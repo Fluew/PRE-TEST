@@ -19,7 +19,7 @@ defineProps<{
         >
             <!-- Background Image -->
             <img
-                src="/LOGIN_PHOTO.png"
+                src="/LOGIN_PHOTO.webp"
                 class="absolute inset-0 h-full w-full object-cover"
                 alt="Industrial Background"
             />
@@ -39,7 +39,7 @@ defineProps<{
             >
                 <div class="mr-3 rounded-xl bg-white p-1.5 shadow-lg">
                     <img
-                        src="/LOGO_MR_PRIDE.png"
+                        src="/LOGO_MR_PRIDE.webp"
                         alt="MR-Pride Logo"
                         class="h-12 w-12 object-contain"
                     />
@@ -83,7 +83,7 @@ defineProps<{
                 <div class="flex flex-col space-y-1 text-center">
                     <div class="mb-2.5 flex justify-center lg:hidden">
                         <img
-                            src="/LOGO_MR_PRIDE.png"
+                            src="/LOGO_MR_PRIDE.webp"
                             alt="MR-Pride Logo"
                             class="h-12 w-12 object-contain"
                         />

@@ -11,6 +11,7 @@ import StaggeredMenu from '@/components/vue-bits/StaggeredMenu.vue';
 import CustomerLoadingScreen from '@/components/CustomerLoadingScreen.vue';
 import FloatingContactSidebar from '@/components/FloatingContactSidebar.vue';
 import CookieConsent from '@/components/CookieConsent.vue';
+import { Toaster } from '@/components/ui/sonner';
 
 const page = usePage();
 const currentPath = computed(() => page.url.split(/[?#]/)[0]);
@@ -33,6 +34,7 @@ const navigation = [
 
         <!-- Cookie Preferences & Privacy Popup -->
         <CookieConsent />
+        <Toaster />
 
         <a href="#main-content" class="skip-link">Skip to content</a>
         <header
@@ -49,7 +51,7 @@ const navigation = [
                         class="flex shrink-0 items-center gap-3 rounded-lg"
                     >
                         <img
-                            src="/LOGO_MR_PRIDE.png"
+                            src="/LOGO_MR_PRIDE.webp"
                             alt=""
                             class="size-11 object-contain"
                         />
@@ -141,18 +143,18 @@ const navigation = [
                         >
                             Explore
                         </h2>
-                        <ul class="mt-5 grid gap-3 text-sm font-medium">
+                        <ul class="mt-3.5 grid text-sm font-medium">
                             <li v-for="item in navigation" :key="item.name">
                                 <Link
                                     :href="item.href"
-                                    class="text-gray-700 hover:text-[#4b5320] hover:underline dark:text-neutral-300 dark:hover:text-[#F8B803]"
+                                    class="inline-block py-1.5 text-gray-700 hover:text-[#4b5320] hover:underline dark:text-neutral-300 dark:hover:text-[#F8B803]"
                                     >{{ item.name }}</Link
                                 >
                             </li>
                             <li>
                                 <Link
                                     :href="quotation()"
-                                    class="text-gray-700 hover:text-[#4b5320] hover:underline dark:text-neutral-300 dark:hover:text-[#F8B803]"
+                                    class="inline-block py-1.5 text-gray-700 hover:text-[#4b5320] hover:underline dark:text-neutral-300 dark:hover:text-[#F8B803]"
                                     >Request Quotation</Link
                                 >
                             </li>

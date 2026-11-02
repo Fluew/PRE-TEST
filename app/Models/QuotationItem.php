@@ -17,6 +17,8 @@ class QuotationItem extends Model
         'product_name',
         'quantity',
         'unit_price',
+        'unit_cost',
+        'supplier_id',
         'discount',
         'subtotal',
     ];
@@ -26,6 +28,7 @@ class QuotationItem extends Model
         return [
             'quantity' => 'integer',
             'unit_price' => 'decimal:2',
+            'unit_cost' => 'decimal:2',
             'discount' => 'decimal:2',
             'subtotal' => 'decimal:2',
         ];
@@ -38,7 +41,8 @@ class QuotationItem extends Model
 
     public function getAvailableStockAttribute(): int
     {
-        return $this->product?->stock ?? 0;
+        // Stock not reserved for confirmed orders.
+        return $this->product?->availableStock() ?? 0;
     }
 
     public function getShortageAttribute(): int
@@ -47,12 +51,17 @@ class QuotationItem extends Model
             return 0;
         }
 
-        return max(0, (int) $this->quantity - (int) $this->product->stock);
+        return max(0, (int) $this->quantity - $this->product->availableStock());
     }
 
     public function quotation(): BelongsTo
     {
         return $this->belongsTo(Quotation::class);
+    }
+
+    public function supplier(): BelongsTo
+    {
+        return $this->belongsTo(Supplier::class);
     }
 
     public function product(): BelongsTo

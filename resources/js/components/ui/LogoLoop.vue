@@ -62,6 +62,20 @@ let lastTime = 0;
 let currentOffset = 0;
 let currentSpeed = props.speed;
 let resizeObserver: ResizeObserver | null = null;
+let visibilityObserver: IntersectionObserver | null = null;
+const reducedMotion = typeof window !== 'undefined' ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+
+// Only animate while the marquee is on screen.
+const start = () => {
+  if (rafId !== null) return;
+  lastTime = 0;
+  rafId = requestAnimationFrame(updateAnimation);
+};
+
+const stop = () => {
+  if (rafId !== null) cancelAnimationFrame(rafId);
+  rafId = null;
+};
 
 const calculateDimensions = () => {
   if (!sequenceRef.value || !containerRef.value) return;
@@ -89,9 +103,7 @@ const updateAnimation = (now: number) => {
   const seqW = sequenceWidth.value;
 
   if (seqW > 0 && currentSpeed !== 0) {
-    const isReducedMotion = typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-    if (!isReducedMotion) {
+    if (!reducedMotion?.matches) {
       if (props.direction === 'left') {
         currentOffset -= currentSpeed * dt;
         if (currentOffset <= -seqW) {
@@ -135,18 +147,19 @@ onMounted(() => {
       }
     }
 
-    lastTime = performance.now();
-    rafId = requestAnimationFrame(updateAnimation);
+    if (containerRef.value && 'IntersectionObserver' in window) {
+      visibilityObserver = new IntersectionObserver(([entry]) => (entry.isIntersecting ? start() : stop()));
+      visibilityObserver.observe(containerRef.value);
+    } else {
+      start();
+    }
   });
 });
 
 onUnmounted(() => {
-  if (rafId !== null) {
-    cancelAnimationFrame(rafId);
-  }
-  if (resizeObserver) {
-    resizeObserver.disconnect();
-  }
+  stop();
+  resizeObserver?.disconnect();
+  visibilityObserver?.disconnect();
 });
 
 watch(

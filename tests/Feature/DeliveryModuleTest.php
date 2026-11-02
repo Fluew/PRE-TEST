@@ -39,49 +39,34 @@ test('deliveries index loads delivery records and metrics', function () {
     $response->assertSuccessful();
     $response->assertInertia(fn ($page) => $page
         ->component('Deliveries/Index')
-        ->has('deliveries.data', 1)
-        ->where('deliveries.data.0.delivery_number', 'DEL-102526-001')
-        ->where('deliveries.data.0.purchase_order_number', '4000005472')
-        ->where('deliveries.data.0.quantity', 100)
-        ->where('deliveries.data.0.unit', 'PCS')
-        ->where('deliveries.data.0.description', '0.68mm Stainless Steel Conduit Rod 2m')
-        ->has('metrics')
-        ->where('metrics.totalDeliveries', 1)
-        ->where('metrics.totalQuantityDelivered', 100)
+        ->has('inboundDeliveries.data', 1)
+        ->where('inboundDeliveries.data.0.delivery_number', 'DEL-102526-001')
+        ->where('inboundDeliveries.data.0.purchase_order_number', '4000005472')
+        ->where('inboundDeliveries.data.0.quantity', 100)
+        ->where('inboundDeliveries.data.0.unit', 'PCS')
+        ->where('inboundDeliveries.data.0.description', '0.68mm Stainless Steel Conduit Rod 2m')
+        ->has('inboundMetrics')
+        ->where('inboundMetrics.totalDeliveries', 1)
+        ->where('inboundMetrics.totalQuantityDelivered', 100)
     );
 });
 
-test('can manually create a new delivery record', function () {
+test('an inbound delivery can only be recorded against a sent purchase order', function () {
     $team = Team::factory()->create(['slug' => 'test-team']);
-    $user = User::factory()->create([
-        'role' => 'admin',
-        'current_team_id' => $team->id,
-        'password_changed_at' => now(),
-    ]);
+    $user = User::factory()->create(['role' => 'admin', 'current_team_id' => $team->id, 'password_changed_at' => now()]);
     $team->members()->attach($user, ['role' => TeamRole::Owner->value]);
     $deviceData = createTrustedDeviceFor($user);
 
-    $response = $this->actingAs($user)
-        ->withCookies($deviceData['cookies'])
-        ->post("/{$team->slug}/deliveries", [
-            'delivery_date' => '2026-10-25',
-            'delivery_number' => 'DEL-102526-002',
-            'purchase_order_number' => '4000005473',
-            'quantity' => 50,
-            'unit' => 'BOX',
-            'description' => 'Circuit Breaker 2P 40A Rail Mounted',
-        ]);
+    // The old free-form endpoint is gone.
+    $this->actingAs($user)->withCookies($deviceData['cookies'])
+        ->post("/{$team->slug}/deliveries", ['delivery_date' => '2026-10-25', 'quantity' => 50, 'description' => 'X'])
+        ->assertStatus(405);
 
-    $response->assertSessionHasNoErrors();
-    $this->assertDatabaseHas('deliveries', [
-        'team_id' => $team->id,
-        'delivery_number' => 'DEL-102526-002',
-        'purchase_order_number' => '4000005473',
-        'quantity' => 50,
-        'unit' => 'BOX',
-        'description' => 'Circuit Breaker 2P 40A Rail Mounted',
-        'status' => 'Delivered',
-    ]);
+    $po = PurchaseOrder::create(['team_id' => $team->id, 'po_date' => '2026-10-20', 'po_number' => '4000005473', 'quantity' => 50, 'description' => 'Breaker', 'unit_cost' => 10, 'total_cost' => 500, 'status' => PurchaseOrder::DRAFT]);
+    $this->actingAs($user)->withCookies($deviceData['cookies'])
+        ->post("/{$team->slug}/deliveries/purchase-orders/{$po->id}/receive", ['delivery_date' => '2026-10-25', 'quantity' => 50])
+        ->assertSessionHasErrors('purchase_order_id');
+    $this->assertDatabaseCount('deliveries', 0);
 });
 
 test('can import deliveries csv with required headers', function () {
@@ -150,7 +135,7 @@ test('can import deliveries csv with required headers', function () {
     ]);
 });
 
-test('can filter deliveries by search, status, and unit', function () {
+test('can search inbound deliveries by description and PO number', function () {
     $team = Team::factory()->create(['slug' => 'test-team']);
     $user = User::factory()->create([
         'role' => 'admin',
@@ -182,26 +167,26 @@ test('can filter deliveries by search, status, and unit', function () {
         'status' => 'In Transit',
     ]);
 
-    // Filter by unit=BOX
+    // Search by description
     $responseUnit = $this->actingAs($user)
         ->withCookies($deviceData['cookies'])
-        ->get("/{$team->slug}/deliveries?unit=BOX");
+        ->get("/{$team->slug}/deliveries?tab=inbound&search=Cable");
 
     $responseUnit->assertSuccessful();
     $responseUnit->assertInertia(fn ($page) => $page
-        ->where('deliveries.total', 1)
-        ->where('deliveries.data.0.delivery_number', 'DEL-ALPHA-01')
+        ->where('inboundDeliveries.total', 1)
+        ->where('inboundDeliveries.data.0.delivery_number', 'DEL-ALPHA-01')
     );
 
-    // Filter by status=In Transit
+    // Search by PO number
     $responseStatus = $this->actingAs($user)
         ->withCookies($deviceData['cookies'])
-        ->get("/{$team->slug}/deliveries?status=In Transit");
+        ->get("/{$team->slug}/deliveries?tab=inbound&search=4000001002");
 
     $responseStatus->assertSuccessful();
     $responseStatus->assertInertia(fn ($page) => $page
-        ->where('deliveries.total', 1)
-        ->where('deliveries.data.0.delivery_number', 'DEL-BETA-02')
+        ->where('inboundDeliveries.total', 1)
+        ->where('inboundDeliveries.data.0.delivery_number', 'DEL-BETA-02')
     );
 });
 

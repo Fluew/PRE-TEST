@@ -3,6 +3,8 @@ import { Link, usePage } from '@inertiajs/vue3';
 import { ArrowUpRight } from '@lucide/vue';
 import { computed } from 'vue';
 import Breadcrumbs from '@/components/Breadcrumbs.vue';
+import CurrencyToggle from '@/components/CurrencyToggle.vue';
+import NotificationBell from '@/components/NotificationBell.vue';
 import { SidebarTrigger } from '@/components/ui/sidebar';
 import { home } from '@/routes';
 import type { BreadcrumbItem } from '@/types';
@@ -51,7 +53,9 @@ const section = computed(() => {
                 >{{ section }}</span
             >
         </div>
-        <div class="flex items-center gap-4">
+        <div class="flex items-center gap-2 sm:gap-4">
+            <CurrencyToggle v-if="page.props.currency" />
+            <NotificationBell v-if="page.props.currentTeam" />
             <span class="hidden text-xs font-medium text-gray-500 lg:block">{{
                 page.props.currentTeam?.name ?? 'MR-Pride'
             }}</span

@@ -69,9 +69,12 @@ class ResendService
      *
      * @return array{success: bool, id: ?string, error: ?string}
      */
-    public function sendCustomerEmail(string $toEmail, string $subject, string $html, string $kind): array
+    /**
+     * @param  array<int, array{filename: string, content: string}>  $attachments  raw file contents (e.g. PDFs)
+     */
+    public function sendCustomerEmail(string $toEmail, string $subject, string $html, string $kind, array $attachments = []): array
     {
-        return $this->deliver($toEmail, $subject, $html, $kind);
+        return $this->deliver($toEmail, $subject, $html, $kind, $attachments);
     }
 
     /**
@@ -93,7 +96,7 @@ class ResendService
      *
      * @return array{success: bool, id: ?string, error: ?string}
      */
-    protected function deliver(string $toEmail, string $subject, string $html, string $kind): array
+    protected function deliver(string $toEmail, string $subject, string $html, string $kind, array $attachments = []): array
     {
         $recipient = $toEmail;
         if ($redirect = $this->devRedirectAddress()) {
@@ -107,6 +110,9 @@ class ResendService
             'subject' => $subject,
             'html' => $html,
         ];
+        if ($attachments !== []) {
+            $payload['attachments'] = array_map(fn ($a) => ['filename' => $a['filename'], 'content' => base64_encode($a['content'])], $attachments);
+        }
         $resendError = 'Resend API key is not configured.';
 
         if (! empty($this->apiKey)) {
@@ -150,7 +156,12 @@ class ResendService
         }
 
         try {
-            Mail::html($html, fn ($message) => $message->to($recipient)->subject($subject));
+            Mail::html($html, function ($message) use ($recipient, $subject, $attachments) {
+                $message->to($recipient)->subject($subject);
+                foreach ($attachments as $a) {
+                    $message->attachData($a['content'], $a['filename']);
+                }
+            });
             Log::info("Laravel Mail ({$mailer}): {$kind} sent to {$recipient}");
 
             return ['success' => true, 'id' => 'mail-'.uniqid(), 'error' => null];

@@ -1,5 +1,6 @@
 <?php
 
+use App\Enums\SalesOrderStatus;
 use App\Enums\TeamRole;
 use App\Models\Product;
 use App\Models\Quotation;
@@ -40,45 +41,37 @@ function gapCsv(): UploadedFile
     return UploadedFile::fake()->createWithContent('import.csv', "sku,name,price,stock\nSKU-NEW-1,New Product,250,4\n");
 }
 
-// --- Replace-mode CSV imports -------------------------------------------------------------
+// --- Inventory imports --------------------------------------------------------------------
+// Replace mode (deactivating the catalog) was removed with the old one-step import. The
+// reviewed document import only adds new products, for staff and admins alike.
 
-it('blocks staff from replace-mode inventory imports and leaves the catalog active', function () {
+it('no longer offers a replace-mode inventory import to anyone', function (string $role) {
     $team = Team::factory()->create(['slug' => 'gap-team']);
-    [$staff, $cookies] = gapActor('staff_inventory', $team);
+    [$user, $cookies] = gapActor($role, $team);
     $existing = gapProduct($team);
 
-    $this->actingAs($staff)->withCookies($cookies)
+    $this->actingAs($user)->withCookies($cookies)
         ->post("/{$team->slug}/inventory/import-csv", ['file' => gapCsv(), 'mode' => 'replace', 'execute' => true])
-        ->assertForbidden();
+        ->assertNotFound();
 
     expect($existing->fresh()->is_active)->toBeTrue()
         ->and(Product::where('sku', 'SKU-NEW-1')->exists())->toBeFalse();
-});
+})->with(['staff_inventory', 'admin']);
 
-it('still lets staff run append-mode inventory imports', function () {
+it('lets staff import new products without touching the existing catalog', function () {
+    Illuminate\Support\Facades\Storage::fake('local');
     $team = Team::factory()->create(['slug' => 'gap-team']);
     [$staff, $cookies] = gapActor('staff_inventory', $team);
     $existing = gapProduct($team);
 
+    $id = $this->actingAs($staff)->withCookies($cookies)
+        ->post("/{$team->slug}/imports/inventory", ['file' => gapCsv()])->assertCreated()->json('id');
     $this->actingAs($staff)->withCookies($cookies)
-        ->post("/{$team->slug}/inventory/import-csv", ['file' => gapCsv(), 'mode' => 'append', 'execute' => true])
-        ->assertSessionHasNoErrors();
+        ->post("/{$team->slug}/imports/batches/{$id}/confirm")->assertOk();
 
     expect(Product::where('team_id', $team->id)->where('sku', 'SKU-NEW-1')->exists())->toBeTrue()
-        ->and($existing->fresh()->is_active)->toBeTrue();
-});
-
-it('lets admins run replace-mode inventory imports', function () {
-    $team = Team::factory()->create(['slug' => 'gap-team']);
-    [$admin, $cookies] = gapActor('admin', $team);
-    $existing = gapProduct($team);
-
-    $this->actingAs($admin)->withCookies($cookies)
-        ->post("/{$team->slug}/inventory/import-csv", ['file' => gapCsv(), 'mode' => 'replace', 'execute' => true])
-        ->assertSessionHasNoErrors();
-
-    expect($existing->fresh()->is_active)->toBeFalse()
-        ->and(Product::where('team_id', $team->id)->where('sku', 'SKU-NEW-1')->exists())->toBeTrue();
+        ->and($existing->fresh()->is_active)->toBeTrue()
+        ->and($existing->fresh()->stock)->toBe(5);
 });
 
 it('blocks staff from replace-mode quotation imports', function () {
@@ -123,7 +116,7 @@ it('refuses to permanently delete a voided sale', function () {
     $sale = Sale::create([
         'team_id' => $team->id, 'invoice_number' => 'INV-GAP-1', 'client_name' => 'Someone',
         'sale_date' => now(), 'subtotal' => 100, 'discount' => 0, 'tax_amount' => 0,
-        'grand_total' => 100, 'status' => 'Completed',
+        'grand_total' => 100, 'status' => 'completed',
     ]);
     $sale->delete();
 
@@ -167,7 +160,7 @@ it('keeps sales when the recycle bin is emptied', function () {
     $sale = Sale::create([
         'team_id' => $team->id, 'invoice_number' => 'INV-GAP-2', 'client_name' => 'Someone',
         'sale_date' => now(), 'subtotal' => 100, 'discount' => 0, 'tax_amount' => 0,
-        'grand_total' => 100, 'status' => 'Completed',
+        'grand_total' => 100, 'status' => 'completed',
     ]);
     $sale->delete();
     $supplier = Supplier::create(['team_id' => $team->id, 'name' => 'Old Supplier']);
@@ -201,52 +194,70 @@ it('tells the frontend only admins can delete', function () {
 
 // --- Recycle bin: restoring a voided sale -------------------------------------------------
 
-function gapSellTwo(Team $team, User $admin, array $cookies, Product $product): Sale
-{
-    test()->actingAs($admin)->withCookies($cookies)
-        ->post("/{$team->slug}/sales", [
-            'customer' => 'Restore Test Co', 'payment_method' => 'GCash',
-            'payment_reference' => 'GCASH-RESTORE-1', 'amount_paid' => 200,
-            'payment_date' => now()->toDateString(),
-            'items' => [['product_id' => $product->id, 'qty' => 2]],
-        ])
-        ->assertSessionHasNoErrors();
-
-    return Sale::where('team_id', $team->id)->latest('id')->firstOrFail();
-}
-
-it('takes the stock back out when a voided sale is restored', function () {
+it('cancels before archiving: the stock goes back once, and restoring the archived order does not take it again', function () {
     $team = Team::factory()->create(['slug' => 'gap-team']);
     [$admin, $cookies] = gapActor('admin', $team);
     $product = Product::create([
         'team_id' => $team->id, 'sku' => 'SKU-RST', 'name' => 'Restorable', 'price' => 100, 'stock' => 10, 'is_active' => true,
     ]);
 
-    $sale = gapSellTwo($team, $admin, $cookies, $product);
+    // A counter sale whose payment proof is still waiting for verification (goods already taken).
+    $this->actingAs($admin)->withCookies($cookies)->post("/{$team->slug}/sales", [
+        'customer' => 'Restore Test Co', 'payment_method' => 'GCash', 'payment_reference' => 'GCASH-RESTORE-1',
+        'amount_paid' => 200, 'payment_date' => now()->toDateString(),
+        'proof_of_payment' => UploadedFile::fake()->image('proof.png'),
+        'items' => [['product_id' => $product->id, 'qty' => 2]],
+    ])->assertSessionHasNoErrors();
+    $sale = Sale::where('team_id', $team->id)->latest('id')->firstOrFail();
     expect($product->fresh()->stock)->toBe(8);
 
-    $this->delete("/{$team->slug}/sales/{$sale->id}");
+    // Only cancelled orders can be archived.
+    $this->delete("/{$team->slug}/sales/{$sale->id}")->assertSessionHasErrors('error');
+    expect(Sale::find($sale->id))->not->toBeNull();
+
+    $this->post("/{$team->slug}/sales/{$sale->id}/cancel", ['reason' => 'Customer changed their mind'])->assertSessionHasNoErrors();
     expect($product->fresh()->stock)->toBe(10);
 
+    $this->delete("/{$team->slug}/sales/{$sale->id}")->assertSessionHas('success');
     $this->post("/{$team->slug}/recycle-bin/sale/{$sale->id}/restore")->assertSessionHas('success');
+
+    expect(Sale::find($sale->id)?->status)->toBe(SalesOrderStatus::Cancelled)
+        ->and($product->fresh()->stock)->toBe(10);
+});
+
+/** A sale archived before the order workflow: archiving it then put its items back in stock. */
+function gapLegacyArchivedSale(Team $team, Product $product): Sale
+{
+    $sale = Sale::create([
+        'team_id' => $team->id, 'invoice_number' => 'INV-LEGACY-1', 'client_name' => 'Someone', 'sale_date' => now(),
+        'subtotal' => 200, 'discount' => 0, 'tax_amount' => 0, 'grand_total' => 200, 'status' => 'completed',
+    ]);
+    $sale->items()->create(['product_id' => $product->id, 'sku' => $product->sku, 'product_name' => $product->name, 'quantity' => 2, 'unit_price' => 100, 'subtotal' => 200]);
+    $sale->delete();
+
+    return $sale;
+}
+
+it('takes the stock back out when an older voided sale is restored', function () {
+    $team = Team::factory()->create(['slug' => 'gap-team']);
+    [$admin, $cookies] = gapActor('admin', $team);
+    $product = Product::create(['team_id' => $team->id, 'sku' => 'SKU-RST', 'name' => 'Restorable', 'price' => 100, 'stock' => 10, 'is_active' => true]);
+    $sale = gapLegacyArchivedSale($team, $product);
+
+    $this->actingAs($admin)->withCookies($cookies)->post("/{$team->slug}/recycle-bin/sale/{$sale->id}/restore")->assertSessionHas('success');
 
     expect(Sale::find($sale->id))->not->toBeNull()
         ->and($product->fresh()->stock)->toBe(8)
         ->and(StockMovement::where('product_id', $product->id)->where('reason', 'like', '%restored from recycle bin%')->count())->toBe(1);
 });
 
-it('refuses to restore a voided sale when the stock is no longer there', function () {
+it('refuses to restore an older voided sale when the stock is no longer there', function () {
     $team = Team::factory()->create(['slug' => 'gap-team']);
     [$admin, $cookies] = gapActor('admin', $team);
-    $product = Product::create([
-        'team_id' => $team->id, 'sku' => 'SKU-RST2', 'name' => 'Sold Out', 'price' => 100, 'stock' => 10, 'is_active' => true,
-    ]);
+    $product = Product::create(['team_id' => $team->id, 'sku' => 'SKU-RST2', 'name' => 'Sold Out', 'price' => 100, 'stock' => 1, 'is_active' => true]);
+    $sale = gapLegacyArchivedSale($team, $product);
 
-    $sale = gapSellTwo($team, $admin, $cookies, $product);
-    $this->delete("/{$team->slug}/sales/{$sale->id}");
-    $product->update(['stock' => 1]); // sold elsewhere in the meantime
-
-    $this->post("/{$team->slug}/recycle-bin/sale/{$sale->id}/restore")->assertSessionHas('error');
+    $this->actingAs($admin)->withCookies($cookies)->post("/{$team->slug}/recycle-bin/sale/{$sale->id}/restore")->assertSessionHas('error');
 
     expect(Sale::find($sale->id))->toBeNull()
         ->and(Sale::withTrashed()->find($sale->id))->not->toBeNull()

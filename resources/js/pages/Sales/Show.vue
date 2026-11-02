@@ -1,624 +1,618 @@
 <script setup lang="ts">
 import { Head, Link, router, usePage } from '@inertiajs/vue3';
-import { ref, computed } from 'vue';
-import SpecularButton from '@/components/ui/SpecularButton.vue';
+import { AlertTriangle, ArrowLeft, Download, ExternalLink, FileText, Plus, Truck } from '@lucide/vue';
+import { computed, ref } from 'vue';
 import StatusBadge from '@/components/ui/StatusBadge.vue';
-import { 
-    Printer, 
-    ArrowLeft, 
-    FileText, 
-    CheckCircle2, 
-    Clock, 
-    Truck, 
-    ShieldCheck, 
-    AlertTriangle, 
-    Building2, 
-    Phone, 
-    Mail, 
-    MapPin, 
-    Calendar, 
-    Download,
-    Check,
-    X,
-    ExternalLink,
-    PackageCheck
-} from '@lucide/vue';
+import { useCurrency } from '@/composables/useCurrency';
 
-interface SaleItem {
+interface Line {
     id: number;
     sku: string;
     product_name: string;
     quantity: number;
     unit_price: number;
+    discount: number;
     subtotal: number;
-    product?: {
-        id: number;
-        name: string;
-        sku: string;
-    } | null;
+    reserved_quantity: number;
+    deducted_quantity: number;
+    released_quantity: number;
+    delivered_quantity: number;
+    cancelled_quantity: number;
+    remaining_quantity: number;
+    releasable_quantity: number;
+    product_id?: number | null;
 }
 
-interface OrderFulfillment {
+interface Payment {
     id: number;
-    fulfillment_number: string;
-    fulfillment_type: string;
-    recipient_name: string;
-    contact_number: string;
-    delivery_address?: string | null;
-    delivery_schedule?: string | null;
-    instructions?: string | null;
-    status: 'Preparing' | 'Ready for Pickup' | 'Dispatched' | 'Delivered' | 'Cancelled';
-    proof_of_delivery?: string | null;
+    method: string;
+    submitted_amount: number;
+    submitted_reference?: string | null;
+    payment_date: string;
+    remarks?: string | null;
+    status: 'submitted' | 'under_verification' | 'verified' | 'rejected' | 'refunded';
+    status_label: string;
+    verified_reference?: string | null;
+    verified_amount?: number | null;
+    verified_payment_date?: string | null;
+    verified_at?: string | null;
+    verification_remarks?: string | null;
+    rejection_reason?: string | null;
+    refund_reason?: string | null;
+    created_at: string;
     proof_url?: string | null;
-    dispatched_at?: string | null;
-    delivered_at?: string | null;
-    notes?: string | null;
-    handled_by?: { name: string } | null;
+    recorded_by?: { name: string } | null;
+    verified_by?: { name: string } | null;
+    rejected_by?: { name: string } | null;
+    receipt?: { id: number; receipt_number: string; pdf_url: string } | null;
 }
 
-interface Sale {
+interface Invoice {
     id: number;
     invoice_number: string;
-    client_name: string;
-    contact_person?: string | null;
-    email?: string | null;
-    phone?: string | null;
-    address?: string | null;
-    sale_date: string;
-    subtotal: number;
-    discount: number;
-    tax_amount: number;
+    status: 'issued' | 'cancelled';
     grand_total: number;
+    issued_at: string;
+    cancelled_at?: string | null;
+    cancellation_reason?: string | null;
+    pdf_url: string;
+    issued_by?: { name: string } | null;
+}
+
+interface Release {
+    id: number;
+    release_number: string;
+    type: 'delivery' | 'pickup';
     status: string;
-    payment_method?: string | null;
-    payment_reference?: string | null;
-    amount_paid?: number | null;
-    outstanding_balance?: number | null;
-    payment_date?: string | null;
-    payment_status?: string | null;
-    proof_of_payment?: string | null;
+    dispatched_at?: string | null;
+    delivered_at?: string | null;
+    received_by_name?: string | null;
+    returned_at?: string | null;
+    return_reason?: string | null;
     proof_url?: string | null;
-    notes?: string | null;
-    verified_at?: string | null;
-    verified_by?: { name: string } | null;
-    processed_by?: { name: string } | null;
-    items?: SaleItem[];
-    fulfillment?: OrderFulfillment | null;
+    created_at: string;
+    items: { id: number; quantity: number; delivered_quantity: number; returned_quantity: number; sale_item?: { sku: string; product_name: string } | null }[];
+}
+
+interface HistoryEntry {
+    id: number;
+    attempt_number: number;
+    previous_status: string;
+    new_status: string;
+    failure_reason?: string | null;
+    remarks?: string | null;
+    attempt_date: string;
+    staff?: { name: string } | null;
 }
 
 const props = defineProps<{
-    sale: Sale;
+    sale: {
+        id: number;
+        order_number: string;
+        channel: 'quotation' | 'counter';
+        fulfillment_type: 'delivery' | 'pickup';
+        invoice_number?: string | null;
+        client_name: string;
+        contact_person?: string | null;
+        email?: string | null;
+        phone?: string | null;
+        address?: string | null;
+        delivery_instructions?: string | null;
+        sale_date: string;
+        subtotal: number;
+        discount: number;
+        tax_amount: number;
+        grand_total: number;
+        amount_paid: number;
+        outstanding_balance: number;
+        status: string;
+        status_label: string;
+        payment_status: string;
+        payment_status_label: string;
+        payment_terms: 'full' | 'down_payment' | 'credit';
+        required_down_payment?: number | null;
+        credit_days?: number | null;
+        credit_due_date?: string | null;
+        confirmed_at?: string | null;
+        completed_at?: string | null;
+        cancelled_at?: string | null;
+        cancellation_reason?: string | null;
+        hold_reason?: string | null;
+        is_on_hold?: boolean;
+        notes?: string | null;
+        quotation?: { id: number; quotation_number: string } | null;
+        processed_by?: { name: string } | null;
+        confirmed_by?: { name: string } | null;
+        terms_approved_by?: { name: string } | null;
+        items: Line[];
+        payments: Payment[];
+        receipts: { id: number; receipt_number: string; amount_received: number; balance_after: number; generated_at: string; pdf_url: string }[];
+        invoices: Invoice[];
+        releases: Release[];
+        fulfillment?: {
+            id: number;
+            fulfillment_number: string;
+            status: string;
+            status_label: string;
+            attempts_display: string;
+            handled_by?: { name: string } | null;
+            delivery_schedule?: string | null;
+            attempt_logs: HistoryEntry[];
+        } | null;
+    };
+    deliveryStatusLabel?: string | null;
+    notifications: { id: number; category: string; type: string; recipient?: string | null; subject?: string | null; status: string; attempts: number; error?: string | null; sent_at?: string | null; created_at: string }[];
+    activity: { id: number; event: string; description: string; user_email?: string | null; outcome: string; created_at: string }[];
+    paymentMethods: string[];
+    can: { verify: boolean; admin: boolean };
+    company: { bir_registered: boolean };
 }>();
 
 const page = usePage();
-const teamSlug = computed(() => (page.props as any).currentTeam?.slug || (page.props as any).team?.slug || '');
+const teamSlug = computed(() => (page.props as any).currentTeam?.slug || '');
+const base = computed(() => `/${teamSlug.value}/sales/${props.sale.id}`);
+const { formatMoney } = useCurrency();
 
-const formatCurrency = (val: number | string | undefined | null) => {
-    return new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' }).format(Number(val || 0));
-};
+const fmtDate = (v?: string | null) => (v ? new Date(v).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—');
+const fmtDateTime = (v?: string | null) => (v ? new Date(v).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—');
+const today = new Date().toISOString().slice(0, 10);
 
-const formatDate = (dateStr?: string | null) => {
-    if (!dateStr) return '—';
-    try {
-        return new Date(dateStr).toLocaleDateString('en-US', {
-            year: 'numeric',
-            month: 'short',
-            day: 'numeric',
-        });
-    } catch {
-        return dateStr;
-    }
-};
+const isOpen = computed(() => !['completed', 'cancelled'].includes(props.sale.status));
+const isConfirmed = computed(() => ['confirmed', 'processing'].includes(props.sale.status));
+const pendingPayments = computed(() => props.sale.payments.filter((p) => ['submitted', 'under_verification'].includes(p.status)));
+const hasShortage = computed(() => isConfirmed.value && props.sale.items.some((l) => l.product_id && l.quantity - l.cancelled_quantity - l.deducted_quantity - l.reserved_quantity > 0));
+const canComplete = computed(
+    () => isConfirmed.value && props.sale.items.every((l) => l.remaining_quantity === 0) && props.sale.fulfillment?.status === 'delivered'
+        && (props.sale.payment_terms !== 'full' || Number(props.sale.outstanding_balance) <= 0),
+);
+const termsLabel = computed(() => {
+    if (props.sale.payment_terms === 'credit') return `Credit terms, ${props.sale.credit_days} days${props.sale.credit_due_date ? ` (due ${fmtDate(props.sale.credit_due_date)})` : ''}`;
+    if (props.sale.payment_terms === 'down_payment') return `Down payment of ${formatMoney(props.sale.required_down_payment ?? 0)} before confirmation`;
+    return 'Full payment before confirmation';
+});
+const statusText = (code: string) => code.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
 
-const formatDateTime = (dateStr?: string | null) => {
-    if (!dateStr) return '—';
-    try {
-        return new Date(dateStr).toLocaleString('en-US', {
-            year: 'numeric',
-            month: 'short',
-            day: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit',
-        });
-    } catch {
-        return dateStr;
-    }
-};
-
-const triggerPrint = () => {
-    window.print();
-};
-
-// Payment Verification State
-const showVerifyModal = ref(false);
-const verifyDecision = ref<'Verified' | 'Rejected'>('Verified');
-const verifyNotes = ref('');
-const isSubmittingVerify = ref(false);
-
-const submitPaymentVerification = () => {
-    isSubmittingVerify.value = true;
-    router.post(`/${teamSlug.value}/sales/${props.sale.id}/verify-payment`, {
-        status: verifyDecision.value,
-        notes: verifyNotes.value,
-    }, {
+// ------------------------------------------------------------------------------ actions
+const busy = ref(false);
+const post = (url: string, data: Record<string, any> = {}, onSuccess?: () => void, files = false) => {
+    busy.value = true;
+    router.post(url, data, {
         preserveScroll: true,
+        forceFormData: files,
+        onSuccess: () => onSuccess?.(),
         onFinish: () => {
-            isSubmittingVerify.value = false;
-            showVerifyModal.value = false;
-            verifyNotes.value = '';
-        }
+            busy.value = false;
+        },
     });
 };
 
-// Fulfillment Modal State
-const showFulfillmentModal = ref(false);
-const fulfillmentTargetStatus = ref<string>(props.sale.fulfillment?.status || 'Dispatched');
-const fulfillmentProofFile = ref<File | null>(null);
-const fulfillmentNotes = ref('');
-const isSubmittingFulfillment = ref(false);
+// Record a payment the customer submitted.
+const showPayment = ref(false);
+const paymentForm = ref({ method: 'Bank Transfer', amount: '' as number | '', reference: '', payment_date: today, remarks: '', proof: null as File | null, idempotency_key: '' });
+const openPayment = () => {
+    paymentForm.value = {
+        method: props.paymentMethods[0] ?? 'Bank Transfer',
+        amount: Number(props.sale.outstanding_balance) > 0 ? Number(props.sale.outstanding_balance) : '',
+        reference: '',
+        payment_date: today,
+        remarks: '',
+        proof: null,
+        idempotency_key: crypto.randomUUID(),
+    };
+    showPayment.value = true;
+};
+const submitPayment = () => post(`${base.value}/payments`, { ...paymentForm.value, proof: paymentForm.value.proof ?? undefined }, () => (showPayment.value = false), true);
 
-const onProofFileChange = (e: Event) => {
-    const input = e.target as HTMLInputElement;
-    fulfillmentProofFile.value = input.files?.[0] || null;
+// Verify against the actual bank / GCash transaction.
+const verifying = ref<Payment | null>(null);
+const verifyForm = ref({ reference: '', amount: 0 as number, payment_date: today, remarks: '' });
+const openVerify = (p: Payment) => {
+    verifying.value = p;
+    verifyForm.value = { reference: p.submitted_reference ?? '', amount: Number(p.submitted_amount), payment_date: p.payment_date?.slice(0, 10) ?? today, remarks: '' };
+    if (p.status === 'submitted') router.post(`${base.value}/payments/${p.id}/review`, {}, { preserveScroll: true, preserveState: true });
+};
+const submitVerify = () => {
+    if (!verifying.value) return;
+    post(`${base.value}/payments/${verifying.value.id}/verify`, verifyForm.value, () => (verifying.value = null));
 };
 
-const submitFulfillmentStatus = () => {
-    if (!props.sale.fulfillment) return;
-    isSubmittingFulfillment.value = true;
-
-    router.patch(`/${teamSlug.value}/fulfillments/${props.sale.fulfillment.id}/status`, {
-        status: fulfillmentTargetStatus.value,
-        notes: fulfillmentNotes.value || undefined,
-        proof_of_delivery: fulfillmentProofFile.value || undefined,
-    }, {
-        forceFormData: true,
-        preserveScroll: true,
-        onFinish: () => {
-            isSubmittingFulfillment.value = false;
-            showFulfillmentModal.value = false;
-            fulfillmentProofFile.value = null;
-            fulfillmentNotes.value = '';
-        }
-    });
+// Reason prompts: reject / refund a payment, hold / cancel the order, cancel the remaining quantity, cancel an invoice.
+const reasonPrompt = ref<{ title: string; help: string; confirm: string; danger?: boolean; url: string; extra?: Record<string, any>; reissue?: boolean } | null>(null);
+const reason = ref('');
+const reissue = ref(true);
+const ask = (p: NonNullable<typeof reasonPrompt.value>) => {
+    reason.value = '';
+    reissue.value = true;
+    reasonPrompt.value = p;
 };
+const submitReason = () => {
+    if (!reasonPrompt.value || !reason.value.trim()) return;
+    const extra = { ...(reasonPrompt.value.extra ?? {}), ...(reasonPrompt.value.reissue ? { reissue: reissue.value } : {}) };
+    post(reasonPrompt.value.url, { reason: reason.value.trim(), ...extra }, () => (reasonPrompt.value = null));
+};
+
+// Payment terms (administrator)
+const showTerms = ref(false);
+const termsForm = ref({ payment_terms: props.sale.payment_terms, required_down_payment: props.sale.required_down_payment ?? '', credit_days: props.sale.credit_days ?? 30 });
+const submitTerms = () => post(`${base.value}/terms`, termsForm.value, () => (showTerms.value = false));
+
+const retryEmail = (id: number) => post(`${base.value}/notifications/${id}/retry`);
 </script>
 
 <template>
-    <Head :title="`Invoice ${sale.invoice_number} — MR-PRIDE`" />
+    <Head :title="`${sale.order_number} — Sales Order`" />
 
-    <div class="workspace-page max-w-6xl mx-auto p-4 sm:p-6 print:p-0 print:max-w-none">
-        <!-- Top Action Bar (Hidden in Print) -->
-        <div class="mb-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 print:hidden">
-            <Link
-                :href="`/${teamSlug}/sales`"
-                class="inline-flex items-center gap-2 text-xs font-semibold text-gray-600 hover:text-gray-900 transition-colors"
-            >
-                <ArrowLeft class="w-4 h-4" />
-                <span>Back to Sales Transactions</span>
-            </Link>
-
-            <div class="flex items-center gap-3">
-                <!-- Payment Verification Action -->
-                <SpecularButton
-                    v-if="sale.payment_status === 'Pending Verification'"
-                    variant="brand"
-                    size="sm"
-                    :radius="8"
-                    @click="showVerifyModal = true"
-                >
-                    <ShieldCheck class="w-4 h-4 mr-1.5" />
-                    <span>Audit / Verify Payment</span>
-                </SpecularButton>
-
-                <!-- Fulfillment Progress Action -->
-                <SpecularButton
-                    v-if="sale.fulfillment && sale.fulfillment.status !== 'Delivered'"
-                    variant="brand"
-                    size="sm"
-                    :radius="8"
-                    @click="showFulfillmentModal = true"
-                >
-                    <Truck class="w-4 h-4 mr-1.5" />
-                    <span>Update Delivery Status</span>
-                </SpecularButton>
-
-                <SpecularButton
-                    variant="secondary"
-                    size="sm"
-                    :radius="8"
-                    @click="triggerPrint"
-                >
-                    <Printer class="w-4 h-4 mr-1.5" />
-                    <span>Print Formal Invoice</span>
-                </SpecularButton>
+    <div class="workspace-page">
+        <!-- Header -->
+        <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div class="min-w-0">
+                <Link :href="`/${teamSlug}/sales`" class="mb-2 inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-900">
+                    <ArrowLeft class="size-3.5" /> Sales Orders
+                </Link>
+                <h1 class="page-title font-mono">{{ sale.order_number }}</h1>
+                <p class="page-subtitle">
+                    {{ sale.client_name }} · {{ fmtDate(sale.sale_date) }} ·
+                    <template v-if="sale.quotation">
+                        from <Link :href="`/${teamSlug}/quotations?search=${sale.quotation.quotation_number}`" class="font-mono hover:underline">{{ sale.quotation.quotation_number }}</Link>
+                    </template>
+                    <template v-else>counter sale</template>
+                </p>
+                <div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                    <span class="text-gray-500">Order</span><StatusBadge :status="sale.status_label" />
+                    <span class="ml-2 text-gray-500">Payment</span><StatusBadge :status="sale.payment_status_label" />
+                    <span class="ml-2 text-gray-500">{{ sale.fulfillment_type === 'pickup' ? 'Pickup' : 'Delivery' }}</span>
+                    <StatusBadge v-if="deliveryStatusLabel" :status="deliveryStatusLabel" />
+                    <span v-else class="text-gray-400">starts when the order is confirmed</span>
+                </div>
+            </div>
+            <div class="flex flex-wrap gap-2">
+                <a :href="`${base}/pdf`" target="_blank" class="secondary-button"><Download class="size-4" /> Sales Order PDF</a>
+                <button v-if="sale.status !== 'cancelled'" type="button" class="brand-button" @click="openPayment"><Plus class="size-4" /> Record payment</button>
             </div>
         </div>
 
-        <!-- Printable Invoice Container -->
-        <div class="bg-white rounded-xl border border-gray-200 print:border-none print:shadow-none p-6 sm:p-10 space-y-8">
-            <!-- Header -->
-            <div class="flex flex-col sm:flex-row justify-between items-start border-b-2 border-[#4b5320] pb-6 gap-6">
-                <div>
-                    <h1 class="text-2xl sm:text-3xl font-black text-[#4b5320] tracking-tight">MR-PRIDE ELECTRICAL SUPPLIES</h1>
-                    <p class="text-xs text-gray-500 font-semibold uppercase mt-0.5">Industrial & Commercial Electrical Solutions</p>
-                    <p class="text-xs text-gray-500 mt-1">Direct Electrical Importers & Authorized Distributor</p>
-                    <p class="text-xs text-gray-500">Contact: +63 (2) 8123-4567 | info@mrpelectrodesk.ph</p>
-                </div>
+        <div v-if="sale.is_on_hold" class="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">On hold: {{ sale.hold_reason }}</div>
+        <div v-if="sale.status === 'cancelled'" class="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-700">
+            Cancelled {{ fmtDate(sale.cancelled_at) }}: {{ sale.cancellation_reason }}
+            <span v-if="Number(sale.amount_paid) > 0" class="font-medium"> · {{ formatMoney(sale.amount_paid) }} in verified payments is still on record; record a refund if money was returned.</span>
+        </div>
 
-                <div class="sm:text-right">
-                    <span class="inline-block px-3 py-1 bg-[#4b5320] text-white font-black text-xl tracking-widest rounded-lg mb-2">
-                        SALES INVOICE
-                    </span>
-                    <p class="text-sm font-bold text-gray-900 font-mono">Invoice #: {{ sale.invoice_number }}</p>
-                    <p class="text-xs text-gray-500 mt-0.5">Date: <strong class="text-gray-800">{{ formatDateTime(sale.sale_date) }}</strong></p>
-                    <div class="mt-2 flex items-center justify-start sm:justify-end gap-2">
-                        <span class="text-xs font-semibold text-gray-500">Transaction Status:</span>
-                        <StatusBadge :status="sale.status" size="sm" />
-                    </div>
-                </div>
+        <!-- Summary -->
+        <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <div class="panel px-4 py-3"><div class="text-xs text-gray-500">Order total</div><div class="mt-1 text-2xl font-semibold text-gray-900">{{ formatMoney(sale.grand_total) }}</div></div>
+            <div class="panel px-4 py-3"><div class="text-xs text-gray-500">Verified payments</div><div class="mt-1 text-2xl font-semibold text-gray-900">{{ formatMoney(sale.amount_paid) }}</div></div>
+            <div class="panel px-4 py-3"><div class="text-xs text-gray-500">Balance</div><div class="mt-1 text-2xl font-semibold" :class="Number(sale.outstanding_balance) > 0 ? 'text-rose-600' : 'text-gray-900'">{{ formatMoney(sale.outstanding_balance) }}</div></div>
+            <div class="panel px-4 py-3">
+                <div class="text-xs text-gray-500">Payment terms</div>
+                <div class="mt-1 text-sm font-medium text-gray-900">{{ termsLabel }}</div>
+                <div v-if="sale.terms_approved_by" class="text-[11px] text-gray-500">Approved by {{ sale.terms_approved_by.name }}</div>
+                <button v-if="can.admin && sale.status === 'pending'" type="button" class="mt-1 text-xs font-medium text-brand hover:underline" @click="showTerms = true">Change terms</button>
             </div>
+        </div>
 
-            <!-- Client & Delivery / Payment Grid -->
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <!-- Customer Details -->
-                <div class="bg-gray-50 p-4 rounded-xl border border-gray-200 text-xs space-y-1.5">
-                    <div class="flex items-center gap-1.5 font-bold uppercase tracking-wider text-[#4b5320] mb-2">
-                        <Building2 class="w-3.5 h-3.5" />
-                        <span>Billed Customer</span>
-                    </div>
-                    <p class="text-sm font-bold text-gray-900">{{ sale.client_name }}</p>
-                    <p v-if="sale.contact_person" class="text-gray-600">Contact: {{ sale.contact_person }}</p>
-                    <p v-if="sale.phone" class="text-gray-600">Phone: {{ sale.phone }}</p>
-                    <p v-if="sale.email" class="text-gray-600">Email: {{ sale.email }}</p>
-                    <p v-if="sale.address" class="text-gray-600">Address: {{ sale.address }}</p>
-                </div>
+        <!-- Order actions -->
+        <div v-if="isOpen" class="panel flex flex-wrap items-center gap-2 p-4">
+            <span class="mr-2 text-sm font-medium text-gray-700">Order actions</span>
+            <button v-if="canComplete" type="button" class="brand-button" :disabled="busy" @click="post(`${base}/complete`)">Mark order completed</button>
+            <span v-else-if="isConfirmed" class="text-xs text-gray-500">The order can be completed when everything is delivered{{ sale.payment_terms === 'full' ? ' and paid' : '' }}.</span>
+            <button v-if="hasShortage" type="button" class="secondary-button" :disabled="busy" @click="post(`${base}/reserve`)">Reserve arrived stock</button>
+            <template v-if="can.admin">
+                <button v-if="isConfirmed && sale.items.some((l) => l.releasable_quantity > 0)" type="button" class="secondary-button"
+                        @click="ask({ title: 'Cancel remaining quantities', help: 'Everything not yet delivered or on its way stops being owed. Reserved stock is released. Totals are not changed: adjust the invoice if needed.', confirm: 'Cancel remaining', danger: true, url: `${base}/cancel-remaining` })">
+                    Cancel remaining quantities
+                </button>
+                <button v-if="!sale.is_on_hold" type="button" class="secondary-button" @click="ask({ title: 'Put order on hold', help: 'The order keeps its status, but nothing is confirmed or released until it is resumed.', confirm: 'Put on hold', url: `${base}/hold` })">Hold</button>
+                <button v-else type="button" class="secondary-button" :disabled="busy" @click="post(`${base}/resume`)">Resume</button>
+                <button v-if="sale.items.every((l) => l.delivered_quantity === 0)" type="button" class="inline-flex min-h-10 items-center rounded-xl border border-rose-200 bg-white px-4 py-2 text-sm font-medium text-rose-600 hover:bg-rose-50"
+                        @click="ask({ title: `Cancel order ${sale.order_number}`, help: 'Reserved stock is released, an issued invoice is cancelled and the customer is emailed. Verified payments stay on record.', confirm: 'Cancel order', danger: true, url: `${base}/cancel` })">
+                    Cancel order
+                </button>
+            </template>
+        </div>
 
-                <!-- Payment Status Card -->
-                <div class="bg-gray-50 p-4 rounded-xl border border-gray-200 text-xs space-y-1.5">
-                    <div class="flex items-center gap-1.5 font-bold uppercase tracking-wider text-[#4b5320] mb-2">
-                        <ShieldCheck class="w-3.5 h-3.5" />
-                        <span>Payment Audit</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-500">Method:</span>
-                        <span class="font-bold text-gray-900">{{ sale.payment_method || 'Bank Transfer' }}</span>
-                    </div>
-                    <div v-if="sale.payment_reference" class="flex justify-between">
-                        <span class="text-gray-500">Reference #:</span>
-                        <span class="font-mono font-bold text-gray-900">{{ sale.payment_reference }}</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-500">Verification:</span>
-                        <span
-                            :class="[
-                                'px-2 py-0.5 rounded text-[11px] font-bold',
-                                sale.payment_status === 'Verified' ? 'bg-emerald-100 text-emerald-800' :
-                                sale.payment_status === 'Rejected' ? 'bg-rose-100 text-rose-800' :
-                                'bg-amber-100 text-amber-800'
-                            ]"
-                        >
-                            {{ sale.payment_status || 'Verified' }}
-                        </span>
-                    </div>
-                    <div v-if="sale.verified_by" class="flex justify-between">
-                        <span class="text-gray-500">Verified By:</span>
-                        <span class="font-medium text-gray-800">{{ sale.verified_by.name }}</span>
-                    </div>
-                    <div v-if="sale.proof_url" class="pt-2 border-t border-gray-200 print:hidden">
-                        <a
-                            :href="sale.proof_url"
-                            target="_blank"
-                            class="inline-flex items-center gap-1 text-[11px] font-bold text-[#4b5320] hover:underline"
-                        >
-                            <ExternalLink class="w-3.5 h-3.5" />
-                            <span>View Proof of Payment Attachment</span>
-                        </a>
-                    </div>
-                </div>
-
-                <!-- Fulfillment & Dispatch Tracking Card -->
-                <div class="bg-gray-50 p-4 rounded-xl border border-gray-200 text-xs space-y-1.5">
-                    <div class="flex items-center gap-1.5 font-bold uppercase tracking-wider text-[#4b5320] mb-2">
-                        <Truck class="w-3.5 h-3.5" />
-                        <span>Order Fulfillment</span>
-                    </div>
-                    <div v-if="sale.fulfillment">
-                        <div class="flex justify-between">
-                            <span class="text-gray-500">Tracking #:</span>
-                            <span class="font-mono font-bold text-gray-900">{{ sale.fulfillment.fulfillment_number }}</span>
-                        </div>
-                        <div class="flex justify-between">
-                            <span class="text-gray-500">Type:</span>
-                            <span class="font-semibold text-gray-900">{{ sale.fulfillment.fulfillment_type }}</span>
-                        </div>
-                        <div class="flex justify-between">
-                            <span class="text-gray-500">Fulfillment Status:</span>
-                            <span
-                                :class="[
-                                    'px-2 py-0.5 rounded text-[11px] font-bold',
-                                    sale.fulfillment.status === 'Delivered' ? 'bg-emerald-100 text-emerald-800' :
-                                    sale.fulfillment.status === 'Dispatched' ? 'bg-blue-100 text-blue-800' :
-                                    'bg-amber-100 text-amber-800'
-                                ]"
-                            >
-                                {{ sale.fulfillment.status }}
-                            </span>
-                        </div>
-                        <div v-if="sale.fulfillment.recipient_name" class="flex justify-between">
-                            <span class="text-gray-500">Recipient:</span>
-                            <span class="font-medium text-gray-900">{{ sale.fulfillment.recipient_name }}</span>
-                        </div>
-                        <div v-if="sale.fulfillment.contact_number" class="flex justify-between">
-                            <span class="text-gray-500">Contact:</span>
-                            <span class="text-gray-800">{{ sale.fulfillment.contact_number }}</span>
-                        </div>
-                        <div v-if="sale.fulfillment.delivery_address" class="text-gray-600 mt-1">
-                            <span class="text-gray-500 block">Address:</span>
-                            {{ sale.fulfillment.delivery_address }}
-                        </div>
-                        <div v-if="sale.fulfillment.proof_url" class="pt-2 border-t border-gray-200 print:hidden">
-                            <a
-                                :href="sale.fulfillment.proof_url"
-                                target="_blank"
-                                class="inline-flex items-center gap-1 text-[11px] font-bold text-[#4b5320] hover:underline"
-                            >
-                                <ExternalLink class="w-3.5 h-3.5" />
-                                <span>View Proof of Delivery File</span>
-                            </a>
-                        </div>
-                    </div>
-                    <div v-else class="text-gray-400 py-3 text-center">
-                        No fulfillment record initialized.
-                    </div>
-                </div>
+        <!-- Items -->
+        <section class="panel overflow-hidden">
+            <div class="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+                <h2 class="text-sm font-semibold text-gray-900">Items</h2>
+                <span class="text-xs text-gray-500">Reserved = held in stock for this order · Released = sent out</span>
             </div>
-
-            <!-- Items Table -->
-            <div>
-                <h4 class="text-xs font-bold uppercase text-[#4b5320] tracking-wider mb-2">PURCHASED PRODUCTS & LINE ITEMS</h4>
-                <table class="w-full text-left border-collapse text-xs">
+            <div class="overflow-x-auto">
+                <table class="w-full text-left">
                     <thead>
-                        <tr class="bg-gray-100 text-gray-700 border-b border-gray-300">
-                            <th class="py-2.5 px-3 font-bold w-12 text-center">#</th>
-                            <th class="py-2.5 px-3 font-bold">Item Description</th>
-                            <th class="py-2.5 px-3 font-bold w-28">SKU</th>
-                            <th class="py-2.5 px-3 font-bold text-center w-16">Qty</th>
-                            <th class="py-2.5 px-3 font-bold text-right w-24">Unit Price</th>
-                            <th class="py-2.5 px-3 font-bold text-right w-28">Subtotal</th>
+                        <tr>
+                            <th>Product</th>
+                            <th class="text-right">Ordered</th>
+                            <th class="text-right">Reserved</th>
+                            <th class="text-right">Released</th>
+                            <th class="text-right">Delivered</th>
+                            <th class="text-right">Cancelled</th>
+                            <th class="text-right">Remaining</th>
+                            <th class="text-right">Unit price</th>
+                            <th class="text-right">Amount</th>
                         </tr>
                     </thead>
-                    <tbody class="divide-y divide-gray-200">
-                        <tr v-for="(item, idx) in sale.items" :key="item.id || idx" class="hover:bg-gray-50">
-                            <td class="py-3 px-3 text-center text-gray-400 font-mono">{{ idx + 1 }}</td>
-                            <td class="py-3 px-3">
-                                <p class="font-bold text-gray-900">{{ item.product_name }}</p>
-                            </td>
-                            <td class="py-3 px-3 font-mono text-gray-500 text-[11px]">{{ item.sku }}</td>
-                            <td class="py-3 px-3 text-center font-bold text-gray-900">{{ item.quantity }}</td>
-                            <td class="py-3 px-3 text-right font-medium text-gray-800">{{ formatCurrency(item.unit_price) }}</td>
-                            <td class="py-3 px-3 text-right font-mono font-bold text-gray-900">{{ formatCurrency(item.subtotal) }}</td>
+                    <tbody class="divide-y divide-gray-100">
+                        <tr v-for="l in sale.items" :key="l.id">
+                            <td class="min-w-48"><div class="font-medium text-gray-900">{{ l.product_name }}</div><div class="font-mono text-[11px] text-gray-500">{{ l.sku }}</div></td>
+                            <td class="text-right">{{ l.quantity }}</td>
+                            <td class="text-right">{{ l.reserved_quantity }}</td>
+                            <td class="text-right">{{ l.released_quantity }}</td>
+                            <td class="text-right">{{ l.delivered_quantity }}</td>
+                            <td class="text-right">{{ l.cancelled_quantity || '—' }}</td>
+                            <td class="text-right font-semibold" :class="l.remaining_quantity > 0 ? 'text-amber-700' : 'text-emerald-700'">{{ l.remaining_quantity }}</td>
+                            <td class="whitespace-nowrap text-right">{{ formatMoney(l.unit_price) }}</td>
+                            <td class="whitespace-nowrap text-right font-medium text-gray-900">{{ formatMoney(l.subtotal) }}</td>
                         </tr>
                     </tbody>
                 </table>
             </div>
+            <div class="flex flex-col items-end gap-1 border-t border-gray-200 px-4 py-3 text-sm">
+                <div class="flex w-56 justify-between"><span class="text-gray-500">Subtotal</span><span>{{ formatMoney(sale.subtotal) }}</span></div>
+                <div v-if="Number(sale.discount) > 0" class="flex w-56 justify-between"><span class="text-gray-500">Discount</span><span>-{{ formatMoney(sale.discount) }}</span></div>
+                <div class="flex w-56 justify-between"><span class="text-gray-500">Tax</span><span>{{ formatMoney(sale.tax_amount) }}</span></div>
+                <div class="flex w-56 justify-between font-semibold text-gray-900"><span>Total</span><span>{{ formatMoney(sale.grand_total) }}</span></div>
+            </div>
+        </section>
 
-            <!-- Totals & Balances -->
-            <div class="flex justify-end pt-2">
-                <div class="w-full sm:w-80 space-y-2 text-xs">
-                    <div class="flex justify-between text-gray-600">
-                        <span>Subtotal:</span>
-                        <span class="font-mono font-bold">{{ formatCurrency(sale.subtotal) }}</span>
+        <div class="grid grid-cols-1 gap-6 xl:grid-cols-2">
+            <!-- Payments -->
+            <section class="panel overflow-hidden xl:col-span-2">
+                <div class="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+                    <h2 class="text-sm font-semibold text-gray-900">Payments</h2>
+                    <span v-if="pendingPayments.length" class="text-xs font-medium text-amber-700">{{ pendingPayments.length }} waiting for verification</span>
+                </div>
+                <p v-if="!sale.payments.length" class="px-4 py-6 text-center text-sm text-gray-500">No payments recorded yet.</p>
+                <div v-else class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead>
+                            <tr><th>Submitted</th><th>Method / reference</th><th class="text-right">Amount</th><th>Status</th><th>Verified</th><th class="text-right">Actions</th></tr>
+                        </thead>
+                        <tbody class="divide-y divide-gray-100">
+                            <tr v-for="p in sale.payments" :key="p.id">
+                                <td class="whitespace-nowrap text-xs">{{ fmtDate(p.payment_date) }}<div class="text-gray-500">by {{ p.recorded_by?.name ?? '—' }}</div></td>
+                                <td class="text-xs"><div class="font-medium text-gray-900">{{ p.method }}</div><div class="font-mono text-gray-500">{{ p.submitted_reference || 'no reference' }}</div>
+                                    <a v-if="p.proof_url" :href="p.proof_url" target="_blank" class="inline-flex items-center gap-1 text-brand hover:underline"><ExternalLink class="size-3" /> Proof</a></td>
+                                <td class="whitespace-nowrap text-right">{{ formatMoney(p.submitted_amount) }}</td>
+                                <td><StatusBadge :status="p.status_label" /><div v-if="p.rejection_reason || p.refund_reason" class="mt-0.5 max-w-48 text-[11px] text-gray-500">{{ p.rejection_reason || p.refund_reason }}</div></td>
+                                <td class="text-xs">
+                                    <template v-if="p.verified_at">
+                                        <div class="font-medium text-gray-900">{{ formatMoney(p.verified_amount ?? 0) }} · <span class="font-mono">{{ p.verified_reference }}</span></div>
+                                        <div class="text-gray-500">{{ p.verified_by?.name }}, {{ fmtDateTime(p.verified_at) }}</div>
+                                        <a v-if="p.receipt" :href="p.receipt.pdf_url" target="_blank" class="text-brand hover:underline">Receipt {{ p.receipt.receipt_number }}</a>
+                                    </template>
+                                    <span v-else class="text-gray-400">—</span>
+                                </td>
+                                <td class="whitespace-nowrap text-right">
+                                    <template v-if="can.verify && ['submitted', 'under_verification'].includes(p.status)">
+                                        <button type="button" class="brand-button min-h-8 px-3 text-xs" @click="openVerify(p)">Verify</button>
+                                        <button type="button" class="ml-1 secondary-button min-h-8 px-3 text-xs" @click="ask({ title: 'Reject payment', help: 'The payment stays on record as rejected and the customer is told it could not be verified.', confirm: 'Reject payment', danger: true, url: `${base}/payments/${p.id}/reject` })">Reject</button>
+                                    </template>
+                                    <button v-if="can.admin && p.status === 'verified'" type="button" class="secondary-button min-h-8 px-3 text-xs"
+                                            @click="ask({ title: 'Record refund', help: 'Record this only after the money was returned. The payment and its receipt stay on record; it no longer counts as paid.', confirm: 'Record refund', danger: true, url: `${base}/payments/${p.id}/refund` })">Refund</button>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Invoices and receipts -->
+            <section class="panel overflow-hidden">
+                <div class="border-b border-gray-200 px-4 py-3"><h2 class="text-sm font-semibold text-gray-900">Sales invoices</h2></div>
+                <p v-if="!sale.invoices.length" class="px-4 py-6 text-center text-sm text-gray-500">Issued when the order is confirmed.</p>
+                <ul v-else class="divide-y divide-gray-100">
+                    <li v-for="inv in sale.invoices" :key="inv.id" class="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-sm">
+                        <div>
+                            <a :href="inv.pdf_url" target="_blank" class="inline-flex items-center gap-1 font-mono font-medium text-gray-900 hover:underline"><FileText class="size-4" /> {{ inv.invoice_number }}</a>
+                            <div class="text-xs text-gray-500">{{ fmtDate(inv.issued_at) }} · {{ formatMoney(inv.grand_total) }}<template v-if="inv.status === 'cancelled'"> · cancelled: {{ inv.cancellation_reason }}</template></div>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <StatusBadge :status="inv.status === 'issued' ? 'Issued' : 'Cancelled'" />
+                            <button v-if="can.admin && inv.status === 'issued'" type="button" class="text-xs font-medium text-rose-600 hover:underline"
+                                    @click="ask({ title: `Cancel invoice ${inv.invoice_number}`, help: 'Issued invoices are never edited. Cancel it with a reason; a corrected replacement can be issued and emailed.', confirm: 'Cancel invoice', danger: true, url: `${base}/invoices/${inv.id}/cancel`, reissue: true })">Cancel</button>
+                        </div>
+                    </li>
+                </ul>
+                <p v-if="!company.bir_registered" class="border-t border-gray-100 px-4 py-2 text-[11px] text-gray-500">System-generated documents; not BIR-registered invoices.</p>
+            </section>
+
+            <section class="panel overflow-hidden">
+                <div class="border-b border-gray-200 px-4 py-3"><h2 class="text-sm font-semibold text-gray-900">Acknowledgment receipts</h2></div>
+                <p v-if="!sale.receipts.length" class="px-4 py-6 text-center text-sm text-gray-500">One receipt per verified payment.</p>
+                <ul v-else class="divide-y divide-gray-100">
+                    <li v-for="r in sale.receipts" :key="r.id" class="flex items-center justify-between gap-2 px-4 py-3 text-sm">
+                        <a :href="r.pdf_url" target="_blank" class="inline-flex items-center gap-1 font-mono font-medium text-gray-900 hover:underline"><FileText class="size-4" /> {{ r.receipt_number }}</a>
+                        <span class="text-xs text-gray-500">{{ formatMoney(r.amount_received) }} received · balance {{ formatMoney(r.balance_after) }}</span>
+                    </li>
+                </ul>
+            </section>
+
+            <!-- Delivery -->
+            <section class="panel overflow-hidden xl:col-span-2">
+                <div class="flex flex-wrap items-center justify-between gap-2 border-b border-gray-200 px-4 py-3">
+                    <h2 class="text-sm font-semibold text-gray-900">{{ sale.fulfillment_type === 'pickup' ? 'Pickup' : 'Delivery' }}</h2>
+                    <Link v-if="sale.fulfillment" :href="`/${teamSlug}/deliveries?search=${sale.order_number}`" class="inline-flex items-center gap-1 text-xs font-medium text-brand hover:underline"><Truck class="size-3.5" /> Manage on the Deliveries page</Link>
+                </div>
+                <div v-if="!sale.fulfillment" class="px-4 py-6 text-center text-sm text-gray-500">
+                    The delivery record is created when the order is confirmed{{ sale.payment_terms === 'credit' ? ' (approved credit terms)' : ' (after the payment is verified)' }}.
+                    <div v-if="sale.address && sale.fulfillment_type === 'delivery'" class="mt-1 text-xs">Deliver to: {{ sale.address }}</div>
+                </div>
+                <div v-else class="grid grid-cols-1 gap-0 lg:grid-cols-2">
+                    <div class="border-b border-gray-200 p-4 lg:border-r lg:border-b-0">
+                        <dl class="grid grid-cols-2 gap-3 text-xs">
+                            <div><dt class="text-gray-500">Delivery no.</dt><dd class="font-mono font-medium text-gray-900">{{ sale.fulfillment.fulfillment_number }}</dd></div>
+                            <div><dt class="text-gray-500">Status</dt><dd><StatusBadge :status="sale.fulfillment.status_label" /></dd></div>
+                            <div><dt class="text-gray-500">Driver</dt><dd class="font-medium text-gray-900">{{ sale.fulfillment.handled_by?.name ?? 'Unassigned' }}</dd></div>
+                            <div><dt class="text-gray-500">Attempts (current trip)</dt><dd class="font-medium text-gray-900">{{ sale.fulfillment.attempts_display }}</dd></div>
+                        </dl>
+                        <h3 class="mt-4 mb-2 text-xs font-semibold text-gray-700">Releases</h3>
+                        <p v-if="!sale.releases.length" class="text-xs text-gray-500">Nothing released yet.</p>
+                        <div v-for="r in sale.releases" :key="r.id" class="mb-2 rounded-xl border border-gray-200 p-3 text-xs">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <span class="font-mono font-medium text-gray-900">{{ r.release_number }}</span>
+                                <span class="text-gray-500">{{ statusText(r.status) }} · {{ fmtDate(r.delivered_at || r.dispatched_at || r.created_at) }}</span>
+                            </div>
+                            <ul class="mt-1 space-y-0.5 text-gray-600">
+                                <li v-for="i in r.items" :key="i.id">{{ i.sale_item?.product_name }}: {{ i.quantity }} sent<span v-if="r.status === 'delivered' || r.status === 'returned'">, {{ i.delivered_quantity }} received<span v-if="i.returned_quantity">, {{ i.returned_quantity }} back to stock</span></span></li>
+                            </ul>
+                            <div class="mt-1 flex flex-wrap gap-3">
+                                <span v-if="r.received_by_name" class="text-gray-500">Received by {{ r.received_by_name }}</span>
+                                <span v-if="r.return_reason" class="text-rose-600">Returned: {{ r.return_reason }}</span>
+                                <a :href="`/${teamSlug}/deliveries/releases/${r.id}/pdf`" target="_blank" class="text-brand hover:underline">{{ r.type === 'pickup' ? 'Release slip' : 'Delivery receipt' }}</a>
+                                <a v-if="r.proof_url" :href="r.proof_url" target="_blank" class="text-brand hover:underline">Proof photo</a>
+                            </div>
+                        </div>
                     </div>
-                    <div v-if="sale.discount && sale.discount > 0" class="flex justify-between text-rose-600">
-                        <span>Discount:</span>
-                        <span class="font-mono font-bold">-{{ formatCurrency(sale.discount) }}</span>
-                    </div>
-                    <div v-if="sale.tax_amount && sale.tax_amount > 0" class="flex justify-between text-gray-600">
-                        <span>Value Added Tax (12% VAT):</span>
-                        <span class="font-mono font-bold">{{ formatCurrency(sale.tax_amount) }}</span>
-                    </div>
-                    <div class="flex justify-between pt-2 border-t-2 border-gray-900 text-sm">
-                        <span class="font-black text-gray-900 uppercase">Grand Total:</span>
-                        <span class="font-black text-base text-[#4b5320] font-mono">{{ formatCurrency(sale.grand_total) }}</span>
-                    </div>
-                    <div class="flex justify-between text-gray-700 pt-1">
-                        <span>Amount Paid:</span>
-                        <span class="font-mono font-bold text-emerald-700">{{ formatCurrency(sale.amount_paid) }}</span>
-                    </div>
-                    <div v-if="Number(sale.outstanding_balance || 0) > 0" class="flex justify-between text-rose-700 font-bold bg-rose-50 p-2 rounded-lg border border-rose-200">
-                        <span>Outstanding Balance:</span>
-                        <span class="font-mono">{{ formatCurrency(sale.outstanding_balance) }}</span>
-                    </div>
-                    <div v-else class="flex justify-between text-emerald-700 font-bold bg-emerald-50 p-2 rounded-lg border border-emerald-200">
-                        <span>Payment Status:</span>
-                        <span>Fully Settled</span>
+                    <div class="p-4">
+                        <h3 class="mb-2 text-xs font-semibold text-gray-700">Status history</h3>
+                        <ol class="space-y-2">
+                            <li v-for="h in sale.fulfillment.attempt_logs" :key="h.id" class="border-l-2 pl-3 text-xs" :class="h.attempt_number > 0 ? 'border-rose-300' : 'border-gray-200'">
+                                <div class="font-medium text-gray-900">{{ h.attempt_number > 0 ? `Failed attempt ${h.attempt_number}` : statusText(h.new_status) }}</div>
+                                <div v-if="h.failure_reason" class="text-rose-600">{{ h.failure_reason }}</div>
+                                <div v-if="h.remarks" class="text-gray-600">{{ h.remarks }}</div>
+                                <div class="text-gray-400">{{ fmtDateTime(h.attempt_date) }} · {{ h.staff?.name ?? 'System' }}</div>
+                            </li>
+                        </ol>
                     </div>
                 </div>
-            </div>
+            </section>
 
-            <!-- Notes Section -->
-            <div v-if="sale.notes" class="pt-4 border-t border-gray-200 text-xs text-gray-600">
-                <h5 class="font-bold uppercase text-gray-700 text-[10px] mb-1">Invoice Remarks & Audit Trail:</h5>
-                <p class="whitespace-pre-line leading-relaxed bg-gray-50 p-3 rounded-lg border border-gray-200">{{ sale.notes }}</p>
-            </div>
+            <!-- Emails -->
+            <section class="panel overflow-hidden">
+                <div class="border-b border-gray-200 px-4 py-3"><h2 class="text-sm font-semibold text-gray-900">Customer emails</h2></div>
+                <p v-if="!notifications.length" class="px-4 py-6 text-center text-sm text-gray-500">{{ sale.email ? 'No emails yet.' : 'No customer email address on this order.' }}</p>
+                <ul v-else class="divide-y divide-gray-100">
+                    <li v-for="n in notifications" :key="n.id" class="px-4 py-3 text-xs">
+                        <div class="flex items-start justify-between gap-2">
+                            <span class="font-medium text-gray-900">{{ n.subject || statusText(n.type) }}</span>
+                            <StatusBadge :status="n.status === 'sent' ? 'Sent' : n.status === 'failed' ? 'Failed' : n.status === 'skipped' ? 'No email address' : 'Pending'" />
+                        </div>
+                        <div class="text-gray-500">{{ statusText(n.category) }} · {{ n.recipient || '—' }} · {{ fmtDateTime(n.sent_at || n.created_at) }}<template v-if="n.attempts > 1"> · {{ n.attempts }} attempts</template></div>
+                        <div v-if="n.error && n.status !== 'sent'" class="mt-0.5 text-rose-600">{{ n.error }}</div>
+                        <button v-if="n.status === 'failed'" type="button" class="mt-1 font-medium text-brand hover:underline" :disabled="busy" @click="retryEmail(n.id)">Send again</button>
+                    </li>
+                </ul>
+                <p class="border-t border-gray-100 px-4 py-2 text-[11px] text-gray-500">"Sent" means the email service accepted the message; delivery to the inbox is not confirmed.</p>
+            </section>
 
-            <!-- Signatures -->
-            <div class="pt-8 border-t border-gray-200 grid grid-cols-2 gap-8 text-xs">
-                <div>
-                    <p class="text-gray-500 mb-8">Issued By:</p>
-                    <div class="border-b border-gray-400 w-48 mb-1"></div>
-                    <p class="font-bold text-gray-900">{{ sale.processed_by?.name || 'Authorized Cashier / Staff' }}</p>
-                    <p class="text-gray-400 text-[10px]">MR-PRIDE Electrical Supplies</p>
-                </div>
-                <div>
-                    <p class="text-gray-500 mb-8">Customer Conforme / Received Goods:</p>
-                    <div class="border-b border-gray-400 w-48 mb-1"></div>
-                    <p class="font-bold text-gray-900">{{ sale.fulfillment?.recipient_name || sale.client_name }}</p>
-                    <p class="text-gray-400 text-[10px]">Signature over Printed Name</p>
-                </div>
-            </div>
+            <!-- Activity -->
+            <section class="panel overflow-hidden">
+                <div class="border-b border-gray-200 px-4 py-3"><h2 class="text-sm font-semibold text-gray-900">Activity</h2></div>
+                <ol class="max-h-[28rem] divide-y divide-gray-100 overflow-y-auto">
+                    <li v-for="a in activity" :key="a.id" class="px-4 py-2.5 text-xs">
+                        <div :class="a.outcome === 'failure' ? 'text-rose-700' : 'text-gray-800'">{{ a.description }}</div>
+                        <div class="text-gray-400">{{ fmtDateTime(a.created_at) }} · {{ a.user_email || 'System' }}</div>
+                    </li>
+                    <li v-if="!activity.length" class="px-4 py-6 text-center text-sm text-gray-500">No activity yet.</li>
+                </ol>
+            </section>
         </div>
+    </div>
 
-        <!-- VERIFY PAYMENT MODAL -->
-        <div v-if="showVerifyModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-            <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl animate-in fade-in duration-150">
-                <div class="flex items-center gap-3 mb-4">
-                    <div class="p-3 bg-amber-100 text-amber-800 rounded-xl">
-                        <ShieldCheck class="w-6 h-6" />
-                    </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Verify Customer Payment</h3>
-                        <p class="text-xs text-gray-500">Invoice: {{ sale.invoice_number }} ({{ sale.client_name }})</p>
-                    </div>
+    <!-- Record payment -->
+    <div v-if="showPayment" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+        <form class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-gray-200 bg-white p-6 shadow-xl" @submit.prevent="submitPayment">
+            <h3 class="text-lg font-semibold text-gray-900">Record payment</h3>
+            <p class="mt-1 text-xs text-gray-500">Record what the customer says they paid. It counts only after you verify it against the actual bank or GCash transaction.</p>
+            <div class="mt-4 space-y-4">
+                <div class="grid grid-cols-2 gap-3">
+                    <div><label class="field-label" for="p-method">Method</label>
+                        <select id="p-method" v-model="paymentForm.method" class="field-control"><option v-for="m in paymentMethods" :key="m" :value="m">{{ m }}</option></select></div>
+                    <div><label class="field-label" for="p-amount">Amount (USD)</label>
+                        <input id="p-amount" v-model.number="paymentForm.amount" type="number" min="0.01" step="0.01" required class="field-control" /></div>
                 </div>
-
-                <div class="bg-gray-50 p-3 rounded-xl border border-gray-200 text-xs space-y-1.5 mb-4">
-                    <div class="flex justify-between">
-                        <span class="text-gray-500">Claimed Amount:</span>
-                        <span class="font-semibold text-gray-900">{{ formatCurrency(sale.amount_paid) }}</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-500">Payment Method:</span>
-                        <span class="font-semibold text-gray-900">{{ sale.payment_method }}</span>
-                    </div>
-                    <div v-if="sale.payment_reference" class="flex justify-between">
-                        <span class="text-gray-500">Reference:</span>
-                        <span class="font-mono font-semibold text-gray-900">{{ sale.payment_reference }}</span>
-                    </div>
-                    <div v-if="sale.proof_url" class="pt-2 border-t border-gray-200">
-                        <a :href="sale.proof_url" target="_blank" class="text-[#4b5320] font-semibold inline-flex items-center gap-1 hover:underline">
-                            <ExternalLink class="w-3.5 h-3.5" />
-                            <span>Open Proof of Payment Document</span>
-                        </a>
-                    </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div><label class="field-label" for="p-ref">Customer's reference</label>
+                        <input id="p-ref" v-model="paymentForm.reference" maxlength="100" class="field-control" placeholder="e.g. BDO-12345" /></div>
+                    <div><label class="field-label" for="p-date">Payment date</label>
+                        <input id="p-date" v-model="paymentForm.payment_date" type="date" :max="today" required class="field-control" /></div>
                 </div>
-
-                <div class="space-y-3 mb-4">
-                    <label class="block text-xs font-semibold text-gray-700">Verification Decision</label>
-                    <div class="grid grid-cols-2 gap-3">
-                        <label
-                            :class="verifyDecision === 'Verified' ? 'border-emerald-500 bg-emerald-50 text-emerald-900 font-bold' : 'border-gray-200 bg-white text-gray-700'"
-                            class="border rounded-xl p-3 cursor-pointer flex items-center gap-2 text-xs transition-colors"
-                        >
-                            <input type="radio" v-model="verifyDecision" value="Verified" class="accent-emerald-600" />
-                            <span>Approve & Verify</span>
-                        </label>
-
-                        <label
-                            :class="verifyDecision === 'Rejected' ? 'border-rose-500 bg-rose-50 text-rose-900 font-bold' : 'border-gray-200 bg-white text-gray-700'"
-                            class="border rounded-xl p-3 cursor-pointer flex items-center gap-2 text-xs transition-colors"
-                        >
-                            <input type="radio" v-model="verifyDecision" value="Rejected" class="accent-rose-600" />
-                            <span>Reject Payment</span>
-                        </label>
-                    </div>
-
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Audit Notes / Reason</label>
-                        <textarea
-                            v-model="verifyNotes"
-                            rows="2"
-                            class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                            placeholder="Optional notes or remarks regarding the verification..."
-                        ></textarea>
-                    </div>
-                </div>
-
-                <div class="flex justify-end gap-3 pt-3 border-t border-gray-100">
-                    <SpecularButton
-                        type="button"
-                        variant="secondary"
-                        size="md"
-                        :radius="10"
-                        @click="showVerifyModal = false"
-                    >
-                        Cancel
-                    </SpecularButton>
-                    <SpecularButton
-                        type="button"
-                        variant="brand"
-                        size="md"
-                        :radius="10"
-                        :disabled="isSubmittingVerify"
-                        @click="submitPaymentVerification"
-                    >
-                        {{ isSubmittingVerify ? 'Saving...' : 'Save Decision' }}
-                    </SpecularButton>
-                </div>
+                <div><label class="field-label" for="p-proof">Proof of payment (optional)</label>
+                    <input id="p-proof" type="file" accept="image/jpeg,image/png,image/webp,application/pdf" class="field-control py-1.5 text-xs" @change="paymentForm.proof = ($event.target as HTMLInputElement).files?.[0] ?? null" />
+                    <p class="mt-1 text-[11px] text-gray-500">A screenshot is not proof that the money arrived; check the actual transaction when verifying.</p></div>
+                <div><label class="field-label" for="p-remarks">Remarks (optional)</label>
+                    <textarea id="p-remarks" v-model="paymentForm.remarks" rows="2" maxlength="1000" class="field-control"></textarea></div>
             </div>
-        </div>
-
-        <!-- UPDATE FULFILLMENT STATUS MODAL -->
-        <div v-if="showFulfillmentModal && sale.fulfillment" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-            <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl animate-in fade-in duration-150">
-                <div class="flex items-center gap-3 mb-4">
-                    <div class="p-3 bg-blue-100 text-blue-800 rounded-xl">
-                        <Truck class="w-6 h-6" />
-                    </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Update Fulfillment Status</h3>
-                        <p class="text-xs text-gray-500">Tracking: {{ sale.fulfillment.fulfillment_number }}</p>
-                    </div>
-                </div>
-
-                <div class="space-y-4 mb-4">
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">New Fulfillment Status</label>
-                        <select
-                            v-model="fulfillmentTargetStatus"
-                            class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                        >
-                            <option value="Preparing">Preparing Order</option>
-                            <option value="Ready for Pickup">Ready for Customer Pickup</option>
-                            <option value="Dispatched">Dispatched / Out for Delivery</option>
-                            <option value="Delivered">Delivered & Confirmed</option>
-                            <option value="Cancelled">Cancelled</option>
-                        </select>
-                    </div>
-
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Proof of Delivery / Waybill (Optional)</label>
-                        <input
-                            type="file"
-                            accept=".jpg,.jpeg,.png,.webp,.pdf"
-                            class="block w-full text-xs text-gray-500 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-[#4b5320] file:text-white hover:file:bg-[#3d431a] cursor-pointer"
-                            @change="onProofFileChange"
-                        />
-                    </div>
-
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Delivery Dispatch Notes</label>
-                        <textarea
-                            v-model="fulfillmentNotes"
-                            rows="2"
-                            class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                            placeholder="Courier name, rider contact, or delivery notes..."
-                        ></textarea>
-                    </div>
-                </div>
-
-                <div class="flex justify-end gap-3 pt-3 border-t border-gray-100">
-                    <SpecularButton
-                        type="button"
-                        variant="secondary"
-                        size="md"
-                        :radius="10"
-                        @click="showFulfillmentModal = false"
-                    >
-                        Cancel
-                    </SpecularButton>
-                    <SpecularButton
-                        type="button"
-                        variant="brand"
-                        size="md"
-                        :radius="10"
-                        :disabled="isSubmittingFulfillment"
-                        @click="submitFulfillmentStatus"
-                    >
-                        {{ isSubmittingFulfillment ? 'Updating...' : 'Update Fulfillment' }}
-                    </SpecularButton>
-                </div>
+            <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
+                <button type="button" class="secondary-button" @click="showPayment = false">Cancel</button>
+                <button type="submit" class="brand-button" :disabled="busy">{{ busy ? 'Saving…' : 'Record payment' }}</button>
             </div>
-        </div>
+        </form>
+    </div>
+
+    <!-- Verify payment -->
+    <div v-if="verifying" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+        <form class="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-gray-200 bg-white p-6 shadow-xl" @submit.prevent="submitVerify">
+            <h3 class="text-lg font-semibold text-gray-900">Verify payment</h3>
+            <p class="mt-1 text-xs text-gray-500">Find this payment in the {{ verifying.method === 'GCash' ? 'GCash' : 'bank' }} records first. Enter what you actually see there.</p>
+            <dl class="mt-4 grid grid-cols-2 gap-3 rounded-xl border border-gray-200 bg-gray-50 p-3 text-xs">
+                <div><dt class="text-gray-500">Customer submitted</dt><dd class="font-medium text-gray-900">{{ formatMoney(verifying.submitted_amount) }} · {{ verifying.method }}</dd></div>
+                <div><dt class="text-gray-500">Their reference</dt><dd class="font-mono font-medium text-gray-900">{{ verifying.submitted_reference || '—' }}</dd></div>
+                <div><dt class="text-gray-500">Order balance</dt><dd class="font-medium text-gray-900">{{ formatMoney(sale.outstanding_balance) }}</dd></div>
+                <div><dt class="text-gray-500">Proof</dt><dd><a v-if="verifying.proof_url" :href="verifying.proof_url" target="_blank" class="text-brand hover:underline">Open proof</a><span v-else class="text-gray-400">none</span></dd></div>
+            </dl>
+            <img v-if="verifying.proof_url && !verifying.proof_url.endsWith('.pdf')" :src="verifying.proof_url" alt="Proof of payment" class="mt-3 max-h-64 w-full rounded-lg border border-gray-200 object-contain" />
+            <div class="mt-4 space-y-4">
+                <div class="grid grid-cols-2 gap-3">
+                    <div><label class="field-label" for="v-ref">Verified transaction reference</label>
+                        <input id="v-ref" v-model="verifyForm.reference" required maxlength="100" class="field-control font-mono" /></div>
+                    <div><label class="field-label" for="v-amount">Amount actually received</label>
+                        <input id="v-amount" v-model.number="verifyForm.amount" type="number" min="0.01" step="0.01" required class="field-control" /></div>
+                </div>
+                <div><label class="field-label" for="v-date">Actual payment date</label>
+                    <input id="v-date" v-model="verifyForm.payment_date" type="date" :max="today" required class="field-control" /></div>
+                <div><label class="field-label" for="v-remarks">Verification remarks</label>
+                    <textarea id="v-remarks" v-model="verifyForm.remarks" rows="2" maxlength="1000" class="field-control" placeholder="e.g. Seen in BDO statement, Oct 30"></textarea></div>
+            </div>
+            <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
+                <button type="button" class="secondary-button" @click="verifying = null">Close</button>
+                <button type="submit" class="brand-button" :disabled="busy">{{ busy ? 'Verifying…' : 'Confirm payment' }}</button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Payment terms (administrator) -->
+    <div v-if="showTerms" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+        <form class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-gray-200 bg-white p-6 shadow-xl" @submit.prevent="submitTerms">
+            <h3 class="text-lg font-semibold text-gray-900">Payment terms</h3>
+            <p class="mt-1 text-xs text-gray-500">Approved terms decide when the order is confirmed. Credit terms confirm it now.</p>
+            <div class="mt-4 space-y-3">
+                <label v-for="t in [{ v: 'full', l: 'Full payment before confirmation' }, { v: 'down_payment', l: 'Down payment, balance later' }, { v: 'credit', l: 'Credit terms' }]" :key="t.v"
+                       :class="termsForm.payment_terms === t.v ? 'border-[#4b5320] bg-[#4b5320]/5' : 'border-gray-200'" class="flex cursor-pointer items-center gap-2 rounded-xl border p-3 text-sm">
+                    <input v-model="termsForm.payment_terms" type="radio" :value="t.v" class="accent-[#4b5320]" /> {{ t.l }}
+                </label>
+                <div v-if="termsForm.payment_terms === 'down_payment'"><label class="field-label" for="t-down">Required down payment (USD)</label>
+                    <input id="t-down" v-model.number="termsForm.required_down_payment" type="number" min="0.01" :max="sale.grand_total" step="0.01" required class="field-control" /></div>
+                <div v-if="termsForm.payment_terms === 'credit'"><label class="field-label" for="t-days">Credit days</label>
+                    <input id="t-days" v-model.number="termsForm.credit_days" type="number" min="1" max="365" required class="field-control" /></div>
+                <p v-if="termsForm.payment_terms === 'credit'" class="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                    <AlertTriangle class="size-4 shrink-0" /> The order will be confirmed, stock reserved and the invoice issued now, before any payment.
+                </p>
+            </div>
+            <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
+                <button type="button" class="secondary-button" @click="showTerms = false">Cancel</button>
+                <button type="submit" class="brand-button" :disabled="busy">Approve terms</button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Reason prompt -->
+    <div v-if="reasonPrompt" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+        <form class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-gray-200 bg-white p-6 shadow-xl" @submit.prevent="submitReason">
+            <h3 class="text-lg font-semibold text-gray-900">{{ reasonPrompt.title }}</h3>
+            <p class="mt-1 text-xs text-gray-500">{{ reasonPrompt.help }}</p>
+            <label class="field-label mt-4" for="reason">Reason</label>
+            <textarea id="reason" v-model="reason" rows="3" maxlength="500" required class="field-control"></textarea>
+            <label v-if="reasonPrompt.reissue" class="mt-3 flex items-center gap-2 text-sm text-gray-700">
+                <input v-model="reissue" type="checkbox" class="accent-[#4b5320]" /> Issue a corrected replacement and email it
+            </label>
+            <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
+                <button type="button" class="secondary-button" @click="reasonPrompt = null">Back</button>
+                <button type="submit" :disabled="busy || !reason.trim()"
+                        :class="reasonPrompt.danger ? 'inline-flex min-h-10 items-center justify-center rounded-xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white hover:bg-rose-700 disabled:opacity-50' : 'brand-button'">
+                    {{ reasonPrompt.confirm }}
+                </button>
+            </div>
+        </form>
     </div>
 </template>

@@ -3,16 +3,20 @@
 namespace App\Http\Controllers;
 
 use App\Enums\QuotationStatus;
+use App\Enums\SalesOrderStatus;
 use App\Models\Product;
 use App\Models\PurchaseRequest;
 use App\Models\Quotation;
 use App\Models\Sale;
 use App\Models\SaleItem;
-use App\Models\StockMovement;
 use App\Models\Supplier;
+use App\Services\Forecast\SmaForecaster;
+use App\Services\Inventory\ProductPrioritizer;
+use App\Services\Suppliers\SupplierEvaluator;
 use App\Support\Csv;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Inertia\Inertia;
 use Inertia\Response;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -90,7 +94,7 @@ class ReportController extends Controller
         $inStockCount = max(0, $inventoryCount - $lowStockCount);
 
         // Sales Metrics (filtered by date range)
-        $salesQuery = Sale::where('team_id', $team->id)->where('status', '!=', 'Cancelled');
+        $salesQuery = Sale::where('team_id', $team->id)->whereIn('status', SalesOrderStatus::countedInSales());
         if ($fromDate) {
             $salesQuery->where('sale_date', '>=', $fromDate)->where('sale_date', '<=', $toDate);
         }
@@ -105,7 +109,7 @@ class ReportController extends Controller
         $quotationsCount = $quotesQuery->count();
         $pendingQuotationsCount = (clone $quotesQuery)->where('status', 'Pending')->count();
         $pendingQuotationsValue = (float) (clone $quotesQuery)->where('status', 'Pending')->sum('grand_total');
-        $approvedQuotationsCount = (clone $quotesQuery)->where('status', 'Approved')->count();
+        $approvedQuotationsCount = (clone $quotesQuery)->where(fn ($q) => $q->whereNotNull('approved_at')->orWhereIn('status', [QuotationStatus::Sent->value, QuotationStatus::Accepted->value, QuotationStatus::Converted->value]))->count();
         $convertedQuotationsCount = (clone $quotesQuery)->whereNotNull('converted_to_sale_id')->count();
 
         // Procurement Metrics (filtered by date range)
@@ -250,7 +254,7 @@ class ReportController extends Controller
         }
 
         $salesMovements = Sale::where('team_id', $team->id)
-            ->where('status', '!=', 'Cancelled')
+            ->whereIn('status', SalesOrderStatus::countedInSales())
             ->where('sale_date', '>=', $trendPeriods[0]->copy()->startOfMonth())
             ->where('sale_date', '<=', $trendPeriods[count($trendPeriods) - 1]->copy()->endOfMonth())
             ->selectRaw("DATE_FORMAT(sale_date, '%Y-%m') as ym, SUM(grand_total) as monthly_rev, COUNT(*) as count")
@@ -275,7 +279,7 @@ class ReportController extends Controller
 
         // Top Selling Products from SaleItem
         $topSellingItems = SaleItem::whereHas('sale', function ($q) use ($team, $fromDate, $toDate) {
-            $q->where('team_id', $team->id)->where('status', '!=', 'Cancelled');
+            $q->where('team_id', $team->id)->whereIn('status', SalesOrderStatus::countedInSales());
             if ($fromDate) {
                 $q->where('sale_date', '>=', $fromDate)->where('sale_date', '<=', $toDate);
             }
@@ -303,14 +307,16 @@ class ReportController extends Controller
             ->get()
             ->map(fn ($s) => [
                 'id' => $s->id,
-                'invoice_number' => $s->invoice_number,
+                'invoice_number' => $s->invoice_number ?: $s->order_number,
+                'order_number' => $s->order_number,
                 'client_name' => $s->client_name,
                 'sale_date' => $s->sale_date?->format('Y-m-d') ?? 'N/A',
                 'subtotal' => (float) $s->subtotal,
                 'tax_amount' => (float) $s->tax_amount,
                 'grand_total' => (float) $s->grand_total,
                 'payment_method' => $s->payment_method ?? 'Cash',
-                'status' => $s->status,
+                'status' => $s->status?->label(),
+                'payment_status' => $s->payment_status?->label(),
             ]);
 
         // Quotations table list
@@ -326,37 +332,17 @@ class ReportController extends Controller
                 'quotation_date' => $q->quotation_date?->format('Y-m-d') ?? 'N/A',
                 'valid_until' => $q->valid_until?->format('Y-m-d') ?? 'N/A',
                 'grand_total' => (float) $q->grand_total,
-                'status' => $q->status instanceof QuotationStatus ? $q->status->value : (string) $q->status,
+                'status' => $q->status?->label() ?? '',
                 'is_converted' => ! empty($q->converted_to_sale_id),
             ]);
 
         // D. Demand Forecast Analysis (Historical vs 3-Mo SMA)
         $forecastMonths = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
         $curYear = (int) $today->year;
-        $monthlyMovements = StockMovement::where('team_id', $team->id)
-            ->whereIn('type', ['sale', 'out'])
-            ->whereYear('movement_date', $curYear)
-            ->selectRaw('MONTH(movement_date) as m, SUM(ABS(quantity)) as total_qty')
-            ->groupBy('m')
-            ->pluck('total_qty', 'm');
-
-        $historicalDemand = [];
-        for ($m = 1; $m <= 12; $m++) {
-            $historicalDemand[] = (int) ($monthlyMovements[$m] ?? 0);
-        }
-
-        // If no records, provide baseline seasonal pattern
-        if (array_sum($historicalDemand) === 0) {
-            foreach ($forecastMonths as $idx => $mName) {
-                $seasonal = sin(($idx + 1) * (pi() / 6)) * 30;
-                $historicalDemand[$idx] = (int) max(15, round(120 + $seasonal));
-            }
-        }
-
-        $smaForecast = array_fill(0, 12, null);
-        for ($i = 3; $i < 12; $i++) {
-            $smaForecast[$i] = (int) round(($historicalDemand[$i - 1] + $historicalDemand[$i - 2] + $historicalDemand[$i - 3]) / 3 * 1.08);
-        }
+        // Same SMA-3 as the Demand Forecasting module; no invented history when there are no records.
+        $yearSeries = app(SmaForecaster::class)->series($team->id, Carbon::create($curYear, 1, 1), Carbon::create($curYear, 12, 31), 3);
+        $historicalDemand = $yearSeries['historical'];
+        $smaForecast = $yearSeries['forecast'];
 
         // E. Procurement & Purchasing Analytics
         $procurementStatusCounts = PurchaseRequest::where('team_id', $team->id)
@@ -385,22 +371,21 @@ class ReportController extends Controller
             ]);
 
         // F. Supplier AHP Prioritization Analytics
-        $suppliers = Supplier::where('team_id', $team->id)
-            ->orderByDesc('ahp_score')
-            ->get();
-
-        $ahpRankingItems = $suppliers->map(function ($s, $idx) {
-            $metrics = $s->metrics ?? ['price' => 7, 'quality' => 7, 'delivery' => 7, 'service' => 7];
+        $ahpRankingItems = $this->rankedSupplierEvaluations($team->id)->values()->map(function ($row, $idx) {
+            [$s, $e] = $row;
 
             return [
-                'rank' => $idx + 1,
+                'rank' => $e['complete'] ? $idx + 1 : null,
                 'id' => $s->id,
                 'name' => $s->name,
                 'contact_person' => $s->contact_person ?? 'N/A',
                 'email' => $s->email ?? 'N/A',
                 'phone' => $s->phone ?? 'N/A',
-                'ahp_score' => (float) ($s->ahp_score ?? 0.0),
-                'metrics' => $metrics,
+                'ahp_score' => $e['score'],
+                'classification' => $e['classification'],
+                'complete' => $e['complete'],
+                'metrics' => collect($e['criteria'])->mapWithKeys(fn ($c) => [$c['key'] => $c['score']])->all(),
+                'evaluation' => $e,
                 'status' => $s->status,
             ];
         });
@@ -474,6 +459,10 @@ class ReportController extends Controller
                 'historical' => $historicalDemand,
                 'forecast' => $smaForecast,
                 'year' => $curYear,
+                'window' => 3,
+                'hasData' => $yearSeries['hasData'],
+                'steps' => $yearSeries['steps'],
+                'sourceRecordCount' => $yearSeries['sourceRecordCount'],
             ],
 
             'procurementAnalytics' => [
@@ -490,6 +479,19 @@ class ReportController extends Controller
             'ahpAnalytics' => [
                 'topSuppliers' => $ahpRankingItems->take(6)->values(),
                 'suppliersList' => $ahpRankingItems,
+                'weights' => config('evaluation.supplier.weights'),
+                'deliverySplit' => config('evaluation.supplier.delivery_split'),
+                'periodMonths' => (int) config('evaluation.supplier.period_months'),
+                'classes' => config('evaluation.supplier.classes'),
+            ],
+
+            // AHP Product Prioritization: same service as the Inventory page.
+            'productPriority' => [
+                'items' => array_values(app(ProductPrioritizer::class)->forTeam($team->id)),
+                'weights' => config('evaluation.product_priority.weights'),
+                'classes' => config('evaluation.product_priority.classes'),
+                'movementMonths' => (int) config('evaluation.product_priority.movement_months'),
+                'smaWindow' => SmaForecaster::DEFAULT_WINDOW,
             ],
         ]);
     }
@@ -624,7 +626,7 @@ class ReportController extends Controller
                         number_format($q->subtotal, 2),
                         number_format($q->tax_amount, 2),
                         number_format($q->grand_total, 2),
-                        $q->status instanceof QuotationStatus ? $q->status->value : (string) $q->status,
+                        $q->status?->label() ?? '',
                         $q->converted_to_sale_id ? 'Yes' : 'No',
                     ]);
                 }
@@ -644,7 +646,7 @@ class ReportController extends Controller
                     number_format($s->tax_amount, 2),
                     number_format($s->grand_total, 2),
                     $s->payment_method ?? 'Cash',
-                    $s->status,
+                    $s->status?->label(),
                 ]);
             }
         });
@@ -662,23 +664,11 @@ class ReportController extends Controller
         $fileName = "forecast_analysis_{$year}_".date('Y-m-d').'.csv';
 
         $labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-        $movements = StockMovement::where('team_id', $team->id)
-            ->whereIn('type', ['sale', 'out'])
-            ->whereYear('movement_date', $year)
-            ->selectRaw('MONTH(movement_date) as month, SUM(ABS(quantity)) as total_qty')
-            ->groupBy('month')
-            ->pluck('total_qty', 'month');
+        $series = app(SmaForecaster::class)->series($team->id, Carbon::create($year, 1, 1), Carbon::create($year, 12, 31), 3);
 
-        return $this->streamCsv($fileName, ['Month', 'Recorded Demand (Units)', 'Moving Average Forecast (Units)'], function ($file) use ($labels, $movements) {
-            $history = [];
-            for ($m = 1; $m <= 12; $m++) {
-                $history[] = (int) ($movements[$m] ?? 0);
-            }
-
+        return $this->streamCsv($fileName, ['Month', 'Recorded Demand (Units)', 'SMA-3 Forecast (Units)'], function ($file) use ($labels, $series) {
             foreach ($labels as $idx => $mLabel) {
-                $val = $history[$idx];
-                $forecastVal = $idx >= 3 ? round(($history[$idx - 1] + $history[$idx - 2] + $history[$idx - 3]) / 3 * 1.08) : 'N/A';
-                Csv::put($file, [$mLabel, $val, $forecastVal]);
+                Csv::put($file, [$mLabel, $series['historical'][$idx], $series['forecast'][$idx] ?? 'N/A']);
             }
         });
     }
@@ -723,24 +713,25 @@ class ReportController extends Controller
         abort_if(! $team, 403);
 
         $fileName = 'supplier_ahp_report_'.date('Y-m-d').'.csv';
-        $suppliers = Supplier::where('team_id', $team->id)
-            ->orderByDesc('ahp_score')
-            ->get();
+        $rows = $this->rankedSupplierEvaluations($team->id);
+        $na = fn ($v) => $v === null ? 'Insufficient data' : number_format($v, 2);
 
-        return $this->streamCsv($fileName, ['Rank', 'Supplier Name', 'Contact Person', 'Email', 'Phone', 'AHP Composite Score', 'Price Rating', 'Quality Rating', 'Delivery Rating', 'Service Rating', 'Status'], function ($file) use ($suppliers) {
-            foreach ($suppliers as $idx => $s) {
-                $m = $s->metrics ?? [];
+        return $this->streamCsv($fileName, ['Rank', 'Supplier Name', 'Contact Person', 'Email', 'Phone', 'Evaluation Score (0-100)', 'Classification', 'Delivery Score', 'Price Score', 'Quality Score', 'Evaluation Period', 'Calculated At', 'Status'], function ($file) use ($rows, $na) {
+            foreach ($rows->values() as $idx => [$s, $e]) {
+                $scores = collect($e['criteria'])->mapWithKeys(fn ($c) => [$c['key'] => $c['score']]);
                 Csv::put($file, [
-                    $idx + 1,
+                    $e['complete'] ? $idx + 1 : '—',
                     $s->name,
                     $s->contact_person ?? 'N/A',
                     $s->email ?? 'N/A',
                     $s->phone ?? 'N/A',
-                    number_format($s->ahp_score ?? 0, 3),
-                    $m['price'] ?? 'N/A',
-                    $m['quality'] ?? 'N/A',
-                    $m['delivery'] ?? 'N/A',
-                    $m['service'] ?? 'N/A',
+                    $na($e['score']),
+                    $e['classification'] ?? 'Not classified (insufficient data)',
+                    $na($scores['delivery']),
+                    $na($scores['price']),
+                    $na($scores['quality']),
+                    $e['period']['from'].' to '.$e['period']['to'],
+                    $e['calculated_at'],
                     $s->status,
                 ]);
             }
@@ -758,7 +749,9 @@ class ReportController extends Controller
         $fileName = 'all_master_data_'.date('Y-m-d').'.csv';
         $products = Product::where('team_id', $team->id)->with('supplier:id,name')->get();
 
-        return $this->streamCsv($fileName, ['Type', 'SKU/Code', 'Name', 'Category/Role', 'Stock/Contact', 'Unit/Email', 'Price', 'Status'], function ($file) use ($products, $team) {
+        $evaluations = app(SupplierEvaluator::class)->forTeam($team->id);
+
+        return $this->streamCsv($fileName, ['Type', 'SKU/Code', 'Name', 'Category/Role', 'Stock/Contact', 'Unit/Email', 'Price/Evaluation Score', 'Status'], function ($file) use ($products, $team, $evaluations) {
             foreach ($products as $p) {
                 Csv::put($file, [
                     'Product',
@@ -780,11 +773,28 @@ class ReportController extends Controller
                     $s->contact_person ?? 'N/A',
                     $s->phone ?? 'N/A',
                     $s->email ?? 'N/A',
-                    $s->ahp_score ? number_format($s->ahp_score, 3) : '0.000',
+                    ($evaluations[$s->id]['score'] ?? null) !== null ? number_format($evaluations[$s->id]['score'], 2) : 'Insufficient data',
                     $s->status,
                 ]);
             }
         });
+    }
+
+    /**
+     * Suppliers with their record-based evaluation: complete scores first (highest first), then the rest by name.
+     *
+     * @return Collection<int, array{0: Supplier, 1: array}>
+     */
+    private function rankedSupplierEvaluations(int $teamId): Collection
+    {
+        $evaluations = app(SupplierEvaluator::class)->forTeam($teamId);
+
+        return Supplier::where('team_id', $teamId)->orderBy('name')->get()
+            ->map(fn ($s) => [$s, $evaluations[$s->id]])
+            ->sortBy([
+                fn ($a, $b) => $b[1]['complete'] <=> $a[1]['complete'],
+                fn ($a, $b) => ($b[1]['score'] ?? -1) <=> ($a[1]['score'] ?? -1),
+            ]);
     }
 
     /**

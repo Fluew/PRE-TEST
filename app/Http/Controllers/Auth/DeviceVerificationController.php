@@ -283,6 +283,108 @@ class DeviceVerificationController extends Controller
     }
 
     /**
+     * Show emergency admin device recovery view (/device/recover).
+     */
+    public function showRecover(Request $request): Response
+    {
+        return Inertia::render('auth/RecoverDevice', [
+            'status' => session('status'),
+        ]);
+    }
+
+    /**
+     * Process emergency admin recovery using the single-use Emergency Admin Recovery Key.
+     */
+    public function processRecover(Request $request): RedirectResponse
+    {
+        $validated = $request->validate([
+            'email' => ['required', 'email'],
+            'password' => ['required', 'string'],
+            'recovery_key' => ['required', 'string', 'max:64'],
+            'device_name' => ['nullable', 'string', 'max:100'],
+        ], [
+            'recovery_key.required' => 'Please enter your Emergency Admin Recovery Key.',
+        ]);
+
+        $user = User::where('email', strtolower(trim($validated['email'])))->first();
+        $submittedKey = strtoupper(trim($validated['recovery_key']));
+
+        // Verify credentials and administrator status
+        if (! $user || ! $user->isAdmin() || ! Hash::check($validated['password'], $user->password)) {
+            AuditLogger::security(
+                'auth.recovery_key.failed',
+                "Emergency recovery failed (invalid credentials) for {$validated['email']}.",
+                $user,
+                'warning',
+                ['ip' => $request->ip()],
+                'failure',
+                $request
+            );
+
+            return back()->withErrors([
+                'recovery_key' => 'Invalid administrator credentials or recovery key.',
+            ]);
+        }
+
+        // Verify recovery key
+        if (empty($user->admin_recovery_key) || ! hash_equals($user->admin_recovery_key, $submittedKey)) {
+            AuditLogger::security(
+                'auth.recovery_key.mismatch',
+                "Emergency recovery failed (key mismatch) for {$user->email}.",
+                $user,
+                'warning',
+                ['ip' => $request->ip()],
+                'failure',
+                $request
+            );
+
+            return back()->withErrors([
+                'recovery_key' => 'The recovery key provided is invalid or has already been used. Please check the key or contact server administrator.',
+            ]);
+        }
+
+        // Rotate single-use recovery key immediately
+        $newKey = 'RECOVER-'.strtoupper(Str::random(6)).'-'.strtoupper(Str::random(6)).'-'.strtoupper(Str::random(6));
+        $user->forceFill(['admin_recovery_key' => $newKey])->save();
+
+        $deviceName = ! empty($validated['device_name'])
+            ? trim($validated['device_name'])
+            : ($this->parseDeviceName($request).' (Emergency Recovery)');
+
+        // Clear existing devices for this user if single-device policy, or register new approved device
+        TrustedDevice::where('user_id', $user->id)->delete();
+
+        $device = TrustedDevice::create([
+            'user_id' => $user->id,
+            'device_uuid' => (string) Str::uuid(),
+            'device_name' => $deviceName,
+            'status' => 'approved',
+            'approved_at' => now(),
+            'ip_address' => $request->ip(),
+            'last_used_at' => now(),
+            'is_shared' => false,
+        ]);
+
+        // Issue permanent cookie credentials to current browser
+        $device->issueCredential();
+
+        AuditLogger::security(
+            'auth.recovery_key.used',
+            "Administrator {$user->email} bypassed workstation verification using Emergency Recovery Key. Device '{$deviceName}' authorized.",
+            $user,
+            'info',
+            ['device_id' => $device->id, 'ip' => $request->ip()],
+            'success',
+            $request
+        );
+
+        return redirect()->route('login')->with(
+            'status',
+            'Emergency recovery successful! This workstation is now authorized. Please sign in with your administrator credentials.'
+        );
+    }
+
+    /**
      * Old one-click authorization link. It used to trust the browser from the link alone; it
      * now forwards to the normal enrollment page, which also requires the OTP, email and password.
      */

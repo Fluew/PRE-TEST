@@ -6,15 +6,14 @@ use App\Models\Product;
 use App\Models\StockMovement;
 use App\Models\Supplier;
 use App\Models\Team;
+use App\Services\AuditLogger;
 use App\Services\Inventory\InventoryExporter;
-use App\Services\MaterialList\ExtractionException;
-use App\Services\MaterialList\FileReader;
-use App\Services\MaterialList\MaterialParser;
+use App\Services\Inventory\ProductPrioritizer;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
-use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
@@ -36,9 +35,15 @@ class InventoryController extends Controller
     {
         $thresholdSql = self::THRESHOLD_SQL;
 
+        // "Incomplete": products imported with missing values, inactive until staff complete them.
         $query = Product::where('team_id', $teamId)
-            ->where('is_active', true)
+            ->when($status === 'Incomplete',
+                fn ($q) => $q->where('is_active', false)->whereNotNull('missing_fields'),
+                fn ($q) => $q->where('is_active', true))
             ->with('supplier:id,name');
+        if ($status === 'Incomplete') {
+            $status = null;
+        }
 
         if ($search) {
             $query->where(function ($q) use ($search) {
@@ -95,32 +100,47 @@ class InventoryController extends Controller
             ->paginate(10)
             ->withQueryString();
 
-        // Calculate inventory summary counts using dynamic stock thresholds
-        $baseCountQuery = fn () => Product::where('team_id', $team->id)->where('is_active', true);
+        // Calculate inventory summary counts in a single aggregate query
+        $counts = Product::where('team_id', $team->id)
+            ->where('is_active', true)
+            ->selectRaw("
+                COUNT(*) as total_items,
+                SUM(CASE WHEN stock <= 0 THEN 1 ELSE 0 END) as out_of_stock,
+                SUM(CASE WHEN stock > 0 AND stock <= {$thresholdSql} THEN 1 ELSE 0 END) as low_stock,
+                SUM(CASE WHEN stock > {$thresholdSql} THEN 1 ELSE 0 END) as in_stock,
+                SUM(CASE WHEN stock <= {$thresholdSql} THEN 1 ELSE 0 END) as requiring_reorder
+            ")
+            ->first();
 
-        $totalItems = $baseCountQuery()->count();
-        $outOfStockCount = $baseCountQuery()->where('stock', '<=', 0)->count();
-        $lowStockCount = $baseCountQuery()->where('stock', '>', 0)->whereRaw("stock <= {$thresholdSql}")->count();
-        $inStockCount = $baseCountQuery()->whereRaw("stock > {$thresholdSql}")->count();
-        $requiringReorderCount = $baseCountQuery()->whereRaw("stock <= {$thresholdSql}")->count();
+        $totalItems = (int) ($counts->total_items ?? 0);
+        $outOfStockCount = (int) ($counts->out_of_stock ?? 0);
+        $lowStockCount = (int) ($counts->low_stock ?? 0);
+        $inStockCount = (int) ($counts->in_stock ?? 0);
+        $requiringReorderCount = (int) ($counts->requiring_reorder ?? 0);
 
-        // Categories list
-        $categories = Product::where('team_id', $team->id)
-            ->distinct()
-            ->pluck('category')
-            ->filter()
-            ->values()
-            ->toArray();
-        if (empty($categories)) {
-            $categories = ['Breakers', 'Wiring', 'Lighting', 'Controls', 'Tools', 'General'];
-        }
+        // Categories list (cached for 5 minutes per team)
+        $categories = Cache::remember("team:{$team->id}:categories", 300, function () use ($team) {
+            $cats = Product::where('team_id', $team->id)
+                ->distinct()
+                ->pluck('category')
+                ->filter()
+                ->values()
+                ->toArray();
 
-        // Suppliers list
-        $suppliers = Supplier::where('team_id', $team->id)
-            ->where('status', 'Active')
-            ->select('id', 'name', 'contact_person', 'phone')
-            ->orderBy('name')
-            ->get();
+            return empty($cats) ? ['Breakers', 'Wiring', 'Lighting', 'Controls', 'Tools', 'General'] : $cats;
+        });
+
+        // Suppliers list (cached for 5 minutes per team). Cached as plain arrays: the cache does
+        // not unserialize objects (cache.serializable_classes), so a cached Collection comes
+        // back as __PHP_Incomplete_Class and reaches the page as {} instead of a list.
+        $suppliers = Cache::remember("team:{$team->id}:suppliers_list_v2", 300, function () use ($team) {
+            return Supplier::where('team_id', $team->id)
+                ->where('status', 'Active')
+                ->select('id', 'name', 'contact_person', 'phone')
+                ->orderBy('name')
+                ->get()
+                ->toArray();
+        });
 
         // Recent stock movements for audit (filtered by search, category, and status when supplied)
         $movementsQuery = StockMovement::where('team_id', $team->id)
@@ -166,12 +186,14 @@ class InventoryController extends Controller
 
         return Inertia::render('Inventory/Index', [
             'products' => $products,
+            'priorities' => array_values(app(ProductPrioritizer::class)->forTeam($team->id)),
             'summary' => [
                 'total' => $totalItems,
                 'in_stock' => $inStockCount,
                 'low_stock' => $lowStockCount,
                 'out_of_stock' => $outOfStockCount,
                 'requiring_reorder' => $requiringReorderCount,
+                'incomplete' => Product::where('team_id', $team->id)->where('is_active', false)->whereNotNull('missing_fields')->count(),
             ],
             'categories' => array_values(array_unique(array_merge(['Breakers', 'Wiring', 'Lighting', 'Controls', 'Tools', 'General'], $categories))),
             'suppliers' => $suppliers,
@@ -303,7 +325,8 @@ class InventoryController extends Controller
             'name' => trim($validated['name']),
             'category' => $validated['category'],
             'brand' => filled($validated['brand'] ?? null) ? trim($validated['brand']) : null,
-            'unit' => $validated['unit'] ?? $product->unit ?? 'pcs',
+            // An imported product with no unit keeps it empty until staff enter one (never assumed).
+            'unit' => $validated['unit'] ?? $product->unit ?? ($product->missing_fields !== null ? null : 'pcs'),
             'price' => $validated['price'],
             'cost_price' => $validated['cost_price'] ?? $product->cost_price,
             'min_stock' => $reorderLevel,
@@ -313,7 +336,14 @@ class InventoryController extends Controller
             'supplier_id' => $validated['supplier_id'] ?? null,
         ]);
 
+        $wasIncomplete = ! $product->is_active && $product->missing_fields !== null;
         $product->updateCalculatedStatus();
+        $product->refreshCompleteness();
+        if ($wasIncomplete && $product->is_active) {
+            AuditLogger::record('product.completed', "Imported product {$product->sku} completed and activated.", $product, [], $request->user());
+
+            return back()->with('success', "Product '{$product->name}' completed and is now active.");
+        }
 
         return back()->with('success', "Product '{$product->name}' updated successfully!");
     }
@@ -510,262 +540,6 @@ class InventoryController extends Controller
     }
 
     /**
-     * Process CSV Import: supports previewing and executing imports.
-     */
-    public function importCsv(Request $request, FileReader $reader): JsonResponse|RedirectResponse
-    {
-        $team = $request->user()->currentTeam;
-
-        $request->validate([
-            'file' => ['required', 'file', 'max:10240', 'extensions:'.implode(',', [...FileReader::EXTENSIONS, 'txt'])],
-            'mode' => ['nullable', 'in:append,replace'],
-            'execute' => ['nullable', 'boolean'],
-        ], [
-            'file.max' => 'The file is larger than 10 MB. Please upload a smaller file.',
-            'file.extensions' => 'This file type is not supported. Please upload a PDF, Excel (.xlsx/.xls), CSV, JPG or PNG file.',
-        ]);
-
-        // Replace mode archives (inventory) or overwrites (quotations) existing records, so it is admin-only.
-        abort_if($request->input('mode') === 'replace' && ! $request->user()->isAdmin(), 403, 'Only administrators can use Replace mode.');
-
-        try {
-            [$lines, $method] = $this->readImportFile($request->file('file'), $reader);
-        } catch (ExtractionException $e) {
-            return $this->importFailure($request, $e->getMessage());
-        }
-        $ocr = in_array($method, ['ocr', 'pdf-ocr'], true);
-
-        // The header row is usually first, but PDFs and photos often have a title above it.
-        // Below the first row only exact header names count, so a data row is never taken for one.
-        $headerAt = null;
-        foreach (array_slice($lines, 0, 30, true) as $i => $row) {
-            if ($this->isHeaderRow($row, $i > 0)) {
-                $headerAt = $i;
-                break;
-            }
-        }
-        $cols = $headerAt !== null ? $this->importColumns($lines[$headerAt]) : null;
-
-        if (count($lines) < 2) {
-            return $this->importFailure($request, 'The uploaded file is empty or missing headers.');
-        }
-        if ($headerAt === null) {
-            return $this->importFailure($request, $ocr
-                ? 'We could not find the SKU and Product Name columns in this file. If it is a photo or scan, make sure the column headers are clearly visible, or upload an Excel/CSV file instead.'
-                : 'Required column headers missing. The file must include SKU and Product Name columns.');
-        }
-
-        [
-            'sku' => $skuIdx, 'name' => $nameIdx, 'category' => $catIdx, 'brand' => $brandIdx, 'unit' => $unitIdx,
-            'cost' => $costIdx, 'price' => $priceIdx, 'stock' => $stockIdx, 'reorder_level' => $reorderLvlIdx, 'reorder_qty' => $reorderQtyIdx,
-        ] = $cols;
-
-        $validRows = [];
-        $invalidRows = [];
-        $seenSkus = [];
-
-        // Fetch existing SKUs in team for uniqueness check
-        $existingSkus = Product::where('team_id', $team->id)->pluck('id', 'sku')->toArray();
-
-        for ($i = $headerAt + 1; $i < count($lines); $i++) {
-            $row = $lines[$i];
-            if (implode('', $row) === '') {
-                continue;
-            }
-            if ($ocr) {
-                // OCR misreads digits as look-alike letters ("1O" for 10, "l5" for 15).
-                foreach ([$costIdx, $priceIdx, $stockIdx, $reorderLvlIdx, $reorderQtyIdx] as $idx) {
-                    if ($idx !== -1 && isset($row[$idx]) && preg_match('/\d/', $row[$idx]) && preg_match('/^[\d\s.,₱OoIl|]+$/u', $row[$idx])) {
-                        $row[$idx] = strtr($row[$idx], ['O' => '0', 'o' => '0', 'I' => '1', 'l' => '1', '|' => '1']);
-                    }
-                }
-            }
-
-            $rowNumber = $i + 1;
-            $sku = isset($row[$skuIdx]) ? strtoupper(trim($row[$skuIdx])) : '';
-            $name = isset($row[$nameIdx]) ? trim($row[$nameIdx]) : '';
-            $category = ($catIdx !== -1 && isset($row[$catIdx]) && trim($row[$catIdx]) !== '') ? trim($row[$catIdx]) : 'General';
-            $brand = ($brandIdx !== -1 && isset($row[$brandIdx]) && trim($row[$brandIdx]) !== '') ? mb_substr(trim($row[$brandIdx]), 0, 100) : null;
-            $unit = ($unitIdx !== -1 && isset($row[$unitIdx]) && trim($row[$unitIdx]) !== '') ? trim($row[$unitIdx]) : 'pcs';
-
-            $costPriceStr = $costIdx !== -1 && isset($row[$costIdx]) ? preg_replace('/[^0-9.-]/', '', (string) $row[$costIdx]) : '0';
-            $costPrice = is_numeric($costPriceStr) ? (float) $costPriceStr : 0.00;
-
-            $priceStr = $priceIdx !== -1 && isset($row[$priceIdx]) ? preg_replace('/[^0-9.-]/', '', (string) $row[$priceIdx]) : '0';
-            $price = is_numeric($priceStr) ? (float) $priceStr : 0.00;
-
-            $stockStr = $stockIdx !== -1 && isset($row[$stockIdx]) ? preg_replace('/[^0-9-]/', '', (string) $row[$stockIdx]) : '0';
-            $stock = is_numeric($stockStr) ? (int) $stockStr : 0;
-
-            $reorderLvlStr = $reorderLvlIdx !== -1 && isset($row[$reorderLvlIdx]) ? preg_replace('/[^0-9-]/', '', (string) $row[$reorderLvlIdx]) : '10';
-            $reorderLevel = is_numeric($reorderLvlStr) ? (int) $reorderLvlStr : 10;
-
-            $reorderQtyStr = $reorderQtyIdx !== -1 && isset($row[$reorderQtyIdx]) ? preg_replace('/[^0-9-]/', '', (string) $row[$reorderQtyIdx]) : '50';
-            $reorderQuantity = is_numeric($reorderQtyStr) ? (int) $reorderQtyStr : 50;
-
-            // Validation rules
-            $errors = [];
-            if ($sku === '') {
-                $errors[] = 'SKU is required.';
-            }
-            if ($name === '') {
-                $errors[] = 'Product Name is required.';
-            }
-            if ($price < 0) {
-                $errors[] = 'Selling price cannot be negative.';
-            }
-            if ($costPrice < 0) {
-                $errors[] = 'Cost price cannot be negative.';
-            }
-            if ($stock < 0) {
-                $errors[] = 'Stock quantity cannot be negative.';
-            }
-            if ($reorderLevel < 0) {
-                $errors[] = 'Reorder level cannot be negative.';
-            }
-            if ($reorderQuantity < 0) {
-                $errors[] = 'Reorder quantity cannot be negative.';
-            }
-            if (isset($seenSkus[$sku])) {
-                $errors[] = "Duplicate SKU '{$sku}' found in row {$seenSkus[$sku]}.";
-            } else {
-                $seenSkus[$sku] = $rowNumber;
-            }
-
-            if (! empty($errors)) {
-                $invalidRows[] = [
-                    'row' => $rowNumber,
-                    'sku' => $sku ?: 'N/A',
-                    'name' => $name ?: 'N/A',
-                    'errors' => $errors,
-                ];
-            } else {
-                $status = 'In Stock';
-                if ($stock <= 0) {
-                    $status = 'Out of Stock';
-                } elseif ($stock <= $reorderLevel) {
-                    $status = 'Low Stock';
-                }
-
-                $validRows[] = [
-                    'sku' => $sku,
-                    'name' => $name,
-                    'category' => $category,
-                    'brand' => $brand,
-                    'unit' => $unit,
-                    'cost_price' => $costPrice,
-                    'price' => $price,
-                    'stock' => $stock,
-                    'reorder_level' => $reorderLevel,
-                    'reorder_quantity' => $reorderQuantity,
-                    'status' => $status,
-                    'is_update' => isset($existingSkus[$sku]),
-                ];
-            }
-        }
-
-        // If not executing, return JSON preview response
-        if (! $request->boolean('execute')) {
-            return response()->json([
-                'success' => true,
-                'method' => $method,
-                'warning' => $ocr ? 'This file was read with text recognition (OCR). Check every row against the original before importing.' : null,
-                'total_rows' => count($lines) - $headerAt - 1,
-                'valid_count' => count($validRows),
-                'invalid_count' => count($invalidRows),
-                'valid_rows' => $validRows,
-                'invalid_rows' => $invalidRows,
-            ]);
-        }
-
-        // Execute import in database transaction
-        $mode = $request->input('mode', 'append');
-        $importedCount = 0;
-        $updatedCount = 0;
-
-        DB::transaction(function () use ($team, $request, $validRows, $mode, &$importedCount, &$updatedCount) {
-            if ($mode === 'replace') {
-                // Soft archive or clear active products
-                Product::where('team_id', $team->id)->update(['is_active' => false]);
-            }
-
-            foreach ($validRows as $item) {
-                $existing = Product::where('team_id', $team->id)->where('sku', $item['sku'])->first();
-
-                if ($existing) {
-                    $prevStock = $existing->stock;
-                    $existing->update([
-                        'name' => $item['name'],
-                        'category' => $item['category'],
-                        'unit' => $item['unit'],
-                        'cost_price' => $item['cost_price'],
-                        'price' => $item['price'],
-                        'stock' => $item['stock'],
-                        'min_stock' => $item['reorder_level'],
-                        'reorder_level' => $item['reorder_level'],
-                        'reorder_quantity' => $item['reorder_quantity'],
-                        'status' => $item['status'],
-                        'is_active' => true,
-                    ] + ($item['brand'] !== null ? ['brand' => $item['brand']] : []));
-
-                    if ($prevStock !== $item['stock']) {
-                        StockMovement::create([
-                            'team_id' => $team->id,
-                            'product_id' => $existing->id,
-                            'user_id' => $request->user()->id,
-                            'type' => 'adjustment',
-                            'quantity' => abs($item['stock'] - $prevStock),
-                            'previous_stock' => $prevStock,
-                            'new_stock' => $item['stock'],
-                            'reference_number' => 'CSV-IMP-'.strtoupper(uniqid()),
-                            'reason' => 'File Import Update',
-                            'remarks' => "Stock updated via file import from {$prevStock} to {$item['stock']}.",
-                            'movement_date' => now(),
-                        ]);
-                    }
-                    $updatedCount++;
-                } else {
-                    $product = Product::create([
-                        'team_id' => $team->id,
-                        'sku' => $item['sku'],
-                        'name' => $item['name'],
-                        'category' => $item['category'],
-                        'brand' => $item['brand'],
-                        'unit' => $item['unit'],
-                        'cost_price' => $item['cost_price'],
-                        'price' => $item['price'],
-                        'stock' => $item['stock'],
-                        'min_stock' => $item['reorder_level'],
-                        'reorder_level' => $item['reorder_level'],
-                        'reorder_quantity' => $item['reorder_quantity'],
-                        'status' => $item['status'],
-                        'is_active' => true,
-                    ]);
-
-                    if ($item['stock'] > 0) {
-                        StockMovement::create([
-                            'team_id' => $team->id,
-                            'product_id' => $product->id,
-                            'user_id' => $request->user()->id,
-                            'type' => 'stock_in',
-                            'quantity' => $item['stock'],
-                            'previous_stock' => 0,
-                            'new_stock' => $item['stock'],
-                            'reference_number' => 'CSV-NEW-'.strtoupper(uniqid()),
-                            'reason' => 'File Import New Entry',
-                            'remarks' => "New product registered with initial stock {$item['stock']}.",
-                            'movement_date' => now(),
-                        ]);
-                    }
-                    $importedCount++;
-                }
-            }
-        });
-
-        return back()->with('success', "Import completed! {$importedCount} new products added, {$updatedCount} updated.");
-    }
-
-    /**
      * Export active inventory records to CSV.
      */
     public function exportCsv(Request $request, InventoryExporter $exporter): SymfonyResponse
@@ -805,122 +579,6 @@ class InventoryController extends Controller
             'team' => $team->name,
             'filters' => $filters ? implode(', ', $filters) : 'All active products',
         ]);
-    }
-
-    /**
-     * Read an uploaded inventory file (PDF, Excel, CSV, JPG, PNG) into rows of text cells.
-     * Spreadsheets are read as they are. PDFs and images are rebuilt from word positions so
-     * their columns stay apart (FileReader::readTable); plain text is the fallback.
-     *
-     * @return array{0: array<int, array<int, string>>, 1: string} rows and how they were read
-     */
-    private function readImportFile(UploadedFile $file, FileReader $reader): array
-    {
-        $path = $file->getRealPath() ?: $file->getPathname();
-        $name = strtolower($file->getClientOriginalExtension()) === 'txt' ? 'import.csv' : $file->getClientOriginalName();
-        $type = $reader->detectType($path, $name);
-
-        try {
-            $read = $reader->readTable($path, $type, fn (array $cells) => $this->isHeaderRow($cells, true))
-                ?? $reader->read($path, $type);
-        } catch (ExtractionException $e) {
-            // The shared reader's wording is written for the quotation form's material list.
-            throw new ExtractionException(match ($e->reason) {
-                'ocr_unavailable' => 'Text recognition (OCR) is not available on the server right now, so photos and scanned PDFs cannot be read. Please upload an Excel or CSV file instead.',
-                'ocr_failed' => 'Text recognition failed or took too long for this file. Please try a clearer image, or upload an Excel or CSV file.',
-                'pdf_render_failed' => 'We could not read this scanned PDF. Please upload a clearer copy, or an Excel or CSV file.',
-                default => $e->getMessage(),
-            }, $e->reason);
-        }
-
-        $rows = isset($read['rows'])
-            ? $read['rows']
-            : array_map(fn ($line) => explode("\t", $line), MaterialParser::cleanLines($read['pages']));
-
-        $rows = array_map(fn ($row) => array_map(function ($cell) {
-            if (is_float($cell) && floor($cell) === $cell) {
-                $cell = (int) $cell;
-            }
-
-            return is_scalar($cell) && ! is_bool($cell) ? trim(preg_replace('/^\xEF\xBB\xBF/', '', (string) $cell)) : '';
-        }, array_values($row)), $rows);
-
-        return [$rows, $read['method']];
-    }
-
-    /**
-     * Column positions in a header row (-1 when absent). $exactOnly skips the loose
-     * "contains" matching, for telling a header apart from data rows below a title.
-     */
-    private function importColumns(array $row, bool $exactOnly = false): array
-    {
-        $headers = array_map(fn ($h) => preg_replace('/[^a-z0-9]/', '', strtolower((string) $h)), $row);
-        $find = fn (array $candidates) => $this->findHeaderIndex($headers, $candidates, $exactOnly);
-
-        return [
-            'sku' => $find(['sku', 'code', 'partnumber', 'itemcode', 'id']),
-            'name' => $find(['productname', 'name', 'itemname', 'description', 'title', 'product']),
-            'category' => $find(['category', 'cat', 'type', 'group']),
-            'brand' => $find(['brand', 'brandname', 'manufacturer', 'make']),
-            'unit' => $find(['unit', 'uom', 'measure']),
-            'cost' => $find(['costprice', 'cost', 'purchaseprice', 'unitcost']),
-            'price' => $find(['price', 'sellingprice', 'unitprice', 'rate']),
-            'stock' => $find(['stock', 'currentstock', 'qty', 'quantity', 'count']),
-            'reorder_level' => $find(['reorderlevel', 'minstock', 'threshold', 'minlevel', 'reorder']),
-            'reorder_qty' => $find(['reorderquantity', 'reorderqty', 'suggestedqty', 'orderqty']),
-        ];
-    }
-
-    /** A header row names both an SKU column and a product name column. */
-    private function isHeaderRow(array $row, bool $exactOnly): bool
-    {
-        $cols = $this->importColumns($row, $exactOnly);
-
-        return $cols['sku'] !== -1 && $cols['name'] !== -1 && $cols['sku'] !== $cols['name'];
-    }
-
-    /** Preview requests get JSON; the final import (an Inertia visit) gets a validation error. */
-    private function importFailure(Request $request, string $message): JsonResponse
-    {
-        if ($request->boolean('execute')) {
-            throw ValidationException::withMessages(['file' => $message]);
-        }
-
-        return response()->json([
-            'success' => false,
-            'message' => $message,
-            'valid_rows' => [],
-            'invalid_rows' => [],
-        ], 422);
-    }
-
-    /**
-     * Helper to find matching header index.
-     */
-    private function findHeaderIndex(array $headers, array $candidates, bool $exactOnly = false): int
-    {
-        // Exact match first
-        foreach ($candidates as $cand) {
-            foreach ($headers as $idx => $header) {
-                if ($header === $cand) {
-                    return $idx;
-                }
-            }
-        }
-        if ($exactOnly) {
-            return -1;
-        }
-
-        // Substring match
-        foreach ($candidates as $cand) {
-            foreach ($headers as $idx => $header) {
-                if ($header !== '' && (str_contains($header, $cand) || str_contains($cand, $header))) {
-                    return $idx;
-                }
-            }
-        }
-
-        return -1;
     }
 
     /**

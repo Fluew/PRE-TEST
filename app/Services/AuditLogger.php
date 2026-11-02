@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\AuditLog;
 use App\Models\User;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
@@ -12,16 +13,10 @@ class AuditLogger
     /**
      * Record an audit or security log event.
      *
-     * @param  string  $event
-     * @param  string  $description
-     * @param  User|null  $user
      * @param  array<string, mixed>|null  $metadata
-     * @param  Request|null  $request
-     * @param  string  $category 'audit' or 'security'
-     * @param  string  $severity 'info', 'warning', 'danger'
-     * @param  User|null  $targetUser
-     * @param  string  $outcome 'success', 'failure', 'blocked'
-     * @return AuditLog
+     * @param  string  $category  'audit' or 'security'
+     * @param  string  $severity  'info', 'warning', 'danger'
+     * @param  string  $outcome  'success', 'failure', 'blocked'
      */
     public static function log(
         string $event,
@@ -56,12 +51,21 @@ class AuditLogger
             'created_at' => now(),
         ]);
 
-        Log::info("[{$category}:{$severity}] {$event}: {$description}", [
+        $logContext = [
             'user_id' => $user?->id,
             'target_user_id' => $targetUser?->id,
             'ip' => $req?->ip(),
             'outcome' => $outcome,
-        ]);
+        ];
+
+        $channel = $category === 'security' ? 'security' : 'stack';
+        $logLevel = match ($severity) {
+            'danger' => 'error',
+            'warning' => 'warning',
+            default => 'info',
+        };
+
+        Log::channel($channel)->{$logLevel}("[{$category}] {$event}: {$description}", $logContext);
 
         return $log;
     }
@@ -157,5 +161,24 @@ class AuditLogger
         }
 
         return $cleaned;
+    }
+
+    /**
+     * Record a business action about one record (a quotation, order, payment, delivery…), so it
+     * shows up in that record's activity history. $user null means a system process did it.
+     *
+     * @param  array<string, mixed>  $details
+     */
+    public static function record(string $event, string $description, Model $subject, array $details = [], ?User $user = null, string $outcome = 'success', string $severity = 'info'): AuditLog
+    {
+        $actor = $user ?? (auth()->user() instanceof User ? auth()->user() : null);
+        if (! $actor) {
+            $details['by'] = 'system';
+        }
+
+        $log = self::log($event, $description, $actor, $details, null, 'audit', $severity, null, $outcome);
+        $log->forceFill(['subject_type' => class_basename($subject), 'subject_id' => $subject->getKey()])->save();
+
+        return $log;
     }
 }

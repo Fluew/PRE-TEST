@@ -1,9 +1,14 @@
 <script setup lang="ts">
 import { Head } from '@inertiajs/vue3';
 import { Target, Eye, Star, Info } from '@lucide/vue';
+import { ref } from 'vue';
 import FadeContent from '@/components/vue-bits/FadeContent.vue';
 import SpotlightCard from '@/components/vue-bits/SpotlightCard.vue';
 import PublicLayout from '@/layouts/PublicLayout.vue';
+import { useScrollReveal } from '@/composables/useScrollReveal';
+
+const sections = ref<HTMLElement[]>([]);
+useScrollReveal(sections);
 </script>
 
 <template>
@@ -14,9 +19,13 @@ import PublicLayout from '@/layouts/PublicLayout.vue';
         <div
             class="relative overflow-hidden border-b border-[#3b4219] bg-[#353b16] py-14 sm:py-20 text-white"
         >
-            <div
-                class="absolute inset-0 bg-[url('https://images.unsplash.com/photo-1581091226825-a6a2a5aee158?ixlib=rb-4.0.3&auto=format&fit=crop&w=2000&q=80')] bg-cover bg-center opacity-35"
-            ></div>
+            <img
+                src="/COMPANY_BACKGROUND.webp"
+                alt=""
+                aria-hidden="true"
+                decoding="async"
+                class="pointer-events-none absolute inset-0 size-full object-cover object-center opacity-35 select-none"
+            />
             <!-- Army green gradient 75% opacity -->
             <div
                 class="absolute inset-0 bg-gradient-to-r from-[#4b5320]/90 via-[#4b5320]/75 to-[#4b5320]/60"
@@ -53,7 +62,7 @@ import PublicLayout from '@/layouts/PublicLayout.vue';
         </div>
 
         <!-- Vision and Mission Section -->
-        <div class="bg-white py-14 sm:py-20">
+        <div ref="sections" class="bg-white py-14 sm:py-20">
             <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
                 <div class="grid grid-cols-1 gap-6 md:grid-cols-2">
                     <!-- Vision -->
@@ -108,7 +117,7 @@ import PublicLayout from '@/layouts/PublicLayout.vue';
         </div>
 
         <!-- Core Values Section -->
-        <div class="border-t border-[#3b4219] bg-[#4b5320] py-14 sm:py-20 text-white">
+        <div ref="sections" class="border-t border-[#3b4219] bg-[#4b5320] py-14 sm:py-20 text-white">
             <div class="mx-auto max-w-7xl px-4 text-center sm:px-6 lg:px-8">
                 <div class="mb-16">
                     <div

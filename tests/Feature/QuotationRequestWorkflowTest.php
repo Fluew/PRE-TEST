@@ -8,18 +8,22 @@ use App\Models\Quotation;
 use App\Models\QuotationFile;
 use App\Models\Team;
 use App\Models\User;
+use App\Services\MaterialList\ExtractionException;
+use App\Services\MaterialList\FileReader;
+use App\Services\MaterialList\OcrEngine;
 use Illuminate\Http\UploadedFile;
-use Illuminate\Process\PendingProcess;
-use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 use Inertia\Testing\AssertableInertia as Assert;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 /**
- * The quotation request workflow: the required material list, brands and product-list files on
- * the public form, and what Quotation Staff can see, open and import on the management page.
+ * The quotation request workflow: brands (catalog and not listed) and product-list files on the
+ * public form, and what Quotation Staff can see, open and import on the management page.
  */
 beforeEach(function () {
     Storage::fake('local');
+    fakeImageOcr();
     $this->team = Team::factory()->create(['slug' => 'mr-pride']);
     Brand::firstOrCreate(['name' => 'Schneider Electric'], ['is_active' => true]);
 });
@@ -55,70 +59,50 @@ function wfPng(string $name = 'products.png', int $seed = 1): UploadedFile
 
 function wfPdf(string $name = 'products.pdf'): UploadedFile
 {
-    return UploadedFile::fake()->createWithContent($name, "%PDF-1.4\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n");
+    return textPdf(['Products needed for Site B', 'Circuit breaker 2P 30A 20 pcs', 'THHN wire 3.5mm 100 meters'], $name);
 }
 
-// --- 1-2. The material list is required ----------------------------------------------------
+// --- 1. No material list ---------------------------------------------------------------------
 
-it('refuses a request without a material list, even with brands, and cannot be bypassed', function () {
-    $this->post('/quotation', wfRequest(['brands' => [['brand' => 'Schneider Electric', 'details' => '']]]))
-        ->assertSessionHasErrors('materials');
-
-    // Empty lines, an unconfirmed list, or a token that is not from this session do not count.
-    $this->post('/quotation', wfRequest(['materials' => []]))->assertSessionHasErrors('materials');
-    $this->post('/quotation', wfRequest(['materials' => [['description' => 'Breaker', 'quantity' => 2]]]))->assertSessionHasErrors('materials_confirmed');
-    $this->post('/quotation', wfRequest(['material_token' => str_repeat('a', 40)]))->assertSessionHasErrors('materials');
-
-    expect(Quotation::count())->toBe(0);
-});
-
-it('accepts a material list entered manually', function () {
-    $this->post('/quotation', wfRequest([
-        'materials' => [['description' => 'THHN wire 3.5mm', 'quantity' => 12, 'unit' => 'rolls']],
-        'materials_confirmed' => true,
-    ]))->assertSessionHasNoErrors();
+it('accepts a request with only contact and project details', function () {
+    $this->post('/quotation', wfRequest())->assertSessionHasNoErrors();
 
     $quotation = Quotation::with('items')->sole();
-    expect($quotation->items->sole())->product_name->toBe('THHN wire 3.5mm')->quantity->toBe(12)
-        ->and($quotation->status)->toBe(QuotationStatus::Pending);
-});
-
-// --- 3. Uploaded material lists -------------------------------------------------------------
-
-it('accepts the uploaded material-list file on its own when its lines could not be read', function () {
-    // OCR is not available on this server: the photo is kept, and its token comes back.
-    Process::fake(fn (PendingProcess $p) => Process::result('', 'not found', 1));
-    $response = $this->postJson('/quotation/materials/extract', ['file' => wfPng('site-list.png')])
-        ->assertStatus(422)
-        ->assertJsonPath('reason', 'ocr_unavailable');
-    $token = $response->json('token');
-    expect($token)->toBeString();
-
-    $this->post('/quotation', wfRequest(['material_token' => $token]))->assertSessionHasNoErrors();
-
-    $quotation = Quotation::sole();
-    expect($quotation->material_file_name)->toBe('site-list.png')
-        ->and($quotation->notes)->toContain('Only the original file was sent')
+    expect($quotation->status)->toBe(QuotationStatus::Pending)
         ->and($quotation->items)->toHaveCount(0);
-    Storage::disk('local')->assertExists($quotation->material_file_path);
 });
 
-// --- 4-5. Product-list files ---------------------------------------------------------------
+it('ignores material lists and specification files sent to the removed fields', function () {
+    $this->post('/quotation', wfRequest([
+        'materials' => [['description' => 'THHN wire 3.5mm', 'quantity' => 12, 'unit' => 'rolls', 'product_id' => 1]],
+        'materials_confirmed' => true,
+        'material_token' => str_repeat('a', 40),
+        'attachment' => wfPdf('boq.pdf'),
+    ]))->assertSessionHasNoErrors();
+
+    $quotation = Quotation::with('items', 'files')->sole();
+    expect($quotation->items)->toHaveCount(0)
+        ->and($quotation->files)->toHaveCount(0)
+        ->and($quotation->attachment_path)->toBeNull()
+        ->and($quotation->material_file_path)->toBeNull()
+        ->and((float) $quotation->grand_total)->toBe(0.0)
+        ->and($quotation->notes)->not->toContain('Material List')->not->toContain('THHN');
+    expect(Storage::disk('local')->allFiles())->toBe([]);
+});
+
+it('no longer offers the public material-list upload endpoints', function () {
+    $this->postJson('/quotation/materials/extract', ['file' => wfPng('site-list.png')])->assertNotFound();
+    $this->postJson('/quotation/materials/remap', ['token' => 'x'])->assertNotFound();
+});
+
+// --- 2. Product-list files -----------------------------------------------------------------
 
 it('stores several product-list files with the request, once each', function () {
-    $token = $this->postJson('/quotation/materials/extract', [
-        'file' => UploadedFile::fake()->createWithContent('materials.csv', "Item,Qty\nBreaker,1\n"),
-    ])->json('token');
-
     $this->post('/quotation', wfRequest([
-        'materials' => [['description' => 'Breaker', 'quantity' => 1]],
-        'materials_confirmed' => true,
-        'material_token' => $token,
         'productFiles' => [
             wfPng('photo-1.png', 1),
             wfPng('photo-2.png', 2),
             wfPng('photo-1-again.png', 1), // the same image twice
-            UploadedFile::fake()->createWithContent('again.csv', "Item,Qty\nBreaker,1\n"), // same as the material list
             wfPdf('catalog-page.pdf'),
         ],
     ]))->assertSessionHasNoErrors();
@@ -133,11 +117,7 @@ it('stores several product-list files with the request, once each', function () 
 });
 
 it('rejects unsupported, disguised, oversized and too many product-list files', function (array $files, string $errorKey) {
-    $this->post('/quotation', wfRequest([
-        'materials' => [['description' => 'Breaker', 'quantity' => 1]],
-        'materials_confirmed' => true,
-        'productFiles' => $files,
-    ]))->assertSessionHasErrors($errorKey);
+    $this->post('/quotation', wfRequest(['productFiles' => $files]))->assertSessionHasErrors($errorKey);
 
     expect(Quotation::count())->toBe(0)
         ->and(Storage::disk('local')->allFiles('quotations/product-lists'))->toBe([]);
@@ -152,16 +132,12 @@ it('limits the combined size of product-list files to 20 MB', function () {
     // Three files of 7 MB each are fine one by one, but 21 MB together.
     $files = array_map(fn ($i) => UploadedFile::fake()->create("part{$i}.pdf", 7 * 1024, 'application/pdf'), [1, 2, 3]);
 
-    $this->post('/quotation', wfRequest([
-        'materials' => [['description' => 'Breaker', 'quantity' => 1]],
-        'materials_confirmed' => true,
-        'productFiles' => $files,
-    ]))->assertSessionHasErrors(['productFiles' => 'Product-list files can be up to 20 MB together. Please remove a file or send smaller ones.']);
+    $this->post('/quotation', wfRequest(['productFiles' => $files]))->assertSessionHasErrors(['productFiles' => 'Product-list files can be up to 20 MB together. Please remove a file or send smaller ones.']);
 
     expect(Quotation::count())->toBe(0);
 });
 
-// --- 6. Everything is saved together --------------------------------------------------------
+// --- 3. Everything is saved together --------------------------------------------------------
 
 it('saves brands, project details and files together as a request awaiting review', function () {
     $this->post('/quotation', wfRequest([
@@ -169,8 +145,6 @@ it('saves brands, project details and files together as a request awaiting revie
         'brands' => [['brand' => 'schneider electric', 'details' => '20A breakers']],
         'hasUnlistedBrands' => true,
         'unlistedBrands' => 'Omron',
-        'materials' => [['description' => 'Breaker 20A', 'quantity' => 50]],
-        'materials_confirmed' => true,
         'productFiles' => [wfPdf()],
     ]))->assertSessionHasNoErrors();
 
@@ -185,24 +159,24 @@ it('saves brands, project details and files together as a request awaiting revie
         ])
         ->and($quotation->request_details['submitted_at'])->not->toBeEmpty()
         ->and($quotation->files)->toHaveCount(1)
-        // Nothing is priced or confirmed from the client's files: custom lines wait for staff.
-        ->and((float) $quotation->items->firstWhere('sku', 'CUSTOM')->unit_price)->toBe(0.0);
+        // Brand requests wait for staff: nothing is priced from the client's input.
+        ->and($quotation->items->pluck('sku')->all())->toBe(['BRAND', 'BRAND-UNLISTED'])
+        ->and((float) $quotation->grand_total)->toBe(0.0);
 });
 
 it('only accepts the listed project types and timelines', function () {
-    $this->post('/quotation', wfRequest(['projectType' => 'Spaceport', 'materials' => [['description' => 'x', 'quantity' => 1]], 'materials_confirmed' => true]))
-        ->assertSessionHasErrors('projectType');
-    $this->post('/quotation', wfRequest(['timeline' => 'Someday', 'materials' => [['description' => 'x', 'quantity' => 1]], 'materials_confirmed' => true]))
-        ->assertSessionHasErrors('timeline');
+    $this->post('/quotation', wfRequest(['projectType' => 'Spaceport']))->assertSessionHasErrors('projectType');
+    $this->post('/quotation', wfRequest(['timeline' => 'Someday']))->assertSessionHasErrors('timeline');
 });
 
-// --- 7 & 12. Staff review, and who may open the files ---------------------------------------
+// --- 4. Staff review, and who may open the files --------------------------------------------
 
 function wfSubmittedRequest(): Quotation
 {
     test()->post('/quotation', wfRequest([
-        'materials' => [['description' => 'Breaker', 'quantity' => 2]],
-        'materials_confirmed' => true,
+        'brands' => [['brand' => 'Schneider Electric', 'details' => '']],
+        'hasUnlistedBrands' => true,
+        'unlistedBrands' => 'Omron, Legrand',
         'productFiles' => [wfPdf('wanted-products.pdf')],
     ]))->assertSessionHasNoErrors();
 
@@ -219,6 +193,8 @@ it('shows quotation staff the submitted details and files, without storage paths
         ->assertInertia(fn (Assert $page) => $page
             ->component('Quotations/AdminIndex')
             ->where('quotations.data.0.request_details.project_type', 'Industrial Facility')
+            ->where('quotations.data.0.request_details.brands.0.brand', 'Schneider Electric')
+            ->where('quotations.data.0.request_details.unlisted_brands', 'Omron, Legrand')
             ->where('quotations.data.0.files.0.original_name', 'wanted-products.pdf')
             ->has('quotations.data.0.files.0.url')
             ->missing('quotations.data.0.files.0.path')
@@ -280,7 +256,7 @@ it('imports a material list as a draft quotation, with catalog prices only for e
         ])->assertSessionHasNoErrors();
 
     $quotation = Quotation::with('items')->sole();
-    expect($quotation->status)->toBe(QuotationStatus::Draft)
+    expect($quotation->status)->toBe(QuotationStatus::Preparing)
         ->and($quotation->client_name)->toBe('Metro Builders')
         ->and($quotation->material_file_name)->toBe('site-a.csv')
         ->and($quotation->request_details['source'])->toBe('staff_import')
@@ -334,4 +310,95 @@ it('does not let other modules import quotations', function () {
     ])->assertForbidden();
 
     expect(Quotation::count())->toBe(0);
+});
+
+// --- Product lists must contain writing, not photos -----------------------------------------
+
+it('rejects a product photo with no written list', function () {
+    $photo = UploadedFile::fake()->image('breaker-photo.jpg', 800, 600); // fake OCR reads wide images as photos
+
+    $this->post('/quotation', wfRequest(['productFiles' => [$photo]]))
+        ->assertSessionHasErrors(['productFiles.0' => "breaker-photo.jpg: We couldn't find any written text in this file. It looks like a photo. Please upload a document or a picture of a typed or handwritten list of the products you need."]);
+
+    expect(Quotation::count())->toBe(0)
+        ->and(Storage::disk('local')->allFiles('quotations/product-lists'))->toBe([]);
+});
+
+it('accepts PDF, Excel, CSV, JPG and PNG lists that contain text', function () {
+    $sheet = new Spreadsheet;
+    $sheet->getActiveSheet()->fromArray([['Item', 'Qty'], ['Circuit breaker 2P 30A', 20], ['PVC conduit 20mm', 50]]);
+    $xlsx = tempnam(sys_get_temp_dir(), 'xl').'.xlsx';
+    (new Xlsx($sheet))->save($xlsx);
+
+    $this->post('/quotation', wfRequest(['productFiles' => [
+        wfPdf('list.pdf'),
+        new UploadedFile($xlsx, 'list.xlsx', null, null, true),
+        UploadedFile::fake()->createWithContent('list.csv', "Item,Qty\nCircuit breaker 2P 30A,20\nTHHN wire 3.5mm,100\n"),
+        UploadedFile::fake()->image('handwritten-list.jpg', 300, 400),
+        wfPng('typed-list.png'),
+    ]]))->assertSessionHasNoErrors();
+
+    expect(Quotation::sole()->files)->toHaveCount(5);
+});
+
+it('rejects documents and spreadsheets without any words', function (UploadedFile $file) {
+    $this->post('/quotation', wfRequest(['productFiles' => [$file]]))->assertSessionHasErrors('productFiles.0');
+})->with([
+    'empty CSV rows' => fn () => UploadedFile::fake()->createWithContent('empty.csv', ",,\n,,\n"),
+    'PDF without text' => fn () => textPdf(['--- ---', '...'], 'blank.pdf'),
+]);
+
+it('accepts an image without the text check when OCR is not installed, and tells staff', function () {
+    fakeImageOcr(available: false);
+
+    $this->post('/quotation', wfRequest(['productFiles' => [UploadedFile::fake()->image('list.jpg', 800, 600)]]))->assertSessionHasNoErrors();
+
+    expect(Quotation::sole()->notes)->toContain('Not checked for text (OCR unavailable): list.jpg');
+});
+
+it('tells photos and written lists apart', function (array $lines, bool $expected) {
+    expect(FileReader::looksLikeWrittenList($lines))->toBe($expected);
+})->with([
+    'numbered list' => [['1. Breaker 30A', '2. Wire 3.5mm'], true],
+    'plain list with quantities' => [['Circuit breaker 20 pcs', 'THHN wire 100 meters'], true],
+    'OCR noise from a photo' => [['~ .,| ;: rr', 'Sx Zk %'], false],
+    'a single label' => [['Schneider'], false],
+    'nothing' => [[], false],
+]);
+
+it('reads lines and the share of the image covered by words from OCR output', function () {
+    $tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+        ."1\t1\t0\t0\t0\t0\t0\t0\t100\t100\t-1\t\n"
+        ."5\t1\t1\t1\t1\t1\t0\t0\t10\t10\t96\tBreaker\n"
+        ."5\t1\t1\t1\t1\t2\t12\t0\t10\t10\t91\t30A\n"
+        ."5\t1\t1\t1\t2\t1\t0\t20\t10\t10\t20\tblurry\n"; // low confidence: ignored
+
+    [$lines, $coverage] = FileReader::linesFromTsv($tsv);
+
+    expect($lines)->toBe(['Breaker 30A'])->and($coverage)->toBe(0.02);
+});
+
+it('rejects real photos and accepts a real list image with Tesseract', function () {
+    $reader = app(FileReader::class);
+    app()->forgetInstance(OcrEngine::class);
+    $reader = new FileReader(new OcrEngine);
+    if (! (new OcrEngine)->tesseractAvailable()) {
+        $this->markTestSkipped('Tesseract is not installed.');
+    }
+
+    $font = base_path('vendor/dompdf/dompdf/lib/fonts/DejaVuSans.ttf');
+    $img = imagecreatetruecolor(900, 360);
+    imagefill($img, 0, 0, imagecolorallocate($img, 255, 255, 255));
+    foreach (['Material list for Site B', '1. Circuit breaker 2P 30A - 20 pcs', '2. THHN wire 3.5mm - 100 meters', '3. PVC conduit 20mm - 50 pieces'] as $i => $line) {
+        imagettftext($img, 22, 0, 30, 60 + $i * 70, imagecolorallocate($img, 0, 0, 0), $font, $line);
+    }
+    $list = tempnam(sys_get_temp_dir(), 'ls').'.png';
+    imagepng($img, $list);
+
+    expect($reader->assertHasText($list, 'image'))->toBeTrue();
+    // A photo that shows a small warning sign is still a photo.
+    expect(fn () => $reader->assertHasText(public_path('LOGIN_PHOTO.png'), 'image'))
+        ->toThrow(ExtractionException::class);
+    expect(fn () => $reader->assertHasText(public_path('PRODUCT_A.png'), 'image'))
+        ->toThrow(ExtractionException::class);
 });

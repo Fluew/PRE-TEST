@@ -26,7 +26,7 @@ defineProps<{
                     <div class="flex flex-col gap-8">
                         <div class="flex flex-col items-center gap-4 text-center">
                             <Link :href="home()" class="flex flex-col items-center gap-3 group">
-                                <img src="/LOGO_MR_PRIDE.png" alt="MR-Pride Logo" class="w-16 h-16 object-contain group-hover:scale-105 transition-transform duration-300" />
+                                <img src="/LOGO_MR_PRIDE.webp" alt="MR-Pride Logo" class="w-16 h-16 object-contain group-hover:scale-105 transition-transform duration-300" />
                                 <div class="flex flex-col justify-center leading-none text-center">
                                     <span class="text-2xl font-bold tracking-tight text-white">MR-PRIDE</span>
                                     <span class="text-xs font-bold tracking-widest text-gray-400 uppercase mt-1">Electrical Supplies</span>

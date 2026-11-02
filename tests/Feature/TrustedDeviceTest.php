@@ -490,3 +490,82 @@ test('end-to-end flow: admin creates pending staff, a 5-minute invitation is ema
     $authResponse->assertRedirect('/password/change');
     $this->assertAuthenticatedAs($staff);
 });
+
+test('administrator can view emergency device recovery page without trusted device', function () {
+    $this->get('/device/recover')
+        ->assertSuccessful()
+        ->assertInertia(fn (Assert $page) => $page
+            ->component('auth/RecoverDevice')
+        );
+});
+
+test('administrator can bypass device lockout using emergency admin recovery key', function () {
+    $admin = User::factory()->create([
+        'role' => 'admin',
+        'password' => Hash::make('AdminPass123!'),
+        'admin_recovery_key' => 'RECOVER-AAA111-BBB222-CCC333',
+    ]);
+
+    // 1. Unregistered device gets 404 on /login
+    $this->get('/login')->assertNotFound();
+
+    // 2. Submit wrong key -> validation error
+    $failResponse = $this->post('/device/recover', [
+        'email' => $admin->email,
+        'password' => 'AdminPass123!',
+        'recovery_key' => 'RECOVER-WRONG-KEY-123456',
+    ]);
+    $failResponse->assertSessionHasErrors('recovery_key');
+
+    // 3. Submit correct key -> success, sets cookies, rotates key
+    $successResponse = $this->post('/device/recover', [
+        'email' => $admin->email,
+        'password' => 'AdminPass123!',
+        'recovery_key' => 'RECOVER-AAA111-BBB222-CCC333',
+        'device_name' => 'Admin Recovery Laptop',
+    ]);
+
+    $successResponse->assertRedirect('/login');
+    $successResponse->assertCookie('mrpride_device_credential');
+    $successResponse->assertCookie('mrpride_device_uuid');
+
+    // Key is single-use and rotated
+    $admin->refresh();
+    expect($admin->admin_recovery_key)->not->toBe('RECOVER-AAA111-BBB222-CCC333')
+        ->and($admin->admin_recovery_key)->toStartWith('RECOVER-');
+
+    // 4. Old key cannot be reused
+    $reuseResponse = $this->post('/device/recover', [
+        'email' => $admin->email,
+        'password' => 'AdminPass123!',
+        'recovery_key' => 'RECOVER-AAA111-BBB222-CCC333',
+    ]);
+    $reuseResponse->assertSessionHasErrors('recovery_key');
+
+    // 5. Browser with the issued cookies can now access /login
+    $deviceCookies = [
+        'mrpride_device_uuid' => $successResponse->getCookie('mrpride_device_uuid')->getValue(),
+        'mrpride_device_credential' => $successResponse->getCookie('mrpride_device_credential')->getValue(),
+    ];
+
+    $this->withCookies($deviceCookies)->get('/login')->assertSuccessful();
+});
+
+test('artisan device:recover command validates key, rotates it, and generates access link', function () {
+    $admin = User::factory()->create([
+        'role' => 'admin',
+        'admin_recovery_key' => 'RECOVER-TEST01-TEST02-TEST03',
+    ]);
+
+    $this->artisan('device:recover', [
+        'email' => $admin->email,
+        'key' => 'RECOVER-TEST01-TEST02-TEST03',
+    ])
+        ->expectsOutputToContain('EMERGENCY ADMIN DEVICE RECOVERY VERIFIED')
+        ->expectsOutputToContain('Option B (Direct 1-Click Enrollment):')
+        ->assertExitCode(0);
+
+    $admin->refresh();
+    expect($admin->admin_recovery_key)->not->toBe('RECOVER-TEST01-TEST02-TEST03');
+});
+

@@ -16,8 +16,6 @@ import { nextTick, ref, computed, watch } from 'vue';
 import FadeContent from '@/components/vue-bits/FadeContent.vue';
 import SpotlightCard from '@/components/vue-bits/SpotlightCard.vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
-import MaterialListUploader from '@/components/quotation/MaterialListUploader.vue';
-import type { MaterialState } from '@/components/quotation/MaterialListUploader.vue';
 import PublicLayout from '@/layouts/PublicLayout.vue';
 import { store } from '@/routes/quotations';
 
@@ -38,38 +36,33 @@ const form = useForm({
     projectType: 'Commercial Building',
     timeline: '1-3 months',
     brandItems: [{ brand: '', details: '' }] as BrandItem[],
+    // "I'm looking for brands not listed": free text, only sent and required when ticked.
     hasUnlistedBrands: false,
     unlistedBrands: '',
-    attachment: null as File | null,
-    // Optional files listing specific products (separate from the material list and the specs).
+    // Optional files listing specific products.
     productFiles: [] as File[],
 });
 
 const submittedSuccess = ref(false);
 const formElement = ref<HTMLFormElement>();
 const successMessage = ref<HTMLElement>();
-const brandsValidationError = ref<string | null>(null);
-const materialError = ref<string | null>(null);
-// Errors for keys that are not form fields (materials, brands, upload limits).
+const unlistedBrandsInput = ref<HTMLTextAreaElement>();
+const unlistedBrandsError = ref<string | null>(null);
+// Errors for keys that are not form fields (brands, upload limits).
 const formErrors = computed(() => form.errors as Record<string, string | undefined>);
-const materialUploader = ref<InstanceType<typeof MaterialListUploader>>();
-const materialSection = ref<HTMLElement>();
+const unlistedBrandsMessage = computed(() => unlistedBrandsError.value || form.errors.unlistedBrands);
 
-// Material list from an uploaded file (or typed) that the client reviewed.
-const materials = ref<MaterialState>({ rows: [], token: null, confirmed: false });
-const selectedMaterials = computed(() => materials.value.rows.filter((r) => r.selected));
-
-// First server error about the material list (e.g. "materials.2.quantity").
-const materialsServerError = computed(() => {
-    const key = Object.keys(form.errors).find((k) => k.startsWith('materials'));
-    return key ? (form.errors as Record<string, string>)[key] : null;
-});
-
-// The required material list: confirmed lines, or the uploaded file itself for staff to read.
-const hasMaterialList = computed(() => selectedMaterials.value.length > 0 || !!materials.value.token);
+// Move the cursor into the brand field as soon as the option is ticked.
 watch(
-    () => [materials.value.rows.length, materials.value.token, materials.value.confirmed],
-    () => (materialError.value = null),
+    () => form.hasUnlistedBrands,
+    async (enabled) => {
+        unlistedBrandsError.value = null;
+        form.clearErrors('unlistedBrands');
+        if (enabled) {
+            await nextTick();
+            unlistedBrandsInput.value?.focus();
+        }
+    },
 );
 
 // ------------------------------------------------------------------ product-list files
@@ -138,11 +131,6 @@ const productFileServerError = computed(() => {
     return key ? (form.errors as Record<string, string>)[key] : null;
 });
 
-function handleAttachmentChange(event: Event) {
-    const target = event.target as HTMLInputElement;
-    form.attachment = target.files?.[0] ?? null;
-}
-
 const fields = [
     {
         key: 'company',
@@ -196,12 +184,10 @@ function addBrandRow() {
     if (!canAddBrandRow.value) {
         return;
     }
-    brandsValidationError.value = null;
     form.brandItems.push({ brand: '', details: '' });
 }
 
 function removeBrandRow(index: number) {
-    brandsValidationError.value = null;
     if (form.brandItems.length > 1) {
         form.brandItems.splice(index, 1);
     } else {
@@ -209,48 +195,16 @@ function removeBrandRow(index: number) {
     }
 }
 
-const selectedBrands = computed(() => form.brandItems.filter((item) => item.brand !== ''));
-
-
 function submit() {
     if (form.processing) {
         return;
     }
 
-    brandsValidationError.value = null;
-
+    unlistedBrandsError.value = null;
     if (form.hasUnlistedBrands && form.unlistedBrands.trim() === '') {
-        brandsValidationError.value =
-            'Please enter the brand names you are looking for.';
+        unlistedBrandsError.value = "Please enter the brand name(s) you're looking for.";
+        unlistedBrandsInput.value?.focus();
         return;
-    }
-
-    materialError.value = null;
-    if (materialUploader.value?.hasUnsentFile) {
-        materialError.value = 'Please click “Upload & extract” to send your material list file, or remove it.';
-    } else if (!hasMaterialList.value) {
-        materialError.value = 'Please add your material list: upload a file, or enter the items and quantities manually.';
-    }
-    if (materialError.value) {
-        materialSection.value?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        return;
-    }
-
-    if (selectedMaterials.value.length > 0) {
-        const invalid = selectedMaterials.value.filter(
-            (r) =>
-                r.description.trim() === '' ||
-                !/^\d+$/.test(r.quantity.trim().replace(/,/g, '')) ||
-                Number(r.quantity.replace(/,/g, '')) < 1,
-        );
-        if (invalid.length > 0) {
-            materialError.value = `Please fix the ${invalid.length} material line(s) marked in red, or untick them.`;
-            return;
-        }
-        if (!materials.value.confirmed) {
-            materialError.value = 'Please confirm that the material list matches what you need.';
-            return;
-        }
     }
 
     submittedSuccess.value = false;
@@ -263,18 +217,7 @@ function submit() {
                     brand: item.brand.trim(),
                     details: item.details.trim(),
                 })),
-            // Only selected lines are sent; the server recalculates every price and total.
-            materials: selectedMaterials.value.map((r) => ({
-                description: r.description.trim(),
-                quantity: r.quantity.trim().replace(/,/g, ''),
-                unit: r.unit.trim(),
-                brand: r.brand.trim(),
-                specs: r.specs.trim(),
-                remarks: r.remarks.trim(),
-                product_id: r.product_id ?? '',
-            })),
-            material_token: materials.value.token ?? '',
-            materials_confirmed: materials.value.confirmed,
+            unlistedBrands: data.hasUnlistedBrands ? data.unlistedBrands.trim() : '',
         }))
         .post(store().url, {
             preserveScroll: true,
@@ -284,7 +227,6 @@ function submit() {
                 form.brandItems = [{ brand: '', details: '' }];
                 form.hasUnlistedBrands = false;
                 form.unlistedBrands = '';
-                materials.value = { rows: [], token: null, confirmed: false };
                 form.productFiles = [];
                 productFileError.value = null;
                 await nextTick();
@@ -316,7 +258,7 @@ function submit() {
                     >
                 </h1>
                 <p class="mt-6 text-base leading-8 text-gray-600">
-                    Send us your material list and the brands you prefer. Our
+                    Tell us about your project and the brands you prefer. Our
                     team will review your requirements and help you find the
                     right products.
                 </p>
@@ -333,7 +275,7 @@ function submit() {
                             v-for="(step, index) in [
                                 {
                                     title: 'Share your requirements',
-                                    text: 'Upload or enter your material list, and add the brands you prefer.',
+                                    text: 'Share your project details and the brands you prefer.',
                                     icon: ClipboardList,
                                 },
                                 {
@@ -383,7 +325,7 @@ function submit() {
                 >
                     <p class="font-semibold">Your request has been received.</p>
                     <p>
-                        Our team will review your material list and contact you
+                        Our team will review your request and contact you
                         shortly with an official itemized quotation.
                     </p>
                 </div>
@@ -490,23 +432,12 @@ function submit() {
                         </div>
                     </div>
 
-                    <!-- ═════════════════════════════════════════════════════ -->
-                    <!-- IMPROVED MATERIALS & PROJECT REQUIREMENTS SECTION      -->
-                    <!-- ═════════════════════════════════════════════════════ -->
+                    <!-- Brands -->
                     <div
                         class="space-y-5 rounded-xl border border-gray-200 bg-gray-50/50 p-5"
                     >
-                        <!-- 1. Material list (required): upload a file or type it, then review the lines -->
-                        <div ref="materialSection">
-                            <MaterialListUploader
-                                ref="materialUploader"
-                                v-model="materials"
-                                :error="materialError || formErrors.materials || formErrors.materials_confirmed || materialsServerError"
-                            />
-                        </div>
-
-                        <!-- 2. Brand selection (optional) -->
-                        <div class="border-t border-gray-200 pt-4">
+                        <!-- Catalog brands (optional) -->
+                        <div>
                             <div class="mb-3">
                                 <label
                                     class="field-label mb-0 font-semibold text-gray-900"
@@ -562,7 +493,6 @@ function submit() {
                                             v-model="item.brand"
                                             :aria-label="`Brand ${index + 1}`"
                                             class="field-control w-full px-3 py-2 text-sm"
-                                            @change="brandsValidationError = null"
                                         >
                                             <option value="">
                                                 Select a Brand
@@ -586,7 +516,6 @@ function submit() {
                                             maxlength="1000"
                                             placeholder="Specific items, models, or quantity needed (e.g. 50 pcs 2-pole 30A breakers, 10 rolls 3.5mm wire)..."
                                             class="block w-full resize-y rounded-xl border border-gray-200 bg-gray-50/60 px-3.5 py-2 text-xs text-gray-900 placeholder:text-gray-400 focus:border-[#4b5320] focus:bg-white focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm"
-                                            @input="brandsValidationError = null"
                                         ></textarea>
                                     </div>
                                 </div>
@@ -608,7 +537,81 @@ function submit() {
                                 </button>
                             </div>
 
-                            <!-- Optional: files naming the specific products wanted (not the material list, not the specs) -->
+                            <!-- Brands not in the catalog (optional; can be combined with catalog brands) -->
+                            <div class="mt-4" data-test="unlisted-brands">
+                                <label
+                                    class="inline-flex cursor-pointer items-center gap-2.5 select-none"
+                                >
+                                    <input
+                                        v-model="form.hasUnlistedBrands"
+                                        type="checkbox"
+                                        aria-controls="unlisted-brands-field"
+                                        :aria-expanded="form.hasUnlistedBrands"
+                                        class="size-4 cursor-pointer rounded border-gray-300 text-[#4b5320] focus:ring-[#4b5320]"
+                                    />
+                                    <span class="text-xs font-semibold text-gray-800">
+                                        I'm looking for brands not listed
+                                    </span>
+                                </label>
+
+                                <div
+                                    v-if="form.hasUnlistedBrands"
+                                    id="unlisted-brands-field"
+                                    class="mt-3 rounded-xl border border-gray-200 bg-white p-4"
+                                >
+                                    <label
+                                        for="unlistedBrands"
+                                        class="field-label text-xs font-semibold text-gray-800"
+                                    >
+                                        Other Brand(s) You're Looking For
+                                    </label>
+                                    <textarea
+                                        id="unlistedBrands"
+                                        ref="unlistedBrandsInput"
+                                        v-model="form.unlistedBrands"
+                                        name="unlistedBrands"
+                                        rows="3"
+                                        maxlength="3000"
+                                        required
+                                        placeholder="Enter the brand name(s) you're interested in..."
+                                        class="block w-full resize-y rounded-xl border bg-gray-50/60 px-3.5 py-2 text-xs text-gray-900 placeholder:text-gray-400 focus:bg-white focus:ring-1 focus:outline-none sm:text-sm"
+                                        :class="
+                                            unlistedBrandsMessage
+                                                ? 'border-red-500 focus:border-red-500 focus:ring-red-500'
+                                                : 'border-gray-200 focus:border-[#4b5320] focus:ring-[#4b5320]'
+                                        "
+                                        :aria-invalid="!!unlistedBrandsMessage"
+                                        :aria-describedby="
+                                            unlistedBrandsMessage
+                                                ? 'unlistedBrands-error unlistedBrands-help'
+                                                : 'unlistedBrands-help'
+                                        "
+                                        @input="unlistedBrandsError = null"
+                                    ></textarea>
+                                    <p
+                                        v-if="unlistedBrandsMessage"
+                                        id="unlistedBrands-error"
+                                        class="mt-1.5 text-xs font-medium text-red-600"
+                                        role="alert"
+                                    >
+                                        {{ unlistedBrandsMessage }}
+                                    </p>
+                                    <div
+                                        class="mt-1.5 flex items-start justify-between gap-3 text-[11px]"
+                                    >
+                                        <p id="unlistedBrands-help" class="text-gray-500">
+                                            Let us know which brands you're looking
+                                            for, even if they're not currently
+                                            available in our catalog.
+                                        </p>
+                                        <span class="shrink-0 text-gray-400"
+                                            >{{ form.unlistedBrands.length }}/3000</span
+                                        >
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Optional: files naming the specific products wanted -->
                             <div class="mt-4" data-test="product-list-upload">
                                 <div class="flex flex-wrap items-center justify-between gap-2">
                                     <div class="min-w-0">
@@ -642,114 +645,32 @@ function submit() {
                                         <button type="button" class="shrink-0 font-medium text-red-600 hover:text-red-700" :aria-label="`Remove ${f.name}`" @click="removeProductFile(i)">Remove</button>
                                     </li>
                                 </ul>
-                                <p class="mt-1 text-[11px] text-gray-400">PDF, Excel, CSV, JPG or PNG · up to {{ MAX_PRODUCT_FILES }} files, 10 MB each</p>
+                                <p class="mt-1 text-[11px] text-gray-400">PDF, Excel, CSV, JPG or PNG with a written or numbered list (not product photos) · up to {{ MAX_PRODUCT_FILES }} files, 10 MB each</p>
                                 <p v-if="productFileError || productFileServerError" class="mt-1 text-xs font-medium text-red-600" role="alert">
                                     {{ productFileError || productFileServerError }}
                                 </p>
                             </div>
                         </div>
 
-                        <!-- 2. Brands not listed -->
-                        <div class="border-t border-gray-200 pt-4">
-                            <label
-                                class="flex cursor-pointer items-center gap-2.5 select-none"
-                            >
-                                <input
-                                    v-model="form.hasUnlistedBrands"
-                                    type="checkbox"
-                                    class="size-4 cursor-pointer rounded border-gray-300 text-[#4b5320] focus:ring-[#4b5320]"
-                                />
-                                <span
-                                    class="text-xs font-semibold text-gray-800"
-                                >
-                                    I'm looking for brands not listed
-                                </span>
-                            </label>
-
-                            <div
-                                v-if="form.hasUnlistedBrands"
-                                class="mt-3 animate-in space-y-1.5 duration-200 fade-in"
-                            >
-                                <div class="relative">
-                                    <textarea
-                                        id="unlistedBrands"
-                                        v-model="form.unlistedBrands"
-                                        rows="3"
-                                        maxlength="3000"
-                                        placeholder=" "
-                                        class="peer block w-full resize-y rounded-xl border border-gray-200 bg-white px-3.5 pt-6 pb-2.5 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm"
-                                        @input="brandsValidationError = null"
-                                    ></textarea>
-                                    <label
-                                        for="unlistedBrands"
-                                        class="pointer-events-none absolute top-4 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                        :class="
-                                            form.unlistedBrands
-                                                ? '-translate-y-2.5 scale-75 text-[#4b5320]'
-                                                : ''
-                                        "
-                                    >
-                                        Brand names you are looking for
-                                    </label>
-                                </div>
-                                <div
-                                    class="flex justify-end text-[11px] text-gray-400"
-                                >
-                                    <span
-                                        >{{ form.unlistedBrands.length }}/3000</span
-                                    >
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- 4. Specifications & Drawings Attachment -->
-                        <div class="border-t border-gray-200 pt-4">
-                            <div class="mb-2">
-                                <label
-                                    for="quotation-attachment"
-                                    class="field-label mb-0 font-semibold text-gray-900"
-                                >
-                                    <span>Specifications, BOQ, or Plans (Optional)</span>
-                                </label>
-                                <p class="mt-0.5 text-xs text-gray-500">
-                                    Upload Bill of Materials, CAD/PDF drawings, or technical spec sheets (PDF, PNG, JPG, DOCX, ZIP up to 10MB).
-                                </p>
-                            </div>
-                            <div class="relative flex items-center">
-                                <input
-                                    id="quotation-attachment"
-                                    type="file"
-                                    accept=".pdf,.png,.jpg,.jpeg,.webp,.doc,.docx,.xls,.xlsx,.zip"
-                                    class="block w-full cursor-pointer rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-500 transition-colors file:mr-3 file:cursor-pointer file:rounded-lg file:border-0 file:bg-[#4b5320]/10 file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-[#4b5320] hover:file:bg-[#4b5320]/20 focus:outline-none"
-                                    @change="handleAttachmentChange"
-                                />
-                            </div>
-                            <p
-                                v-if="form.errors.attachment"
-                                class="mt-1.5 text-xs text-red-600 font-medium"
-                            >
-                                {{ form.errors.attachment }}
-                            </p>
-                        </div>
-
                         <!-- Inline validation notice -->
                         <div
-                            v-if="
-                                brandsValidationError ||
-                                formErrors.brands ||
-                                form.errors.unlistedBrands ||
-                                formErrors.upload
-                            "
+                            v-if="formErrors.brands || formErrors.upload"
                             class="flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-xs font-medium text-red-700"
+                            role="alert"
                         >
                             <AlertCircle class="size-4 shrink-0 text-red-600" />
-                            <span>{{
-                                brandsValidationError ||
-                                formErrors.brands ||
-                                form.errors.unlistedBrands ||
-                                formErrors.upload
-                            }}</span>
+                            <span>{{ formErrors.brands || formErrors.upload }}</span>
                         </div>
+                    </div>
+
+                    <!-- Saving failed on the server: everything entered is still in the form -->
+                    <div
+                        v-if="formErrors.submit"
+                        class="flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-xs font-medium text-red-700"
+                        role="alert"
+                    >
+                        <AlertCircle class="size-4 shrink-0 text-red-600" />
+                        <span>{{ formErrors.submit }}</span>
                     </div>
 
                     <!-- Submit Button -->

@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { Head } from '@inertiajs/vue3';
+import { ref } from 'vue';
 import PublicLayout from '@/layouts/PublicLayout.vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
+import { useScrollReveal } from '@/composables/useScrollReveal';
+
+const sections = ref<HTMLElement[]>([]);
+useScrollReveal(sections);
 </script>
 
 <template>
@@ -13,7 +18,7 @@ import SpecularButton from '@/components/ui/SpecularButton.vue';
             <!-- Responsive Banner Image Container -->
             <div class="hero-banner relative w-full overflow-hidden">
                 <img 
-                    src="/HOME_BACKGROUND.png" 
+                    src="/HOME_BACKGROUND.webp" 
                     class="hero-img w-full h-full object-cover select-none pointer-events-none" 
                     alt="MR-Pride Electrical Supplies" 
                     loading="eager"
@@ -64,7 +69,7 @@ import SpecularButton from '@/components/ui/SpecularButton.vue';
         </section>
 
         <!-- About Us Section -->
-        <section id="about" aria-labelledby="about-us-heading" class="py-24 bg-[#4b5320] text-white relative z-10 border-t border-[#3c421a] overflow-hidden">
+        <section ref="sections" id="about" aria-labelledby="about-us-heading" class="py-24 bg-[#4b5320] text-white relative z-10 border-t border-[#3c421a] overflow-hidden">
             <!-- Subtle ambient glow background decoration -->
             <div class="absolute -top-24 -right-24 size-96 rounded-full bg-[#F8B803]/10 blur-3xl pointer-events-none"></div>
             <div class="absolute -bottom-24 -left-24 size-96 rounded-full bg-black/20 blur-3xl pointer-events-none"></div>
@@ -89,7 +94,7 @@ import SpecularButton from '@/components/ui/SpecularButton.vue';
         </section>
 
         <!-- Call to Action -->
-        <div class="py-24 relative overflow-hidden bg-gray-50 border-t border-gray-200">
+        <div ref="sections" class="py-24 relative overflow-hidden bg-gray-50 border-t border-gray-200">
             <div class="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGNpcmNsZSBjeD0iMSIgY3k9IjEiIHI9IjEiIGZpbGw9IiNjY2MiLz48L3N2Zz4=')] opacity-50"></div>
             <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 relative z-10 text-center">
                 <h2 class="text-4xl font-semibold text-gray-900 mb-6">Ready to Power Up?</h2>

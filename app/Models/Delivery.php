@@ -7,6 +7,7 @@ use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Delivery extends Model
 {
@@ -19,6 +20,13 @@ class Delivery extends Model
         'purchase_order_number',
         'purchase_order_id',
         'quantity',
+        'accepted_quantity',
+        'rejected_quantity',
+        'inspection_result',
+        'inspected_on',
+        'inspected_by_id',
+        'inspection_remarks',
+        'rejection_reason',
         'unit',
         'description',
         'supplier_id',
@@ -26,12 +34,71 @@ class Delivery extends Model
         'status',
         'notes',
         'deleted_by_id',
+        'supplier_document_number',
+        'over_receipt_reason',
+        'over_receipt_approved_by_id',
+        'inspection_number',
+        'rejection_category',
+        'resolution_status',
+        'resolution_remarks',
+        'resolved_at',
+        'posted_quantity',
+        'posted_at',
+        'posted_by_id',
+        'stock_movement_id',
+        'damaged_quantity',
+        'defective_quantity',
     ];
+
+    /** Kinds of rejection recorded at inspection. */
+    public const REJECTION_CATEGORIES = ['defective', 'damaged', 'incorrect_item', 'nonconforming_spec', 'shortage_in_pack', 'other'];
+
+    /** How rejected units were resolved with the supplier. */
+    public const RESOLUTIONS = ['returned', 'replaced', 'credited', 'written_off'];
 
     protected $casts = [
         'delivery_date' => 'date',
         'quantity' => 'integer',
+        'accepted_quantity' => 'integer',
+        'rejected_quantity' => 'integer',
+        'posted_quantity' => 'integer',
+        'damaged_quantity' => 'integer',
+        'defective_quantity' => 'integer',
+        'inspected_on' => 'date',
+        'resolved_at' => 'datetime',
+        'posted_at' => 'datetime',
     ];
+
+    /**
+     * Inspection status shown to staff, derived from the recorded quantities:
+     * Pending Inspection, Passed, Partially Accepted, Failed, or Pending Resolution
+     * (rejected units exist and no supplier resolution has been recorded yet).
+     */
+    public function inspectionStatus(): string
+    {
+        if ($this->inspection_result === null) {
+            return 'Pending Inspection';
+        }
+        if ((int) $this->rejected_quantity > 0 && $this->resolution_status === null) {
+            return 'Pending Resolution';
+        }
+
+        return match ($this->inspection_result) {
+            'accepted' => 'Passed',
+            'rejected' => 'Failed',
+            default => 'Partially Accepted',
+        };
+    }
+
+    public function invoices(): HasMany
+    {
+        return $this->hasMany(CommercialInvoice::class, 'delivery_id');
+    }
+
+    public function postedBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'posted_by_id');
+    }
 
     public function team(): BelongsTo
     {
@@ -46,6 +113,11 @@ class Delivery extends Model
     public function supplier(): BelongsTo
     {
         return $this->belongsTo(Supplier::class);
+    }
+
+    public function inspectedBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'inspected_by_id');
     }
 
     public function receivedBy(): BelongsTo

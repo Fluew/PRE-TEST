@@ -7,7 +7,9 @@ import { cn } from "@/lib/utils"
 import { buttonVariants } from "."
 import SpecularButton from "@/components/ui/SpecularButton.vue"
 
-interface Props extends /* @vue-ignore */ PrimitiveProps {
+interface Props {
+  as?: PrimitiveProps["as"]
+  asChild?: boolean
   variant?: ButtonVariants["variant"] | any
   size?: ButtonVariants["size"] | any
   class?: HTMLAttributes["class"]

@@ -11,12 +11,12 @@ use App\Models\QuotationFile;
 use App\Models\Team;
 use App\Services\MaterialList\ExtractionException;
 use App\Services\MaterialList\FileReader;
-use App\Services\MaterialList\MaterialParser;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -24,15 +24,15 @@ use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 use Inertia\Inertia;
 use Inertia\Response;
+use Throwable;
 
 /**
  * The public "Request a Quotation" form.
  *
- * A request must include a material list: lines the client confirmed (read from an uploaded file
- * or typed), or at least the uploaded material-list file itself, for staff to read. Brands, extra
- * product-list files and specification documents are optional. Everything is saved with the
- * quotation as client-submitted information with status Pending: nothing is approved, priced or
- * confirmed as available until staff review it.
+ * A request holds the client's contact and project details, the catalog brands they are
+ * interested in, any brands not in our catalog ("brands not listed"), and optional product-list
+ * files. Everything is saved with the quotation as client-submitted information with status
+ * Pending: nothing is approved, priced or confirmed as available until staff review it.
  */
 class PublicQuotationController extends Controller
 {
@@ -101,20 +101,6 @@ class PublicQuotationController extends Controller
             'brands' => ['nullable', 'array', 'max:50'],
             'hasUnlistedBrands' => ['nullable', 'boolean'],
             'unlistedBrands' => ['nullable', 'string', 'max:3000'],
-            'attachment' => ['nullable', 'file', 'mimes:pdf,jpg,jpeg,png,webp,doc,docx,xls,xlsx,zip', 'max:10240'],
-
-            // Material list (extracted from an uploaded file, or typed) the client reviewed and confirmed.
-            // Prices and totals are never taken from the client; they come from the catalog below.
-            'materials' => ['nullable', 'array', 'max:'.MaterialParser::MAX_ITEMS],
-            'materials.*.description' => ['required', 'string', 'max:500'],
-            'materials.*.quantity' => ['required', 'integer', 'min:1', 'max:'.MaterialParser::MAX_QUANTITY],
-            'materials.*.unit' => ['nullable', 'string', 'max:30'],
-            'materials.*.brand' => ['nullable', 'string', 'max:100'],
-            'materials.*.specs' => ['nullable', 'string', 'max:500'],
-            'materials.*.remarks' => ['nullable', 'string', 'max:500'],
-            'materials.*.product_id' => ['nullable', 'integer'],
-            'material_token' => ['nullable', 'string', 'max:64'],
-            'materials_confirmed' => ['nullable', 'boolean'],
 
             // Optional files listing specific products the client wants quoted.
             'productFiles' => ['nullable', 'array', 'max:'.self::MAX_PRODUCT_FILES],
@@ -122,30 +108,11 @@ class PublicQuotationController extends Controller
         ], [
             'projectType.in' => 'Please choose a project type from the list.',
             'timeline.in' => 'Please choose an expected timeline from the list.',
-            'materials.*.description.required' => 'Every material line needs a description.',
-            'materials.*.quantity.required' => 'Every material line needs a quantity.',
-            'materials.*.quantity.integer' => 'Quantities must be whole numbers.',
-            'materials.*.quantity.min' => 'Quantities must be at least 1.',
             'productFiles.max' => 'You can attach up to '.self::MAX_PRODUCT_FILES.' product-list files.',
             'productFiles.*.max' => 'Each product-list file must be 10 MB or smaller.',
             'productFiles.*.extensions' => 'Product lists must be PDF, Excel (.xls/.xlsx), CSV, JPG or PNG files.',
             'productFiles.*.uploaded' => 'A product-list file could not be uploaded. It may be larger than 10 MB.',
         ]);
-
-        $materials = array_values($validated['materials'] ?? []);
-        $materialUpload = $this->materialUpload($request, $validated['material_token'] ?? null);
-
-        // The material list is required: confirmed lines, or at least the uploaded file.
-        if ($materials === [] && $materialUpload === null) {
-            return back()->withErrors([
-                'materials' => 'Please add your material list: upload a file, or enter the items and quantities manually.',
-            ])->withInput();
-        }
-        if ($materials !== [] && ! $request->boolean('materials_confirmed')) {
-            return back()->withErrors([
-                'materials_confirmed' => 'Please confirm that the material list matches what you need.',
-            ])->withInput();
-        }
 
         $productFiles = $this->checkProductFiles($request, $reader);
 
@@ -155,38 +122,37 @@ class PublicQuotationController extends Controller
         $unlisted = $request->boolean('hasUnlistedBrands') ? trim((string) ($validated['unlistedBrands'] ?? '')) : '';
         if ($request->boolean('hasUnlistedBrands') && $unlisted === '') {
             return back()->withErrors([
-                'unlistedBrands' => 'Please enter the brand names you are looking for.',
+                'unlistedBrands' => "Please enter the brand name(s) you're looking for.",
             ])->withInput();
         }
 
         $team = Team::first();
         if ($team) {
-            DB::transaction(function () use ($request, $validated, $team, $brandItems, $brands, $catalog, $unlisted, $materials, $materialUpload, $productFiles) {
-                $quotation = $this->createQuotation($request, $validated, $team, $brandItems, $brands, $catalog, $unlisted);
+            $storedFiles = [];
+            try {
+                // Retried as a whole if the database reports a deadlock between simultaneous requests.
+                DB::transaction(function () use ($validated, $team, $brandItems, $brands, $catalog, $unlisted, $productFiles, &$storedFiles) {
+                    $storedFiles = [];
+                    $quotation = $this->createQuotation($validated, $team, $brandItems, $brands, $catalog, $unlisted);
+                    $this->keepProductFiles($quotation, $productFiles, $storedFiles);
+                }, 3);
+            } catch (Throwable $e) {
+                // Nothing was saved (the transaction rolled back): remove the copied files, log the
+                // cause, and send the visitor back to the form with everything they entered.
+                Storage::disk('local')->delete($storedFiles);
+                Log::error('Public quotation request could not be saved: '.$e->getMessage(), [
+                    'exception' => $e,
+                    'company' => $validated['company'],
+                    'email' => $validated['email'],
+                ]);
 
-                if ($materials !== []) {
-                    $this->addMaterials($quotation, $team, $materials);
-                }
-                $materialHash = $materialUpload ? $this->keepMaterialFile($request, $quotation, $materialUpload, $materials !== []) : null;
-                $this->keepProductFiles($quotation, $productFiles, $materialHash);
-            });
+                return back()->withErrors([
+                    'submit' => 'We could not send your request just now. Please try again in a moment. If it keeps happening, please contact us directly.',
+                ])->withInput();
+            }
         }
 
-        return back()->with('success', 'Thank you! Your quotation request has been received. Our team will review your material list and get in touch shortly.');
-    }
-
-    /**
-     * The material-list file this visitor uploaded in this session, when the form refers to it.
-     *
-     * @return array{token: string, path: string, name: string}|null
-     */
-    private function materialUpload(Request $request, ?string $token): ?array
-    {
-        $upload = $request->session()->get(MaterialListController::SESSION_KEY);
-
-        return $token && $upload && hash_equals($upload['token'], $token) && Storage::disk('local')->exists($upload['path'])
-            ? $upload
-            : null;
+        return back()->with('success', 'Thank you! Your quotation request has been received. Our team will review your request and get in touch shortly.');
     }
 
     /**
@@ -206,17 +172,28 @@ class PublicQuotationController extends Controller
         }
 
         foreach ($files as $i => $file) {
+            $path = $file->getRealPath() ?: $file->getPathname();
+            $name = Str::limit($file->getClientOriginalName(), 60);
             try {
-                $reader->detectType($file->getRealPath() ?: $file->getPathname(), $file->getClientOriginalName());
+                $type = $reader->detectType($path, $file->getClientOriginalName());
+                // Lists must be written (typed, printed or handwritten text), not plain photos.
+                if (! $reader->assertHasText($path, $type)) {
+                    $this->uncheckedFiles[] = $file->getClientOriginalName();
+                    Log::warning("Public quotation file {$name} was accepted without a text check: OCR is not available.");
+                }
             } catch (ExtractionException $e) {
-                throw ValidationException::withMessages([
-                    "productFiles.{$i}" => Str::limit($file->getClientOriginalName(), 60).': '.$e->getMessage(),
-                ]);
+                $message = in_array($e->reason, ['ocr_failed'], true)
+                    ? "We couldn't read the text in this file. Please upload a clearer image, or a PDF, Excel or CSV file."
+                    : $e->getMessage();
+                throw ValidationException::withMessages(["productFiles.{$i}" => "{$name}: {$message}"]);
             }
         }
 
         return $files;
     }
+
+    /** @var list<string> files accepted without a text check because OCR is not installed */
+    private array $uncheckedFiles = [];
 
     /**
      * Brands chosen in the form, limited to the catalog (case-insensitive, catalog spelling).
@@ -246,7 +223,7 @@ class PublicQuotationController extends Controller
         return [$brandItems, $catalog];
     }
 
-    private function createQuotation(Request $request, array $validated, Team $team, array $brandItems, array $brands, $catalog, string $unlisted): Quotation
+    private function createQuotation(array $validated, Team $team, array $brandItems, array $brands, $catalog, string $unlisted): Quotation
     {
         $client = Client::firstOrCreate(
             ['team_id' => $team->id, 'company_name' => $validated['company']],
@@ -271,9 +248,9 @@ class PublicQuotationController extends Controller
             $notes .= "\n--- Brands Not Listed ---\n".$unlisted."\n";
         }
 
-        $quotation = Quotation::create([
+        // Number: Q<today>-PROD, -01, -02, … reserved so no other request can get it.
+        $quotation = Quotation::createWithNumber([
             'team_id' => $team->id,
-            'quotation_number' => Quotation::generateNumber($team->id),
             'client_id' => $client->id,
             'client_name' => $validated['company'],
             'contact_person' => $validated['contactName'],
@@ -287,7 +264,6 @@ class PublicQuotationController extends Controller
             'tax_amount' => 0.00,
             'grand_total' => 0.00,
             'status' => QuotationStatus::Pending,
-            'attachment_path' => $request->hasFile('attachment') ? $request->file('attachment')->store('quotations/attachments', 'local') : null,
             'notes' => $notes,
             // The same request in a structured form, for the staff review screen.
             'request_details' => [
@@ -340,127 +316,14 @@ class PublicQuotationController extends Controller
     }
 
     /**
-     * Add the confirmed material lines as quotation items.
-     *
-     * A line linked to an active catalog product (chosen by the client from our suggestions) gets
-     * that product's current selling price as an estimate. Every other line is a custom item at
-     * ₱0.00 for staff to price. Prices and totals are calculated here, never taken from the client.
-     *
-     * @param  array<int, array<string, mixed>>  $materials
-     */
-    private function addMaterials(Quotation $quotation, Team $team, array $materials): void
-    {
-        $productIds = collect($materials)->pluck('product_id')->filter()->map(fn ($id) => (int) $id)->unique();
-        $products = Product::query()
-            ->where('team_id', $team->id)
-            ->where('is_active', true)
-            ->whereIn('id', $productIds)
-            ->get(['id', 'sku', 'name', 'price'])
-            ->keyBy('id');
-
-        $subtotal = 0.0;
-        $pending = 0;
-        $lines = [];
-
-        foreach ($materials as $i => $m) {
-            $description = trim((string) $m['description']);
-            $qty = (int) $m['quantity'];
-            $brand = trim((string) ($m['brand'] ?? ''));
-            $specs = trim((string) ($m['specs'] ?? ''));
-            $unit = trim((string) ($m['unit'] ?? ''));
-            $remarks = trim((string) ($m['remarks'] ?? ''));
-            $product = isset($m['product_id']) ? $products->get((int) $m['product_id']) : null;
-            $price = $product && (float) $product->price > 0 ? round((float) $product->price, 2) : 0.0;
-            $lineTotal = round($price * $qty, 2);
-
-            $name = $product
-                ? $product->name
-                : $description.($brand !== '' ? " — {$brand}" : '').($specs !== '' ? " ({$specs})" : '');
-
-            $quotation->items()->create([
-                'product_id' => $product?->id,
-                'sku' => $product?->sku ?? 'CUSTOM',
-                'product_name' => Str::limit($name, 250),
-                'quantity' => $qty,
-                'unit_price' => $price,
-                'discount' => 0.00,
-                'subtotal' => $lineTotal,
-            ]);
-
-            $subtotal += $lineTotal;
-            if ($price <= 0) {
-                $pending++;
-            }
-
-            $lines[] = ($i + 1).'. '.$description
-                .($brand !== '' ? " | Brand: {$brand}" : '')
-                .($specs !== '' ? " | Specs: {$specs}" : '')
-                ." | Qty: {$qty}".($unit !== '' ? " {$unit}" : '')
-                .($remarks !== '' ? " | Remarks: {$remarks}" : '')
-                .($product ? " | Matched: {$product->sku}" : ' | Custom item (for staff pricing)');
-        }
-
-        // Same formula as staff quotations (QuotationController): tax on the discounted subtotal.
-        $taxRate = (float) ($quotation->tax_rate ?? config('quotation.tax_rate', 12));
-        $taxAmount = round($subtotal * ($taxRate / 100), 2);
-
-        $notes = rtrim((string) $quotation->notes)."\n\n--- Material List (".count($materials).' item'.(count($materials) === 1 ? '' : 's').') ---'."\n"
-            .implode("\n", $lines)."\n";
-        $notes .= $pending > 0
-            ? "\n{$pending} item(s) need pricing by staff. Totals shown are estimates from catalog prices only.\n"
-            : "\nTotals are estimates from catalog prices; staff confirm official pricing.\n";
-
-        $quotation->update([
-            'subtotal' => round($subtotal, 2),
-            'tax_amount' => $taxAmount,
-            'grand_total' => round($subtotal + $taxAmount, 2),
-            'notes' => $notes,
-        ]);
-    }
-
-    /**
-     * Keep the client's original material-list file with the request. Returns its fingerprint.
-     *
-     * @param  array{token: string, path: string, name: string}  $upload
-     * @param  bool  $hasLines  whether material lines were sent too
-     */
-    private function keepMaterialFile(Request $request, Quotation $quotation, array $upload, bool $hasLines): ?string
-    {
-        if (! Schema::hasColumn('quotations', 'material_file_path')) {
-            return null;
-        }
-
-        $disk = Storage::disk('local');
-        $hash = hash_file('sha256', $disk->path($upload['path'])) ?: null;
-        $target = 'quotations/attachments/material-list-'.basename($upload['path']);
-        $disk->move($upload['path'], $target);
-        $request->session()->forget(MaterialListController::SESSION_KEY);
-
-        $quotation->update([
-            'material_file_path' => $target,
-            'material_file_name' => $upload['name'],
-            'source_file_sha256' => $hash,
-        ] + ($hasLines ? [] : [
-            // Nothing could be read from the file (or the client chose not to): staff read it themselves.
-            'notes' => rtrim((string) $quotation->notes).'
-
---- Material List ---
-Only the original file was sent ('.$upload['name'].'). Please read the items and quantities from it.
-',
-        ]));
-
-        return $hash;
-    }
-
-    /**
-     * Store the product-list files. A file identical to the material list, or to another
-     * product file, is not stored twice.
+     * Store the product-list files. A file identical to another product file is not stored twice.
      *
      * @param  array<int, UploadedFile>  $files
+     * @param  array<int, string>  $stored  receives the storage path of every file copied, for clean-up if saving fails
      */
-    private function keepProductFiles(Quotation $quotation, array $files, ?string $materialHash): void
+    private function keepProductFiles(Quotation $quotation, array $files, array &$stored): void
     {
-        $seen = array_filter([$materialHash]);
+        $seen = [];
         foreach ($files as $file) {
             $path = $file->getRealPath() ?: $file->getPathname();
             $hash = hash_file('sha256', $path);
@@ -469,9 +332,10 @@ Only the original file was sent ('.$upload['name'].'). Please read the items and
             }
             $seen[] = $hash;
 
+            $stored[] = $file->storeAs(self::PRODUCT_FILES_DIR, Str::uuid().'.'.strtolower($file->getClientOriginalExtension()), 'local');
             $quotation->files()->create([
                 'kind' => QuotationFile::KIND_PRODUCT_LIST,
-                'path' => $file->storeAs(self::PRODUCT_FILES_DIR, Str::uuid().'.'.strtolower($file->getClientOriginalExtension()), 'local'),
+                'path' => end($stored),
                 'original_name' => Str::limit(basename(str_replace('\\', '/', $file->getClientOriginalName())), 200, ''),
                 'mime' => $file->getMimeType(),
                 'size' => (int) $file->getSize(),
@@ -481,7 +345,10 @@ Only the original file was sent ('.$upload['name'].'). Please read the items and
 
         $count = $quotation->files()->count();
         if ($count > 0) {
-            $quotation->update(['notes' => rtrim((string) $quotation->notes)."\n\n--- Product list files ---\n{$count} file(s) attached for staff review.\n"]);
+            $unchecked = $this->uncheckedFiles === []
+                ? ''
+                : 'Not checked for text (OCR unavailable): '.implode(', ', $this->uncheckedFiles).".\n";
+            $quotation->update(['notes' => rtrim((string) $quotation->notes)."\n\n--- Product list files ---\n{$count} file(s) attached for staff review.\n{$unchecked}"]);
         }
     }
 }

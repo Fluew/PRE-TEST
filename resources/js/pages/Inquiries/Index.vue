@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { Head, router, useForm, usePage } from '@inertiajs/vue3';
+import { showToast } from '@/composables/useFlashToast';
 import { ref, computed } from 'vue';
 import {
     Search,
@@ -108,18 +109,7 @@ const teamSlug = computed(() => {
     return 'mr-pride';
 });
 
-// Toast Notifications
-const notificationMessage = ref('');
-const notificationType = ref<'success' | 'error' | 'info'>('success');
-const showNotification = (msg: string, type: 'success' | 'error' | 'info' = 'success') => {
-    notificationMessage.value = msg;
-    notificationType.value = type;
-    setTimeout(() => {
-        if (notificationMessage.value === msg) {
-            notificationMessage.value = '';
-        }
-    }, 4500);
-};
+// Flash toasts are handled globally by useFlashToast in AppSidebarLayout
 
 // Filter states
 const search = ref(props.filters?.search || '');
@@ -214,13 +204,13 @@ const submitStatusChange = (inquiry: InquiryItem, newStatus: string) => {
         preserveScroll: true,
         preserveState: true,
         onSuccess: () => {
-            showNotification(`Inquiry #${inquiry.id} marked as ${newStatus}.`, 'success');
+            showToast(`Inquiry #${inquiry.id} marked as ${newStatus}.`, 'success');
             if (selectedInquiry.value && selectedInquiry.value.id === inquiry.id) {
                 selectedInquiry.value.status = newStatus as any;
             }
         },
         onError: () => {
-            showNotification('Failed to update status.', 'error');
+            showToast('Failed to update status.', 'error');
         }
     });
 };
@@ -230,13 +220,13 @@ const submitPriorityChange = (inquiry: InquiryItem, newPriority: string) => {
         preserveScroll: true,
         preserveState: true,
         onSuccess: () => {
-            showNotification(`Inquiry priority set to ${newPriority}.`, 'success');
+            showToast(`Inquiry priority set to ${newPriority}.`, 'success');
             if (selectedInquiry.value && selectedInquiry.value.id === inquiry.id) {
                 selectedInquiry.value.priority = newPriority as any;
             }
         },
         onError: () => {
-            showNotification('Failed to update priority.', 'error');
+            showToast('Failed to update priority.', 'error');
         }
     });
 };
@@ -247,13 +237,13 @@ const submitNotes = () => {
         preserveScroll: true,
         preserveState: true,
         onSuccess: () => {
-            showNotification('Internal notes saved successfully.', 'success');
+            showToast('Internal notes saved successfully.', 'success');
             if (selectedInquiry.value) {
                 selectedInquiry.value.admin_notes = notesForm.admin_notes;
             }
         },
         onError: () => {
-            showNotification('Failed to save notes.', 'error');
+            showToast('Failed to save notes.', 'error');
         }
     });
 };
@@ -264,7 +254,7 @@ const submitAssignment = () => {
         preserveScroll: true,
         preserveState: true,
         onSuccess: () => {
-            showNotification('Representative assignment updated.', 'success');
+            showToast('Representative assignment updated.', 'success');
             const found = props.staffMembers.find(s => s.id === Number(assignForm.assigned_to_id));
             if (selectedInquiry.value) {
                 selectedInquiry.value.assigned_to_id = assignForm.assigned_to_id;
@@ -272,7 +262,7 @@ const submitAssignment = () => {
             }
         },
         onError: () => {
-            showNotification('Failed to assign representative.', 'error');
+            showToast('Failed to assign representative.', 'error');
         }
     });
 };
@@ -282,11 +272,11 @@ const submitReply = () => {
     replyForm.post(`/${teamSlug.value}/inquiries/${selectedInquiry.value.id}/reply`, {
         preserveScroll: true,
         onSuccess: () => {
-            showNotification('Reply successfully sent to customer and inquiry updated!', 'success');
+            showToast('Reply successfully sent to customer and inquiry updated!', 'success');
             closeDetailModal();
         },
         onError: () => {
-            showNotification('Failed to send reply.', 'error');
+            showToast('Failed to send reply.', 'error');
         }
     });
 };
@@ -318,11 +308,11 @@ const confirmDelete = () => {
         onSuccess: () => {
             closeDeleteModal();
             if (showDetailModal.value) closeDetailModal();
-            showNotification('Inquiry message removed successfully.', 'success');
+            showToast('Inquiry message removed successfully.', 'success');
         },
         onError: () => {
             isDeleting.value = false;
-            showNotification('Failed to delete inquiry message.', 'error');
+            showToast('Failed to delete inquiry message.', 'error');
         }
     });
 };
@@ -347,23 +337,6 @@ const formatDate = (dateStr?: string | null) => {
 
 <template>
     <Head title="Customer Messages & Inquiries | Admin Dashboard" />
-
-    <!-- Toast Notification -->
-    <div
-        v-if="notificationMessage"
-        class="fixed top-5 right-5 z-[100] max-w-md px-4 py-3 rounded-xl shadow-xl border text-sm flex items-center gap-3 animate-in fade-in duration-200"
-        :class="[
-            notificationType === 'success' ? 'bg-emerald-50 text-emerald-900 border-emerald-200' :
-            notificationType === 'error' ? 'bg-rose-50 text-rose-900 border-rose-200' :
-            'bg-blue-50 text-blue-900 border-blue-200'
-        ]"
-    >
-        <CheckCircle2 v-if="notificationType === 'success'" class="w-5 h-5 text-emerald-600 shrink-0" />
-        <AlertCircle v-else-if="notificationType === 'error'" class="w-5 h-5 text-rose-600 shrink-0" />
-        <Clock v-else class="w-5 h-5 text-blue-600 shrink-0" />
-        <span class="font-medium text-xs sm:text-sm">{{ notificationMessage }}</span>
-        <button @click="notificationMessage = ''" class="ml-auto text-gray-400 hover:text-gray-700">&times;</button>
-    </div>
 
     <div class="workspace-page">
         <!-- Page Header -->

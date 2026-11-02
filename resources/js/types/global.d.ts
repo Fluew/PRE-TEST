@@ -22,6 +22,12 @@ declare module '@inertiajs/core' {
             sidebarOpen: boolean;
             currentTeam: Team | null;
             teams: Team[];
+            /** Admin/Staff display currency; null for public visitors and customers. */
+            currency: {
+                preferred: 'USD' | 'PHP';
+                base: 'USD';
+                rate: { rate: number; date: string; fetched_at: string } | null;
+            } | null;
             [key: string]: unknown;
         };
     }

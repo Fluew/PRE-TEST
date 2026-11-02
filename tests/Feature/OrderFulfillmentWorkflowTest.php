@@ -1,14 +1,17 @@
 <?php
 
+use App\Enums\DeliveryStatus;
 use App\Enums\QuotationStatus;
+use App\Enums\SalesOrderStatus;
 use App\Enums\TeamRole;
-use App\Models\OrderFulfillment;
+use App\Models\Payment;
 use App\Models\Product;
 use App\Models\Quotation;
 use App\Models\Sale;
 use App\Models\StockMovement;
 use App\Models\Team;
 use App\Models\User;
+use App\Services\Sales\SalesOrderService;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Storage;
 
@@ -30,140 +33,90 @@ function fulfillmentActor(string $role, Team $team): array
     return [$user, $deviceData['cookies']];
 }
 
-it('automatically initializes order fulfillment upon quotation conversion to sale', function () {
-    [$user, $cookies] = fulfillmentActor('admin', $this->team);
-
-    $product = Product::create([
-        'team_id' => $this->team->id,
-        'name' => 'Heavy Duty Magnetic Contactor',
-        'sku' => 'HD-MC-TEST',
-        'price' => 1200.00,
-        'cost_price' => 800.00,
-        'stock' => 10,
-        'status' => 'In Stock',
-        'is_active' => true,
-    ]);
-
+function fulfillmentQuotation(Team $team, Product $product, int $qty): Quotation
+{
     $quotation = Quotation::create([
-        'team_id' => $this->team->id,
-        'quotation_number' => 'Q-FULFILL-001',
-        'client_name' => 'Metro Power Corp',
-        'contact_person' => 'Engr. Roberto Cruz',
-        'phone' => '09181112233',
+        'team_id' => $team->id, 'quotation_number' => 'Q-FULFILL-001', 'client_name' => 'Metro Power Corp',
+        'contact_person' => 'Engr. Roberto Cruz', 'email' => 'roberto@metropower.example', 'phone' => '09181112233',
         'address' => 'Unit 402 Industrial Complex, Taguig City',
-        'quotation_date' => now()->toDateString(),
-        'valid_until' => now()->addDays(14)->toDateString(),
-        'subtotal' => 2400.00,
-        'discount' => 0.00,
-        'tax_rate' => 12.00,
-        'tax_amount' => 288.00,
-        'grand_total' => 2688.00,
-        'status' => QuotationStatus::Approved,
+        'quotation_date' => now()->toDateString(), 'valid_until' => now()->addDays(14)->toDateString(),
+        'subtotal' => $product->price * $qty, 'discount' => 0, 'tax_rate' => 0, 'tax_amount' => 0, 'grand_total' => $product->price * $qty,
+        'status' => QuotationStatus::Accepted,
     ]);
+    $quotation->items()->create(['product_id' => $product->id, 'sku' => $product->sku, 'product_name' => $product->name, 'quantity' => $qty, 'unit_price' => $product->price, 'subtotal' => $product->price * $qty]);
 
-    $quotation->items()->create([
-        'product_id' => $product->id,
-        'sku' => $product->sku,
-        'product_name' => $product->name,
-        'quantity' => 2,
-        'unit_price' => 1200.00,
-        'subtotal' => 2400.00,
-    ]);
+    return $quotation;
+}
 
-    $response = $this->actingAs($user)->withCookies($cookies)->post("/{$this->team->slug}/quotations/{$quotation->id}/convert-to-sale", [
-        'payment_method' => 'Bank Transfer',
-        'amount_paid' => 2688.00,
+it('creates the delivery record at order_confirmed only once the converted order is paid', function () {
+    [$user, $cookies] = fulfillmentActor('admin', $this->team);
+    $product = Product::create(['team_id' => $this->team->id, 'name' => 'Heavy Duty Magnetic Contactor', 'sku' => 'HD-MC-TEST', 'price' => 1200, 'cost_price' => 800, 'stock' => 10, 'status' => 'In Stock', 'is_active' => true]);
+    $quotation = fulfillmentQuotation($this->team, $product, 2);
+
+    $this->actingAs($user)->withCookies($cookies)->post("/{$this->team->slug}/quotations/{$quotation->id}/convert-to-sale", [
         'fulfillment_type' => 'Delivery',
-        'recipient_name' => 'Site Receiver Mark',
-        'contact_number' => '09189998877',
         'delivery_address' => 'Substation Project B, Pasig',
         'delivery_instructions' => 'Call 30 mins before arrival',
-    ]);
-
-    $response->assertSessionHasNoErrors();
+    ])->assertSessionHasNoErrors();
 
     $quotation->refresh();
-    expect($quotation->status)->toBe(QuotationStatus::Completed);
-    expect($quotation->converted_to_sale_id)->not->toBeNull();
-
     $sale = Sale::find($quotation->converted_to_sale_id);
-    expect($sale)->not->toBeNull();
-    expect($sale->fulfillment)->not->toBeNull();
+    expect($quotation->status)->toBe(QuotationStatus::Converted)
+        ->and($sale->status)->toBe(SalesOrderStatus::Pending)
+        ->and($sale->address)->toBe('Substation Project B, Pasig')
+        ->and($sale->fulfillment)->toBeNull()          // not confirmed yet: no delivery record
+        ->and($product->fresh()->stock)->toBe(10);    // and nothing taken out of stock
 
-    $fulfillment = $sale->fulfillment;
-    expect($fulfillment->fulfillment_type)->toBe('Delivery');
-    expect($fulfillment->recipient_name)->toBe('Site Receiver Mark');
-    expect($fulfillment->status)->toBe('Preparing');
+    // Payment recorded and verified → confirmed → delivery record starts at order_confirmed.
+    $this->actingAs($user)->withCookies($cookies)->post("/{$this->team->slug}/sales/{$sale->id}/payments", [
+        'method' => 'Bank Transfer', 'amount' => 2400, 'reference' => 'BDO-777', 'payment_date' => now()->toDateString(),
+    ])->assertSessionHasNoErrors();
+    $payment = Payment::sole();
+    $this->actingAs($user)->withCookies($cookies)->post("/{$this->team->slug}/sales/{$sale->id}/payments/{$payment->id}/verify", [
+        'reference' => 'BDO-777', 'amount' => 2400, 'payment_date' => now()->toDateString(),
+    ])->assertSessionHasNoErrors();
 
-    // Product stock deducted once upon conversion
-    $product->refresh();
-    expect($product->stock)->toBe(8);
+    $fulfillment = $sale->fresh()->fulfillment;
+    expect($fulfillment)->not->toBeNull()
+        ->and($fulfillment->status)->toBe(DeliveryStatus::OrderConfirmed)
+        ->and($fulfillment->fulfillment_type)->toBe('delivery')
+        ->and($fulfillment->delivery_address)->toBe('Substation Project B, Pasig')
+        ->and($fulfillment->instructions)->toBe('Call 30 mins before arrival')
+        ->and($fulfillment->attemptLogs()->sole()->new_status)->toBe('order_confirmed')
+        ->and($product->fresh()->stock)->toBe(10)
+        ->and($product->fresh()->availableStock())->toBe(8); // reserved, not taken
 });
 
-it('ensures fulfillment progression from preparing to delivered does not duplicate inventory movements', function () {
+it('takes stock out once, when the release leaves, however the delivery progresses afterwards', function () {
     [$user, $cookies] = fulfillmentActor('admin', $this->team);
+    $product = Product::create(['team_id' => $this->team->id, 'name' => 'Thermal Overload Relay', 'sku' => 'TOR-TEST', 'price' => 850, 'stock' => 15, 'is_active' => true]);
+    $quotation = fulfillmentQuotation($this->team, $product, 1);
+    [$sale] = app(SalesOrderService::class)->createFromQuotation($quotation, $user);
+    app(SalesOrderService::class)->setTerms($sale, Sale::TERMS_CREDIT, null, 15, $user);
+    $fulfillment = $sale->fresh()->fulfillment;
+    $line = $sale->items()->sole();
+    $base = "/{$this->team->slug}/deliveries";
 
-    $product = Product::create([
-        'team_id' => $this->team->id,
-        'name' => 'Thermal Overload Relay',
-        'sku' => 'TOR-TEST',
-        'price' => 850.00,
-        'stock' => 15,
-        'is_active' => true,
-    ]);
+    $this->actingAs($user)->withCookies($cookies)->post("{$base}/fulfillments/{$fulfillment->id}/releases", ['quantities' => [$line->id => 1]])->assertSessionHasNoErrors();
+    $release = $fulfillment->releases()->sole();
+    $this->actingAs($user)->withCookies($cookies)->post("{$base}/releases/{$release->id}/ready")->assertSessionHasNoErrors();
+    expect($product->fresh()->stock)->toBe(15);
 
-    $sale = Sale::create([
-        'team_id' => $this->team->id,
-        'invoice_number' => 'INV-FUL-002',
-        'client_name' => 'Delta Engg',
-        'sale_date' => now(),
-        'subtotal' => 850.00,
-        'discount' => 0.00,
-        'tax_amount' => 0.00,
-        'grand_total' => 850.00,
-        'status' => 'Completed',
-        'processed_by_id' => $user->id,
-    ]);
+    $this->actingAs($user)->withCookies($cookies)->post("{$base}/fulfillments/{$fulfillment->id}/start")->assertSessionHasNoErrors();
+    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::OutForDelivery)
+        ->and($fulfillment->fresh()->dispatched_at)->not->toBeNull()
+        ->and($product->fresh()->stock)->toBe(14);
 
-    $fulfillment = OrderFulfillment::create([
-        'team_id' => $this->team->id,
-        'sale_id' => $sale->id,
-        'fulfillment_number' => 'FUL-TEST-002',
-        'fulfillment_type' => 'Delivery',
+    $this->actingAs($user)->withCookies($cookies)->post("{$base}/fulfillments/{$fulfillment->id}/deliver", [
+        'proof_of_delivery' => UploadedFile::fake()->image('signed_waybill.jpg', 300, 300),
         'recipient_name' => 'Site Engr Arthur',
-        'contact_number' => '09170001122',
-        'status' => 'Preparing',
-        'handled_by_id' => $user->id,
-    ]);
-
-    $initialStock = $product->stock;
-    $initialMovementsCount = StockMovement::where('product_id', $product->id)->count();
-
-    // Advance to Dispatched
-    $this->actingAs($user)->withCookies($cookies)->patch("/{$this->team->slug}/fulfillments/{$fulfillment->id}/status", [
-        'status' => 'Dispatched',
-        'notes' => 'Handed over to delivery van rider #12.',
+        'remarks' => 'Client signed received copy.',
     ])->assertSessionHasNoErrors();
 
     $fulfillment->refresh();
-    expect($fulfillment->status)->toBe('Dispatched');
-    expect($fulfillment->dispatched_at)->not->toBeNull();
-
-    // Advance to Delivered with Proof
-    $proof = UploadedFile::fake()->image('signed_waybill.jpg', 300, 300);
-    $this->actingAs($user)->withCookies($cookies)->patch("/{$this->team->slug}/fulfillments/{$fulfillment->id}/status", [
-        'status' => 'Delivered',
-        'proof_of_delivery' => $proof,
-        'notes' => 'Client signed received copy.',
-    ])->assertSessionHasNoErrors();
-
-    $fulfillment->refresh();
-    expect($fulfillment->status)->toBe('Delivered');
-    expect($fulfillment->delivered_at)->not->toBeNull();
-    expect($fulfillment->proof_of_delivery)->not->toBeNull();
-
-    // Stock must not change during dispatch or delivery
-    $product->refresh();
-    expect($product->stock)->toBe($initialStock);
-    expect(StockMovement::where('product_id', $product->id)->count())->toBe($initialMovementsCount);
+    expect($fulfillment->status)->toBe(DeliveryStatus::Delivered)
+        ->and($fulfillment->delivered_at)->not->toBeNull()
+        ->and($release->fresh()->proof_path)->not->toBeNull()
+        ->and($product->fresh()->stock)->toBe(14)
+        ->and(StockMovement::where('product_id', $product->id)->count())->toBe(1);
 });

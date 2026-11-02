@@ -1,5 +1,7 @@
 <?php
 
+use App\Enums\PaymentRecordStatus;
+use App\Enums\SalesOrderStatus;
 use App\Enums\TeamRole;
 use App\Models\Product;
 use App\Models\Sale;
@@ -120,7 +122,8 @@ test('pos records sale with bank transfer details and deducts inventory', functi
         'payment_reference' => 'BDO-TRX-987654321',
         'amount_paid' => 9000.00,
         'grand_total' => 9000.00,
-        'status' => 'Completed',
+        'status' => 'completed',
+        'payment_status' => 'paid',
     ]);
 
     expect($product->fresh()->stock)->toBe(6);
@@ -169,22 +172,26 @@ test('pos records sale with gcash details and optional proof of payment file', f
     expect($sale)->not->toBeNull();
     expect($sale->payment_method)->toBe('GCash');
     expect($sale->payment_reference)->toBe('GCASH-REF-1002348912');
-    expect($sale->proof_of_payment)->not->toBeNull();
+    $payment = $sale->payments()->sole();
+    expect($payment->proof_path)->not->toBeNull()
+        // Proof alone verifies nothing: the payment waits for staff.
+        ->and($payment->status)->toBe(PaymentRecordStatus::Submitted)
+        ->and($sale->status)->toBe(SalesOrderStatus::Pending);
 
     // Stored privately, not on the public disk.
-    Storage::disk('local')->assertExists($sale->proof_of_payment);
-    Storage::disk('public')->assertMissing($sale->proof_of_payment);
-    expect($sale->proof_url)->toContain("/{$team->slug}/sales/{$sale->id}/proof");
+    Storage::disk('local')->assertExists($payment->proof_path);
+    Storage::disk('public')->assertMissing($payment->proof_path);
+    $url = "/{$team->slug}/sales/{$sale->id}/payments/{$payment->id}/proof";
 
     // The owner's team can view it through the authenticated route.
     $this->actingAs($user)
         ->withCookies($deviceData['cookies'])
-        ->get("/{$team->slug}/sales/{$sale->id}/proof")
+        ->get($url)
         ->assertOk();
 
     // Guests can't.
     auth()->logout();
-    $this->get("/{$team->slug}/sales/{$sale->id}/proof")->assertRedirect(route('login'));
+    $this->get($url)->assertRedirect(route('login'));
 });
 
 test('pos rejects a payment smaller than the total and leaves stock untouched', function () {
@@ -241,7 +248,7 @@ test('sales staff cannot void a sale; only admins can delete', function () {
         'discount' => 0,
         'tax_amount' => 0,
         'grand_total' => 100,
-        'status' => 'Completed',
+        'status' => 'completed',
     ]);
 
     $this->actingAs($staff)

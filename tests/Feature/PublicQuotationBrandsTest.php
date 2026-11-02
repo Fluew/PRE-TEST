@@ -30,9 +30,6 @@ function validQuotationPayload(array $overrides = []): array
         'phone' => '09171234567',
         'projectType' => 'Commercial Building',
         'timeline' => '1-3 months',
-        // The material list is required (see QuotationRequestWorkflowTest); brands come on top.
-        'materials' => [['description' => 'Duplex outlet', 'quantity' => 10]],
-        'materials_confirmed' => true,
     ], $overrides);
 }
 
@@ -93,9 +90,21 @@ it('saves brands that are not listed in a separate line', function () {
     ]))->assertSessionHasNoErrors();
 
     $quotation = Quotation::with('items')->firstOrFail();
-    expect($quotation->items->pluck('sku')->all())->toBe(['BRAND', 'BRAND-UNLISTED', 'CUSTOM'])
+    expect($quotation->items->pluck('sku')->all())->toBe(['BRAND', 'BRAND-UNLISTED'])
         ->and($quotation->items->firstWhere('sku', 'BRAND-UNLISTED')->product_name)->toContain('Omron, Legrand')
-        ->and($quotation->notes)->toContain('Brands Not Listed')->toContain('Omron, Legrand');
+        ->and($quotation->notes)->toContain('Brands Not Listed')->toContain('Omron, Legrand')
+        ->and($quotation->request_details['brands'])->toBe([['brand' => 'Schneider', 'details' => '']])
+        ->and($quotation->request_details['unlisted_brands'])->toBe('Omron, Legrand');
+});
+
+it('ignores the unlisted brand text when the option is not ticked', function () {
+    $this->post('/quotation', validQuotationPayload(['hasUnlistedBrands' => false, 'unlistedBrands' => 'Omron']))
+        ->assertSessionHasNoErrors();
+
+    $quotation = Quotation::with('items')->sole();
+    expect($quotation->request_details['unlisted_brands'])->toBeNull()
+        ->and($quotation->items->where('sku', 'BRAND-UNLISTED'))->toHaveCount(0)
+        ->and($quotation->notes)->not->toContain('Omron');
 });
 
 it('accepts a request that only names unlisted brands', function () {
@@ -105,7 +114,7 @@ it('accepts a request that only names unlisted brands', function () {
     expect(Quotation::count())->toBe(1);
 });
 
-it('keeps brands optional when a material list is given', function () {
+it('keeps brands optional', function () {
     brandProduct($this->team, 'Breaker', 'Schneider');
 
     $this->post('/quotation', validQuotationPayload())->assertSessionHasNoErrors();
@@ -153,7 +162,7 @@ it('ignores removed quantity, notes and additional requirement fields', function
     expect($quotation->notes)->not->toContain('Deliver by Friday')
         ->and($quotation->items->where('sku', 'BRAND'))->toHaveCount(1)
         ->and($quotation->items->firstWhere('sku', 'BRAND')->quantity)->toBe(1)
-        ->and($quotation->items->firstWhere('sku', 'CUSTOM')->quantity)->toBe(10);
+        ->and($quotation->items->where('sku', 'CUSTOM'))->toHaveCount(0);
 });
 
 it('keeps existing quotations with product and custom items readable', function () {

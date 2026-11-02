@@ -151,7 +151,7 @@ onUnmounted(() => {
                     :aria-expanded="activeTab === 'email'"
                     aria-controls="consultation-email-panel"
                     aria-label="Consultation Email"
-                    class="group pointer-events-auto flex cursor-pointer items-center rounded-l-2xl border-y border-l border-white/20 bg-gradient-to-r from-[#4b5320] to-[#3a4119] px-3.5 py-2.5 text-white shadow-xl transition-all duration-300 ease-out hover:-translate-x-3 hover:border-[#F8B803] hover:from-[#576025] hover:to-[#434b1d] hover:shadow-2xl focus-visible:ring-2 focus-visible:ring-[#F8B803] focus-visible:ring-offset-2 focus-visible:outline-none sm:px-4 sm:py-3 sm:hover:-translate-x-4"
+                    class="group pointer-events-auto flex cursor-pointer items-center rounded-l-2xl max-sm:px-2 max-sm:py-3 max-sm:[writing-mode:vertical-rl] border-y border-l border-white/20 bg-gradient-to-r from-[#4b5320] to-[#3a4119] px-3.5 py-2.5 text-white shadow-xl transition-all duration-300 ease-out hover:-translate-x-3 hover:border-[#F8B803] hover:from-[#576025] hover:to-[#434b1d] hover:shadow-2xl focus-visible:ring-2 focus-visible:ring-[#F8B803] focus-visible:ring-offset-2 focus-visible:outline-none sm:px-4 sm:py-3 sm:hover:-translate-x-4"
                     :class="[
                         activeTab === 'email'
                             ? '-translate-x-3 border-[#F8B803] bg-[#3a4119] shadow-2xl ring-1 ring-[#F8B803]/50 sm:-translate-x-4'
@@ -237,7 +237,7 @@ onUnmounted(() => {
                     :aria-expanded="activeTab === 'support'"
                     aria-controls="get-support-panel"
                     aria-label="Get Support"
-                    class="group pointer-events-auto flex cursor-pointer items-center rounded-l-2xl border-y border-l border-white/20 bg-gradient-to-r from-[#3a4119] to-[#2d3313] px-3.5 py-2.5 text-white shadow-xl transition-all duration-300 ease-out hover:-translate-x-3 hover:border-[#F8B803] hover:from-[#474f1f] hover:to-[#363d17] hover:shadow-2xl focus-visible:ring-2 focus-visible:ring-[#F8B803] focus-visible:ring-offset-2 focus-visible:outline-none sm:px-4 sm:py-3 sm:hover:-translate-x-4"
+                    class="group pointer-events-auto flex cursor-pointer items-center rounded-l-2xl max-sm:px-2 max-sm:py-3 max-sm:[writing-mode:vertical-rl] border-y border-l border-white/20 bg-gradient-to-r from-[#3a4119] to-[#2d3313] px-3.5 py-2.5 text-white shadow-xl transition-all duration-300 ease-out hover:-translate-x-3 hover:border-[#F8B803] hover:from-[#474f1f] hover:to-[#363d17] hover:shadow-2xl focus-visible:ring-2 focus-visible:ring-[#F8B803] focus-visible:ring-offset-2 focus-visible:outline-none sm:px-4 sm:py-3 sm:hover:-translate-x-4"
                     :class="[
                         activeTab === 'support'
                             ? '-translate-x-3 border-[#F8B803] bg-[#2d3313] shadow-2xl ring-1 ring-[#F8B803]/50 sm:-translate-x-4'

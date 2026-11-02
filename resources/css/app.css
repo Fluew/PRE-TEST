@@ -264,6 +264,31 @@
         background: #f8b80355;
     }
 }
+/* Scroll-reveal animation classes (used by useScrollReveal composable) */
+.scroll-reveal {
+    opacity: 0;
+    transform: translateY(20px);
+}
+.scroll-reveal.scroll-revealed {
+    opacity: 1;
+    /* `none` (not translateY(0)) so revealed sections don't trap position: fixed children. */
+    transform: none;
+    transition:
+        opacity 550ms ease,
+        transform 550ms ease;
+}
+
+/* Staff pages fade in when the module changes. `backwards` fill drops the animation once it has
+   run, so it never leaves a stacking context behind for dropdowns and dialogs. */
+.page-enter {
+    animation: page-enter 160ms ease-out backwards;
+}
+@keyframes page-enter {
+    from {
+        opacity: 0;
+    }
+}
+
 @media (prefers-reduced-motion: reduce) {
     *,
     *::before,
@@ -272,5 +297,9 @@
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
         scroll-behavior: auto !important;
+    }
+    .scroll-reveal {
+        opacity: 1;
+        transform: none;
     }
 }

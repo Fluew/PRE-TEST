@@ -2,20 +2,27 @@
 
 namespace App\Models;
 
+use App\Enums\DeliveryStatus;
+use App\Services\DocumentNumbers;
 use App\Traits\TracksDeletions;
-use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
+/**
+ * The delivery (or pickup) record of one Sales Order. Created when the order is confirmed, with
+ * status order_confirmed. Each trip or pickup is a DeliveryRelease; every status change is kept
+ * in delivery_attempt_logs (the status history).
+ */
 class OrderFulfillment extends Model
 {
     use HasFactory, SoftDeletes, TracksDeletions;
 
     protected $table = 'order_fulfillments';
 
+    /** Failed attempts allowed per trip before an administrator has to reschedule. */
     public const MAX_ATTEMPTS = 3;
 
     protected $fillable = [
@@ -35,6 +42,8 @@ class OrderFulfillment extends Model
         'handled_by_id',
         'dispatched_at',
         'delivered_at',
+        'completed_at',
+        'cancelled_at',
         'rescheduled_at',
         'rescheduled_by_id',
         'notes',
@@ -43,10 +52,13 @@ class OrderFulfillment extends Model
     ];
 
     protected $casts = [
+        'status' => DeliveryStatus::class,
         'attempt_count' => 'integer',
         'delivery_schedule' => 'datetime',
         'dispatched_at' => 'datetime',
         'delivered_at' => 'datetime',
+        'completed_at' => 'datetime',
+        'cancelled_at' => 'datetime',
         'rescheduled_at' => 'datetime',
     ];
 
@@ -54,6 +66,7 @@ class OrderFulfillment extends Model
         'proof_url',
         'remaining_attempts',
         'attempts_display',
+        'status_label',
     ];
 
     public function getProofUrlAttribute(): ?string
@@ -62,8 +75,7 @@ class OrderFulfillment extends Model
             return null;
         }
 
-        $team = $this->team;
-        $slug = $team?->slug ?? 'mr-pride';
+        $slug = $this->team?->slug ?? 'mr-pride';
 
         return "/{$slug}/deliveries/fulfillments/{$this->id}/proof";
     }
@@ -76,6 +88,16 @@ class OrderFulfillment extends Model
     public function getAttemptsDisplayAttribute(): string
     {
         return sprintf('%d/%d', min(self::MAX_ATTEMPTS, (int) $this->attempt_count), self::MAX_ATTEMPTS);
+    }
+
+    public function getStatusLabelAttribute(): ?string
+    {
+        return $this->status?->label();
+    }
+
+    public function isPickup(): bool
+    {
+        return $this->fulfillment_type === 'pickup';
     }
 
     public function team(): BelongsTo
@@ -103,34 +125,30 @@ class OrderFulfillment extends Model
         return $this->belongsTo(User::class, 'rescheduled_by_id');
     }
 
+    /** Status history, newest first (attempt_number 0 = a status change, not a failed attempt). */
     public function attemptLogs(): HasMany
     {
         return $this->hasMany(DeliveryAttemptLog::class, 'order_fulfillment_id')->latest('id');
     }
 
-    /**
-     * Check if a delivery attempt can still be made.
-     */
-    public function canAttempt(): bool
+    public function releases(): HasMany
     {
-        return $this->attempt_count < self::MAX_ATTEMPTS
-            && ! in_array($this->status, ['Delivered', 'Cancelled', 'Return to Warehouse', 'Maximum Attempts Reached'], true);
+        return $this->hasMany(DeliveryRelease::class, 'order_fulfillment_id')->latest('id');
     }
 
-    /**
-     * Generate unique fulfillment tracking number (e.g., FUL-102826-001).
-     */
+    /** The release being prepared or on the road, if any. */
+    public function openRelease(): ?DeliveryRelease
+    {
+        return $this->releases()->whereIn('status', DeliveryRelease::OPEN)->first();
+    }
+
+    public function canAttempt(): bool
+    {
+        return $this->attempt_count < self::MAX_ATTEMPTS && $this->status === DeliveryStatus::OutForDelivery;
+    }
+
     public static function generateFulfillmentNumber(int $teamId, mixed $date = null): string
     {
-        $d = $date ? Carbon::parse($date) : Carbon::now();
-        $dateStr = $d->format('mdy');
-        $prefix = "FUL-{$dateStr}-";
-
-        $count = static::withTrashed()
-            ->where('team_id', $teamId)
-            ->where('fulfillment_number', 'LIKE', "{$prefix}%")
-            ->count();
-
-        return $prefix.str_pad((string) ($count + 1), 3, '0', STR_PAD_LEFT);
+        return DocumentNumbers::next($teamId, DocumentNumbers::FULFILLMENT);
     }
 }

@@ -3,8 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Product;
-use App\Models\SaleItem;
-use App\Models\StockMovement;
+use App\Services\Forecast\SmaForecaster;
 use App\Support\Csv;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -39,8 +38,7 @@ class ForecastController extends Controller
             $fromDate = Carbon::create($today->year, 1, 1);
         }
 
-        $smaWindow = (int) $request->input('sma_window', 3);
-        $smaWindow = in_array($smaWindow, [3, 6, 12]) ? $smaWindow : 3;
+        $smaWindow = SmaForecaster::window($request->input('sma_window', SmaForecaster::DEFAULT_WINDOW));
 
         $category = $request->input('category', 'All');
         $productId = $request->filled('product_id') && $request->input('product_id') !== 'All'
@@ -83,9 +81,9 @@ class ForecastController extends Controller
         if ($selectedProduct) {
             $threshold = $selectedProduct->reorder_level ?: ($selectedProduct->min_stock ?: 10);
             $forecastNonZero = array_filter($data['forecast'], fn ($v) => $v !== null && $v > 0);
-            $avgForecastDemand = ! empty($forecastNonZero) ? (int) round(array_sum($forecastNonZero) / count($forecastNonZero)) : 10;
-            $dailyDemand = max(0.1, $avgForecastDemand / 30);
-            $daysOfSupply = (int) round($selectedProduct->stock / $dailyDemand);
+            // No forecast means no demand estimate: shown as insufficient data, never a default.
+            $avgForecastDemand = ! empty($forecastNonZero) ? (int) round(array_sum($forecastNonZero) / count($forecastNonZero)) : null;
+            $daysOfSupply = $avgForecastDemand ? (int) round($selectedProduct->stock / ($avgForecastDemand / 30)) : null;
             $recommendedRestock = max($selectedProduct->reorder_quantity ?: 50, ($threshold * 2) - $selectedProduct->stock);
 
             $urgency = 'Safe';
@@ -121,7 +119,7 @@ class ForecastController extends Controller
             $totalStock = $catProducts->sum('stock');
             $lowCount = $catProducts->filter(fn ($p) => $p->stock <= ($p->reorder_level ?: 10))->count();
             $forecastNonZero = array_filter($data['forecast'], fn ($v) => $v !== null && $v > 0);
-            $avgForecast = ! empty($forecastNonZero) ? (int) round(array_sum($forecastNonZero) / count($forecastNonZero)) : 0;
+            $avgForecast = ! empty($forecastNonZero) ? (int) round(array_sum($forecastNonZero) / count($forecastNonZero)) : null;
 
             $categoryWindow = [
                 'name' => $category,
@@ -237,113 +235,8 @@ class ForecastController extends Controller
         }, 200, $headers);
     }
 
-    /**
-     * Calculate monthly demand history and Simple Moving Average across a date range.
-     */
-    private function calculateForecastData(
-        int $teamId,
-        Carbon $fromDate,
-        Carbon $toDate,
-        int $smaWindow,
-        string $category = 'All',
-        ?int $productId = null
-    ): array {
-        // Build list of year-month periods in the range
-        $periods = [];
-        $cursor = $fromDate->copy()->startOfMonth();
-        $end = $toDate->copy()->startOfMonth();
-
-        while ($cursor->lte($end)) {
-            $periods[] = $cursor->copy();
-            $cursor->addMonth();
-        }
-
-        $labels = array_map(fn ($d) => $d->format('M Y'), $periods);
-        $historical = array_fill(0, count($periods), 0);
-
-        // Fetch monthly outgoing stock from stock movements (sale / out)
-        $movementsQuery = StockMovement::where('team_id', $teamId)
-            ->whereIn('type', ['sale', 'out'])
-            ->where('movement_date', '>=', $fromDate->copy()->startOfMonth())
-            ->where('movement_date', '<=', $toDate->copy()->endOfMonth());
-
-        if ($productId) {
-            $movementsQuery->where('product_id', $productId);
-        } elseif ($category && $category !== 'All') {
-            $movementsQuery->whereHas('product', fn ($q) => $q->where('category', $category));
-        }
-
-        $movements = $movementsQuery
-            ->selectRaw("DATE_FORMAT(movement_date, '%Y-%m') as ym, SUM(ABS(quantity)) as total_qty")
-            ->groupBy('ym')
-            ->pluck('total_qty', 'ym');
-
-        // Also query sale items (aggregated per month) to cover invoices not recorded as movements
-        $saleItemsQuery = SaleItem::whereHas('sale', function ($q) use ($teamId, $fromDate, $toDate) {
-            $q->where('team_id', $teamId)
-                ->where('sale_date', '>=', $fromDate->copy()->startOfMonth())
-                ->where('sale_date', '<=', $toDate->copy()->endOfMonth())
-                ->where('status', '!=', 'Cancelled');
-        })
-            ->join('sales', 'sales.id', '=', 'sale_items.sale_id');
-
-        if ($productId) {
-            $saleItemsQuery->where('sale_items.product_id', $productId);
-        } elseif ($category && $category !== 'All') {
-            $saleItemsQuery->whereHas('product', fn ($q) => $q->where('category', $category));
-        }
-
-        $saleItems = $saleItemsQuery
-            ->selectRaw("DATE_FORMAT(sales.sale_date, '%Y-%m') as ym, SUM(sale_items.quantity) as total_qty")
-            ->groupBy('ym')
-            ->pluck('total_qty', 'ym');
-
-        foreach ($periods as $idx => $period) {
-            $ym = $period->format('Y-m');
-            $movementQty = (int) ($movements[$ym] ?? 0);
-            $saleQty = (int) ($saleItems[$ym] ?? 0);
-            $historical[$idx] = max($movementQty, $saleQty);
-        }
-
-        // Fallback: if no real data at all, generate a realistic seasonal baseline
-        $total = array_sum($historical);
-        if ($total === 0) {
-            if ($productId) {
-                $product = Product::find($productId);
-                $baseVal = $product ? max(10, (int) round(($product->reorder_level ?: 10) * 1.5)) : 25;
-                $seasonalScale = max(3, (int) round($baseVal * 0.25));
-                foreach ($periods as $idx => $period) {
-                    $seasonal = sin(($period->month) * (pi() / 6)) * $seasonalScale;
-                    $historical[$idx] = (int) max(2, round($baseVal + $seasonal));
-                }
-            } elseif ($category && $category !== 'All') {
-                $baseVal = 55 + (($fromDate->year - 2024) * 10);
-                foreach ($periods as $idx => $period) {
-                    $seasonal = sin(($period->month) * (pi() / 6)) * 18;
-                    $historical[$idx] = (int) max(12, round($baseVal + $seasonal));
-                }
-            } else {
-                $baseVal = 150 + (($fromDate->year - 2024) * 25);
-                foreach ($periods as $idx => $period) {
-                    $seasonal = sin(($period->month) * (pi() / 6)) * 40;
-                    $historical[$idx] = (int) max(20, round($baseVal + $seasonal));
-                }
-            }
-        }
-
-        // Simple Moving Average
-        $count = count($periods);
-        $forecast = array_fill(0, $count, null);
-
-        for ($i = $smaWindow; $i < $count; $i++) {
-            $slice = array_slice($historical, $i - $smaWindow, $smaWindow);
-            $forecast[$i] = (int) round(array_sum($slice) / $smaWindow * 1.08); // +8% trend factor
-        }
-
-        return [
-            'labels' => $labels,
-            'historical' => $historical,
-            'forecast' => $forecast,
-        ];
+    private function calculateForecastData(int $teamId, Carbon $fromDate, Carbon $toDate, int $smaWindow, string $category = 'All', ?int $productId = null): array
+    {
+        return app(SmaForecaster::class)->series($teamId, $fromDate, $toDate, $smaWindow, $category ?: 'All', $productId);
     }
 }

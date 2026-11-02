@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { Head } from '@inertiajs/vue3';
 import { Mail, Phone, MapPin, Clock, Building, ShieldCheck } from '@lucide/vue';
+import { ref } from 'vue';
 import PublicLayout from '@/layouts/PublicLayout.vue';
+import { useScrollReveal } from '@/composables/useScrollReveal';
+
+const sections = ref<HTMLElement[]>([]);
+useScrollReveal(sections);
 </script>
 
 <template>
@@ -26,7 +31,7 @@ import PublicLayout from '@/layouts/PublicLayout.vue';
                 </div>
 
                 <!-- Contact Information Grid -->
-                <div class="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
+                <div ref="sections" class="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
                     <!-- Email Card -->
                     <div class="flex flex-col justify-between rounded-xl border border-white/20 bg-white p-6 text-gray-900 shadow-xl transition-colors duration-200 dark:border-neutral-800 dark:bg-neutral-900 dark:text-white">
                         <div>
@@ -40,17 +45,17 @@ import PublicLayout from '@/layouts/PublicLayout.vue';
                                 Send purchase orders, quotation inquiries, and company correspondence.
                             </p>
                         </div>
-                        <div class="mt-6 border-t border-gray-100 pt-4 dark:border-neutral-800 space-y-2">
+                        <div class="mt-6 border-t border-gray-100 pt-2 dark:border-neutral-800">
                             <a
                                 href="mailto:sales.rcjlent@gmail.com"
-                                class="flex items-center gap-2 text-xs font-semibold text-gray-800 hover:text-[#4b5320] hover:underline dark:text-neutral-200 dark:hover:text-[#F8B803]"
+                                class="flex items-center gap-2 py-2 text-xs font-semibold text-gray-800 hover:text-[#4b5320] hover:underline dark:text-neutral-200 dark:hover:text-[#F8B803]"
                             >
                                 <span class="size-2 rounded-full bg-emerald-500 shrink-0"></span>
                                 sales.rcjlent@gmail.com
                             </a>
                             <a
                                 href="mailto:malabanan.gary@gmail.com"
-                                class="flex items-center gap-2 text-xs font-semibold text-gray-800 hover:text-[#4b5320] hover:underline dark:text-neutral-200 dark:hover:text-[#F8B803]"
+                                class="flex items-center gap-2 py-2 text-xs font-semibold text-gray-800 hover:text-[#4b5320] hover:underline dark:text-neutral-200 dark:hover:text-[#F8B803]"
                             >
                                 <span class="size-2 rounded-full bg-[#F8B803] shrink-0"></span>
                                 malabanan.gary@gmail.com
@@ -71,17 +76,17 @@ import PublicLayout from '@/layouts/PublicLayout.vue';
                                 Call our direct sales lines for urgent orders and delivery follow-ups.
                             </p>
                         </div>
-                        <div class="mt-6 border-t border-gray-100 pt-4 dark:border-neutral-800 space-y-2">
+                        <div class="mt-6 border-t border-gray-100 pt-2 dark:border-neutral-800">
                             <a
                                 href="tel:09397366907"
-                                class="flex items-center gap-2 font-mono text-xs font-semibold text-gray-800 hover:text-[#4b5320] dark:text-neutral-200 dark:hover:text-[#F8B803]"
+                                class="flex items-center gap-2 py-2 font-mono text-xs font-semibold text-gray-800 hover:text-[#4b5320] dark:text-neutral-200 dark:hover:text-[#F8B803]"
                             >
                                 <span class="size-2 rounded-full bg-emerald-500 shrink-0"></span>
                                 09397366907 (Mobile / Smart)
                             </a>
                             <a
                                 href="tel:022444939"
-                                class="flex items-center gap-2 font-mono text-xs font-semibold text-gray-800 hover:text-[#4b5320] dark:text-neutral-200 dark:hover:text-[#F8B803]"
+                                class="flex items-center gap-2 py-2 font-mono text-xs font-semibold text-gray-800 hover:text-[#4b5320] dark:text-neutral-200 dark:hover:text-[#F8B803]"
                             >
                                 <span class="size-2 rounded-full bg-[#F8B803] shrink-0"></span>
                                 (02) 244-4939 (Landline)
@@ -114,7 +119,7 @@ import PublicLayout from '@/layouts/PublicLayout.vue';
                 </div>
 
                 <!-- Additional Info Section: Business Hours & Support Notice -->
-                <div class="mt-8 grid grid-cols-1 gap-6 sm:grid-cols-2">
+                <div ref="sections" class="mt-8 grid grid-cols-1 gap-6 sm:grid-cols-2">
                     <div class="flex items-start gap-4 rounded-xl border border-white/15 bg-white/10 p-5 backdrop-blur-xs">
                         <div class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-[#F8B803] text-gray-900 font-semibold">
                             <Clock class="size-5" />

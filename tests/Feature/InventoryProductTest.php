@@ -129,3 +129,57 @@ test('can update a supplier without type error', function () {
         'name' => 'Updated Supplier Corp',
     ]);
 });
+
+test('inventory index provides the backend ahp prioritization', function () {
+    $team = Team::factory()->create(['slug' => 'test-team']);
+    $user = User::factory()->create([
+        'role' => 'admin',
+        'current_team_id' => $team->id,
+        'password_changed_at' => now(),
+    ]);
+    $team->members()->attach($user, ['role' => TeamRole::Owner->value]);
+    $deviceData = createTrustedDeviceFor($user);
+
+    $supplier = Supplier::create([
+        'team_id' => $team->id,
+        'name' => 'Schneider Electric Philippines',
+        'contact_person' => 'Juan Dela Cruz',
+        'phone' => '09123456789',
+        'email' => 'juan@schneider.ph',
+        'status' => 'Active',
+    ]);
+
+    Product::create([
+        'team_id' => $team->id,
+        'name' => 'Molded Case Circuit Breaker 100A',
+        'sku' => 'MCCB-100A',
+        'category' => 'Circuit Breakers',
+        'unit' => 'pcs',
+        'stock' => 5,
+        'min_stock' => 10,
+        'reorder_level' => 20,
+        'reorder_quantity' => 50,
+        'price' => 3500.00,
+        'cost_price' => 2200.00,
+        'supplier_id' => $supplier->id,
+        'status' => 'Low Stock',
+        'is_active' => true,
+    ]);
+
+    $response = $this->actingAs($user)
+        ->withCookies($deviceData['cookies'])
+        ->get("/{$team->slug}/inventory");
+
+    $response->assertOk();
+    $response->assertInertia(fn ($page) => $page
+        ->component('Inventory/Index')
+        ->has('priorities', 1)
+        ->where('priorities.0.product.sku', 'MCCB-100A')
+        // No sales history and no verified supplier availability: reported as incomplete, not scored as 0.
+        ->where('priorities.0.complete', false)
+        ->where('priorities.0.classification', null)
+        ->where('priorities.0.criteria.0.key', 'demand')
+        ->where('priorities.0.criteria.0.weight', 0.4)
+        ->where('priorities.0.criteria.0.available', false)
+    );
+});

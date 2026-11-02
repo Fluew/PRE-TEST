@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { Head, router, usePage } from '@inertiajs/vue3';
 import { useCanDelete } from '@/composables/useCanDelete';
+import { useCurrency } from '@/composables/useCurrency';
+import { showToast } from '@/composables/useFlashToast';
 import { ref, computed, watch } from 'vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
+import ImportWizard from '@/components/import/ImportWizard.vue';
 import StatusBadge from '@/components/ui/StatusBadge.vue';
 import GlideSelect from '@/components/vue-bits/GlideSelect.vue';
 import { 
@@ -47,9 +50,14 @@ interface QuotationItem {
     unit_price: number;
     discount: number;
     subtotal: number;
-    // Computed by the server for catalog products (stock check).
+    // Computed by the server for catalog products (stock check, unreserved stock).
     available_stock?: number;
     shortage?: number;
+    stock_status?: string;
+    // Internal: supplier cost when the line was priced. Never on customer documents.
+    unit_cost?: number | null;
+    supplier_id?: number | null;
+    supplier?: { id: number; name: string } | null;
 }
 
 interface Quotation {
@@ -68,12 +76,25 @@ interface Quotation {
     tax_rate: number;
     tax_amount: number;
     grand_total: number;
-    status: 'Draft' | 'Pending' | 'Approved' | 'Rejected' | 'Cancelled' | 'Expired' | 'Completed';
+    status: string;
+    status_label?: string;
+    email_status?: string;
+    email_status_label?: string;
+    allowed_actions?: string[];
+    is_approved?: boolean;
+    approved_by?: { name: string } | null;
+    approved_at?: string | null;
+    sent_by?: { name: string } | null;
+    sent_at?: string | null;
+    decision_by?: { name: string } | null;
+    customer_decision_at?: string | null;
+    customer_decision_source?: string | null;
+    customer_decision_remarks?: string | null;
     notes?: string | null;
     terms_and_conditions?: string | null;
     prepared_by?: { name: string } | null;
     converted_to_sale_id?: number | null;
-    sale?: { invoice_number: string } | null;
+    sale?: { id: number; order_number: string; status: string; payment_status: string } | null;
     items: QuotationItem[];
     created_at?: string;
     attachment_url?: string | null;
@@ -99,8 +120,13 @@ interface Product {
     name: string;
     category: string;
     price: number;
-    stock: number;
+    cost_price?: number | null;
+    supplier_id?: number | null;
+    supplier_name?: string | null;
+    stock: number; // available (not reserved for confirmed orders)
+    on_hand?: number;
     status: string;
+    stock_status?: string;
 }
 
 interface Client {
@@ -129,14 +155,23 @@ const props = defineProps<{
     metrics: {
         totalQuotations: number;
         pendingCount: number;
+        forApprovalCount: number;
         approvedCount: number;
+        acceptedCount: number;
         totalQuotedValue: number;
     };
     products: Product[];
     clients: Client[];
     nextNumber: string;
     statusOptions: { value: string; label: string; badgeClass: string }[];
+    formStatuses: { value: string; label: string }[];
+    decisionSources: Record<string, string>;
+    canApprove: boolean;
+    suppliers?: { id: number; name: string }[];
 }>();
+
+const statusLabel = (value: string) => props.statusOptions.find((o) => o.value === value)?.label ?? value;
+const can = (quote: Quotation | null, action: string) => !!quote?.allowed_actions?.includes(action);
 
 const page = usePage();
 const canDelete = useCanDelete();
@@ -211,6 +246,8 @@ const form = ref<{
         unit_price: number;
         discount: number;
         stock: number;
+        unit_cost: number | null;
+        supplier_id: number | null;
     }[];
 }>({
     client_name: '',
@@ -220,7 +257,7 @@ const form = ref<{
     address: '',
     quotation_date: new Date().toISOString().slice(0, 10),
     valid_until: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
-    status: 'Draft',
+    status: 'under_preparation',
     notes: '',
     terms_and_conditions: "1. Price Validity: Quotation is valid until the stated expiration date.\n2. Payment Terms: 50% down payment upon confirmation, 50% upon delivery.\n3. Delivery: 5-7 business days from receipt of purchase order.\n4. Warranty: 1-Year standard manufacturer warranty on electrical equipment.\n5. To accept, please sign and return via email.",
     tax_rate: 12.00,
@@ -261,6 +298,21 @@ const formGrandTotal = computed(() => {
     return taxable + formTaxAmount.value;
 });
 
+const formStatusChoices = computed(() => {
+    const list = [...props.formStatuses];
+    if (form.value.status && !list.some((s) => s.value === form.value.status)) {
+        list.unshift({ value: form.value.status, label: statusLabel(form.value.status) });
+    }
+    return list;
+});
+
+// Margin over supplier cost, for staff only.
+const lineMargin = (item: { unit_price: number; discount: number; unit_cost: number | null }) => {
+    if (item.unit_cost == null || !(Number(item.unit_price) > 0)) return null;
+    const net = Number(item.unit_price) - (Number(item.discount) || 0);
+    return Math.round(((net - Number(item.unit_cost)) / net) * 1000) / 10;
+};
+
 // Line Items Methods
 const addItem = () => {
     // Default to first product if available
@@ -273,6 +325,8 @@ const addItem = () => {
         unit_price: firstProd ? Number(firstProd.price) : 0,
         discount: 0,
         stock: firstProd ? firstProd.stock : 0,
+        unit_cost: firstProd?.cost_price != null ? Number(firstProd.cost_price) : null,
+        supplier_id: firstProd?.supplier_id ?? null,
     });
 };
 
@@ -285,6 +339,8 @@ const onProductSelect = (index: number, productId: number | null) => {
         form.value.items[index].product_name = prod.name;
         form.value.items[index].unit_price = Number(prod.price);
         form.value.items[index].stock = prod.stock;
+        form.value.items[index].unit_cost = prod.cost_price != null ? Number(prod.cost_price) : null;
+        form.value.items[index].supplier_id = prod.supplier_id ?? null;
     }
 };
 
@@ -304,7 +360,7 @@ const openCreateModal = () => {
         address: '',
         quotation_date: new Date().toISOString().slice(0, 10),
         valid_until: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
-        status: 'Draft',
+        status: 'under_preparation',
         notes: '',
         terms_and_conditions: "1. Price Validity: Quotation is valid until the stated expiration date.\n2. Payment Terms: 50% down payment upon confirmation, 50% upon delivery.\n3. Delivery: 5-7 business days from receipt of purchase order.\n4. Warranty: 1-Year standard manufacturer warranty on electrical equipment.\n5. To accept, please sign and return via email.",
         tax_rate: 12.00,
@@ -342,6 +398,8 @@ const openEditModal = (quote: Quotation) => {
                 unit_price: Number(item.unit_price),
                 discount: Number(item.discount),
                 stock: matchedProd ? matchedProd.stock : 0,
+                unit_cost: item.unit_cost != null ? Number(item.unit_cost) : null,
+                supplier_id: item.supplier_id ?? null,
             };
         })
     };
@@ -461,26 +519,34 @@ const saveQuotation = () => {
     }
 };
 
-// Status Update Modal
-const targetStatus = ref<string>('Pending');
+// Status Update Modal (working statuses only; approval, sending and the customer's answer have their own actions)
+const targetStatus = ref<string>('');
+const statusRemarks = ref('');
+const manualStatusOptions = computed(() =>
+    (activeQuotation.value?.allowed_actions ?? [])
+        .filter((a) => a.startsWith('status:'))
+        .map((a) => a.slice(7))
+        .map((value) => props.statusOptions.find((o) => o.value === value) ?? { value, label: value, badgeClass: '' }),
+);
 const openStatusModal = (quote: Quotation) => {
     activeQuotation.value = quote;
-    targetStatus.value = quote.status;
+    targetStatus.value = manualStatusOptions.value[0]?.value ?? '';
+    statusRemarks.value = '';
     showStatusModal.value = true;
 };
 
 const isUpdatingStatus = ref(false);
 
 const promptUpdateStatus = () => {
-    if (!activeQuotation.value) return;
+    if (!activeQuotation.value || !targetStatus.value) return;
     openConfirmModal({
         title: 'Confirm Status Change',
-        description: `Are you sure you want to change status of quotation ${activeQuotation.value.quotation_number} to "${targetStatus.value}"?`,
+        description: `Change quotation ${activeQuotation.value.quotation_number} to "${statusLabel(targetStatus.value)}"?`,
         details: [
             { label: 'Quotation #', value: activeQuotation.value.quotation_number },
             { label: 'Client / Company', value: activeQuotation.value.client_name },
-            { label: 'Current Status', value: activeQuotation.value.status },
-            { label: 'New Target Status', value: targetStatus.value },
+            { label: 'Current Status', value: activeQuotation.value.status_label ?? activeQuotation.value.status },
+            { label: 'New Status', value: statusLabel(targetStatus.value) },
         ],
         confirmText: 'Update Status',
         action: updateStatusSubmit,
@@ -491,63 +557,129 @@ const updateStatusSubmit = () => {
     if (!activeQuotation.value) return;
     isUpdatingStatus.value = true;
     router.patch(`/${teamSlug.value}/quotations/${activeQuotation.value.id}/status`, {
-        status: targetStatus.value
+        status: targetStatus.value,
+        remarks: statusRemarks.value || undefined,
     }, {
         preserveScroll: true,
         onSuccess: () => {
             showStatusModal.value = false;
+        },
+        onFinish: () => {
             isUpdatingStatus.value = false;
         },
-        onError: () => {
-            isUpdatingStatus.value = false;
-        }
     });
 };
 
-// Convert to Sale Modal
-const paymentMethod = ref('Bank Transfer / Check');
-const convertAmountPaid = ref<number>(0);
-const convertPaymentReference = ref('');
-const convertFulfillmentType = ref<'Delivery' | 'Store Pickup'>('Delivery');
-const convertRecipientName = ref('');
-const convertContactNumber = ref('');
+const workflowBusy = ref(false);
+const postWorkflow = (quote: Quotation, action: string, data: Record<string, any> = {}, onSuccess?: () => void) => {
+    workflowBusy.value = true;
+    router.post(`/${teamSlug.value}/quotations/${quote.id}/${action}`, data, {
+        preserveScroll: true,
+        onSuccess: () => onSuccess?.(),
+        onFinish: () => {
+            workflowBusy.value = false;
+        },
+    });
+};
+
+// Admin approval: does not email the customer and does not touch stock.
+const promptApprove = (quote: Quotation) => {
+    openConfirmModal({
+        title: 'Approve and Send',
+        description: quote.email
+            ? `Approve ${quote.quotation_number}? It is emailed to ${quote.email} as a PDF straight away and becomes Sent.`
+            : `Approve ${quote.quotation_number}? It has no customer email address, so it stays approved until you add one and use Send.`,
+        details: [
+            { label: 'Total', value: formatCurrency(quote.grand_total) },
+            { label: 'Valid until', value: formatDate(quote.valid_until) },
+        ],
+        confirmText: 'Approve and Send',
+        action: () => postWorkflow(quote, 'approve'),
+    });
+};
+
+const promptSend = (quote: Quotation) => {
+    openConfirmModal({
+        title: quote.status === 'sent' ? 'Send Quotation Again' : 'Send Quotation',
+        description: quote.email
+            ? `Email ${quote.quotation_number} as a PDF to ${quote.email}? The PDF shows customer prices only.`
+            : 'This quotation has no customer email address. Edit it first, or add the email to the client.',
+        details: [
+            { label: 'To', value: quote.email || '—' },
+            { label: 'Total', value: formatCurrency(quote.grand_total) },
+            { label: 'Valid until', value: formatDate(quote.valid_until) },
+        ],
+        confirmText: 'Send Email',
+        action: () => postWorkflow(quote, 'send'),
+    });
+};
+
+// Customer's answer (recorded by staff: customers have no accounts)
+const showDecisionModal = ref(false);
+// An acceptance creates the Sales Order straight away, so it asks how the order is fulfilled.
+const decision = ref({
+    decision: 'accepted' as 'accepted' | 'rejected',
+    source: 'email',
+    decided_on: new Date().toISOString().slice(0, 10),
+    remarks: '',
+    fulfillment_type: 'delivery' as 'delivery' | 'pickup',
+    delivery_address: '',
+    delivery_instructions: '',
+});
+const openDecisionModal = (quote: Quotation) => {
+    activeQuotation.value = quote;
+    decision.value = {
+        decision: 'accepted',
+        source: 'email',
+        decided_on: new Date().toISOString().slice(0, 10),
+        remarks: '',
+        fulfillment_type: 'delivery',
+        delivery_address: quote.address || '',
+        delivery_instructions: '',
+    };
+    showDecisionModal.value = true;
+};
+const submitDecision = () => {
+    if (!activeQuotation.value) return;
+    const d = decision.value;
+    const accepted = d.decision === 'accepted';
+    postWorkflow(activeQuotation.value, 'decision', {
+        decision: d.decision,
+        source: d.source,
+        decided_on: d.decided_on,
+        remarks: d.remarks || undefined,
+        fulfillment_type: accepted ? d.fulfillment_type : undefined,
+        delivery_address: accepted && d.fulfillment_type === 'delivery' ? d.delivery_address || undefined : undefined,
+        delivery_instructions: accepted ? d.delivery_instructions || undefined : undefined,
+    }, () => {
+        showDecisionModal.value = false;
+    });
+};
+
+// Generate the Sales Order from an accepted quotation. Nothing is paid or taken from stock here.
+const convertFulfillmentType = ref<'delivery' | 'pickup'>('delivery');
 const convertDeliveryAddress = ref('');
-const convertDeliverySchedule = ref('');
 const convertDeliveryInstructions = ref('');
+const lowStockLines = computed(() => (activeQuotation.value?.items ?? []).filter((i) => i.product_id && (i.shortage || 0) > 0));
 
 const openConvertModal = (quote: Quotation) => {
     activeQuotation.value = quote;
-    paymentMethod.value = 'Bank Transfer / Check';
-    convertAmountPaid.value = Number(quote.grand_total || 0);
-    convertPaymentReference.value = '';
-    convertFulfillmentType.value = 'Delivery';
-    convertRecipientName.value = quote.contact_person || quote.client_name;
-    convertContactNumber.value = quote.phone || '';
+    convertFulfillmentType.value = 'delivery';
     convertDeliveryAddress.value = quote.address || '';
-    convertDeliverySchedule.value = '';
     convertDeliveryInstructions.value = '';
     showConvertModal.value = true;
 };
 
 const convertToSaleSubmit = () => {
     if (!activeQuotation.value) return;
-    router.post(`/${teamSlug.value}/quotations/${activeQuotation.value.id}/convert-to-sale`, {
-        payment_method: paymentMethod.value,
-        amount_paid: convertAmountPaid.value,
-        payment_reference: convertPaymentReference.value,
+    postWorkflow(activeQuotation.value, 'convert-to-sale', {
         fulfillment_type: convertFulfillmentType.value,
-        recipient_name: convertRecipientName.value,
-        contact_number: convertContactNumber.value,
-        delivery_address: convertDeliveryAddress.value,
-        delivery_schedule: convertDeliverySchedule.value || null,
-        delivery_instructions: convertDeliveryInstructions.value,
-    }, {
-        onSuccess: () => {
-            showConvertModal.value = false;
-        }
+        delivery_address: convertFulfillmentType.value === 'delivery' ? convertDeliveryAddress.value : undefined,
+        delivery_instructions: convertDeliveryInstructions.value || undefined,
+    }, () => {
+        showConvertModal.value = false;
     });
 };
-
 // View & Print
 const openViewModal = (quote: Quotation) => {
     activeQuotation.value = quote;
@@ -590,11 +722,15 @@ const statusFromReview = () => {
 const importOptions = [
     { value: 'materials', label: 'Material list', tag: 'PDF · Excel · Image' },
     { value: 'csv', label: 'Quotations (CSV)', tag: '.csv' },
+    { value: 'supplier_quotation', label: 'Supplier quotation', tag: 'CSV · Excel · PDF · Image' },
 ];
 const onImportChoice = (value: string) => {
     if (value === 'csv') openImportModal();
+    else if (value === 'supplier_quotation') showSupplierQuoteImport.value = true;
     else openMaterialImportModal();
 };
+// Supplier quotations received by email: imported as unverified supplier quotes (inventory prices untouched).
+const showSupplierQuoteImport = ref(false);
 
 // ------------------------------------------------------------------ material-list import
 
@@ -772,37 +908,15 @@ const formatDate = (dateStr: string | null | undefined): string => {
 };
 
 const isExpired = (validUntil: string | null | undefined, status: string): boolean => {
-    if (!validUntil || status === 'Completed' || status === 'Cancelled') return false;
+    if (!validUntil || ['converted', 'cancelled', 'expired', 'rejected', 'accepted'].includes(status)) return false;
     const cleanDate = toInputDate(validUntil);
     const today = new Date().toISOString().slice(0, 10);
     return cleanDate < today;
 };
 
-const formatCurrency = (amount: number | string) => {
-    const num = typeof amount === 'string' ? parseFloat(amount) : amount;
-    return new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' }).format(num || 0);
-};
-
-const getStatusBadge = (status: string) => {
-    switch (status) {
-        case 'Approved':
-            return 'bg-emerald-50 text-emerald-700 border-emerald-200';
-        case 'Pending':
-            return 'bg-[#F8B803]/15 text-[#4b5320] border-[#F8B803]/30 font-semibold';
-        case 'Completed':
-            return 'bg-blue-50 text-blue-700 border-blue-200 font-semibold';
-        case 'Draft':
-            return 'bg-gray-100 text-gray-700 border-gray-200';
-        case 'Rejected':
-            return 'bg-rose-50 text-rose-700 border-rose-200';
-        case 'Expired':
-            return 'bg-amber-50 text-amber-800 border-amber-300';
-        case 'Cancelled':
-            return 'bg-slate-100 text-slate-500 border-slate-200 line-through';
-        default:
-            return 'bg-gray-100 text-gray-700 border-gray-200';
-    }
-};
+// Stored amounts are USD; shown in the user's display currency (header switch). Price inputs
+// stay in USD, the currency the quotation is saved in.
+const { formatMoney: formatCurrency, conversionNote } = useCurrency();
 
 // Row Expansion State for Multi-Item Quotes
 const expandedQuoteIds = ref<number[]>([]);
@@ -821,20 +935,7 @@ const getQuoteTotalQuantity = (quote: Quotation): number => {
     return quote.items.reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
 };
 
-// Toast Notification
-const notification = ref<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
-const showNotification = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
-    notification.value = { message, type };
-    setTimeout(() => {
-        notification.value = null;
-    }, 4500);
-};
-
-watch(() => (page.props as any).flash, (flash: any) => {
-    if (flash?.success) showNotification(flash.success, 'success');
-    if (flash?.error) showNotification(flash.error, 'error');
-    if (flash?.info) showNotification(flash.info, 'info');
-}, { immediate: true, deep: true });
+// Flash toasts are handled globally by useFlashToast in AppSidebarLayout
 
 // Live Preview of Generated Quote Number in Create Modal
 const currentPreviewQuoteNumber = computed(() => {
@@ -968,12 +1069,12 @@ const downloadSampleCsv = () => {
     link.download = 'mr_pride_quotations_template.csv';
     link.click();
     URL.revokeObjectURL(link.href);
-    showNotification('Sample CSV template downloaded with required headers!', 'info');
+    showToast('Sample CSV template downloaded with required headers!', 'info');
 };
 
 const executeCsvImport = () => {
     if (!importedFile.value || !csvValidationResult.value || csvValidationResult.value.valid_count === 0) {
-        showNotification('No valid rows available to import.', 'error');
+        showToast('No valid rows available to import.', 'error');
         return;
     }
 
@@ -993,7 +1094,7 @@ const executeCsvImport = () => {
         onError: (err) => {
             isImportingCsv.value = false;
             const msg = Object.values(err)[0] as string;
-            showNotification(msg || 'Failed to import CSV.', 'error');
+            showToast(msg || 'Failed to import CSV.', 'error');
         }
     });
 };
@@ -1049,9 +1150,9 @@ const executeCsvImport = () => {
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div
                 v-for="card in [
-                    { label: 'Total quotations', value: metrics.totalQuotations },
-                    { label: 'Pending review', value: metrics.pendingCount },
-                    { label: 'Approved, ready to convert', value: metrics.approvedCount },
+                    { label: 'Requests to review', value: metrics.pendingCount },
+                    { label: 'Waiting for approval', value: metrics.forApprovalCount },
+                    { label: 'Accepted, ready for order', value: metrics.acceptedCount },
                     { label: 'Active pipeline value', value: formatCurrency(metrics.totalQuotedValue) },
                 ]"
                 :key="card.label"
@@ -1134,14 +1235,16 @@ const executeCsvImport = () => {
                                         <button v-if="quote.items && quote.items.length > 1" 
                                                 type="button"
                                                 @click="toggleRowExpand(quote.id)" 
-                                                class="p-0.5 rounded text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+                                                class="-m-1 p-1.5 rounded text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+                                                :aria-expanded="isRowExpanded(quote.id)"
                                                 :title="isRowExpanded(quote.id) ? 'Collapse line items' : 'Expand line items'">
                                             <ChevronRight :class="['w-3.5 h-3.5 transition-transform duration-150', isRowExpanded(quote.id) ? 'rotate-90 text-[#4b5320]' : '']" />
                                         </button>
                                         <div>
                                             <span class="font-mono text-xs sm:text-sm font-semibold text-gray-900 block">{{ quote.quotation_number }}</span>
                                             <div class="flex items-center gap-1.5 mt-0.5">
-                                                <StatusBadge :status="quote.status" size="sm" />
+                                                <StatusBadge :status="quote.status_label ?? quote.status" size="sm" />
+                                                <span v-if="quote.status === 'for_approval' && quote.is_approved" class="rounded-md border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700">Approved, not sent</span>
                                                 <span class="text-[11px] text-gray-500 truncate max-w-[130px]" :title="quote.client_name">{{ quote.client_name }}</span>
                                             </div>
                                         </div>
@@ -1198,25 +1301,43 @@ const executeCsvImport = () => {
                                 <!-- AMOUNT -->
                                 <td class="py-4 text-right whitespace-nowrap">
                                     <span class="text-sm sm:text-base font-semibold text-gray-900 block">{{ formatCurrency(quote.grand_total || quote.subtotal) }}</span>
-                                    <span v-if="quote.sale" class="block text-[10px] text-blue-600 font-mono font-semibold">
-                                        Sale: {{ quote.sale.invoice_number }}
+                                    <a v-if="quote.sale" :href="`/${teamSlug}/sales/${quote.sale.id}`" class="block text-[10px] text-blue-600 font-mono font-semibold hover:underline">
+                                        {{ quote.sale.order_number }}
+                                    </a>
+                                    <span v-else-if="quote.email_status && quote.email_status !== 'not_sent'" class="block text-[10px]" :class="quote.email_status === 'failed' ? 'text-rose-600 font-semibold' : 'text-gray-500'">
+                                        Email: {{ quote.email_status_label }}
                                     </span>
                                 </td>
 
                                 <!-- ACTIONS -->
                                 <td class="py-4 text-right whitespace-nowrap">
                                     <div class="inline-flex items-center gap-1.5">
-                                        <!-- Convert to Sale Button (Only if Approved) -->
+                                        <!-- The next step for this quotation -->
+                                        <SpecularButton v-if="can(quote, 'approve')" variant="brand" size="sm" :radius="8" :disabled="workflowBusy" @click="promptApprove(quote)" title="Approve this quotation (administrator)">
+                                            <CheckCircle2 class="w-3.5 h-3.5" />
+                                            <span>Approve</span>
+                                        </SpecularButton>
+                                        <SpecularButton v-if="can(quote, 'send')" variant="brand" size="sm" :radius="8" :disabled="workflowBusy" @click="promptSend(quote)" title="Email the quotation PDF to the customer">
+                                            <Mail class="w-3.5 h-3.5" />
+                                            <span>Send</span>
+                                        </SpecularButton>
+                                        <SpecularButton v-if="can(quote, 'decision')" variant="secondary" size="sm" :radius="8" @click="openDecisionModal(quote)" title="Record the customer's acceptance or rejection">
+                                            <span>Customer answer</span>
+                                        </SpecularButton>
+                                        <button v-if="can(quote, 'resend')" @click="promptSend(quote)" :disabled="workflowBusy" title="Send the quotation again"
+                                                class="p-1.5 text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors">
+                                            <Mail class="w-4 h-4" />
+                                        </button>
                                         <SpecularButton
-                                            v-if="quote.status === 'Approved' && !quote.converted_to_sale_id" 
+                                            v-if="can(quote, 'convert')"
                                             variant="success"
                                             size="sm"
                                             :radius="8"
-                                            @click="openConvertModal(quote)" 
-                                            title="Convert Approved Quote to Sale"
+                                            @click="openConvertModal(quote)"
+                                            title="Generate the Sales Order from this accepted quotation"
                                         >
                                             <ShoppingCart class="w-3.5 h-3.5" />
-                                            <span>Convert to Sale</span>
+                                            <span>Generate Sales Order</span>
                                         </SpecularButton>
 
                                         <!-- Review what the client sent -->
@@ -1229,7 +1350,7 @@ const executeCsvImport = () => {
                                         </button>
 
                                         <!-- Update Status Quick Action -->
-                                        <button @click="openStatusModal(quote)" 
+                                        <button v-if="quote.allowed_actions?.some((a) => a.startsWith('status:'))" @click="openStatusModal(quote)" 
                                                 title="Update Status"
                                                 class="px-2 py-1 bg-white border border-gray-200 hover:border-[#F8B803] text-gray-700 rounded-lg text-xs transition-colors">
                                             Status
@@ -1242,8 +1363,8 @@ const executeCsvImport = () => {
                                             <Printer class="w-4 h-4 text-[#4b5320]" />
                                         </button>
 
-                                        <!-- Edit -->
-                                        <button @click="openEditModal(quote)" 
+                                        <!-- Edit (only while it is being prepared) -->
+                                        <button v-if="can(quote, 'edit')" @click="openEditModal(quote)" 
                                                 title="Edit Quotation"
                                                 class="p-1.5 text-gray-600 hover:text-[#4b5320] hover:bg-[#F8B803]/10 rounded-lg transition-colors">
                                             <Pencil class="w-4 h-4" />
@@ -1495,13 +1616,11 @@ const executeCsvImport = () => {
                         <select id="q_status"
                                 v-model="form.status" 
                                 class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm">
-                            <option value="Draft">Draft</option>
-                            <option value="Pending">Pending</option>
-                            <option value="Approved">Approved</option>
+                            <option v-for="s in formStatusChoices" :key="s.value" :value="s.value">{{ s.label }}</option>
                         </select>
                         <label for="q_status"
                                class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-[#4b5320]">
-                            Initial Status
+                            Status (approval is a separate step)
                         </label>
                     </div>
                 </div>
@@ -1529,8 +1648,9 @@ const executeCsvImport = () => {
                                     <th class="p-2.5 font-semibold w-5/12">Product Selection / SKU</th>
                                     <th class="p-2.5 font-semibold w-24 text-center">Stock</th>
                                     <th class="p-2.5 font-semibold w-20">Qty *</th>
-                                    <th class="p-2.5 font-semibold w-28">Unit Price (₱)</th>
-                                    <th class="p-2.5 font-semibold w-24">Discount (₱)</th>
+                                    <th class="p-2.5 font-semibold w-28" title="Internal only: never shown to the customer">Supplier Cost (USD)</th>
+                                    <th class="p-2.5 font-semibold w-28">Unit Price (USD)</th>
+                                    <th class="p-2.5 font-semibold w-24">Discount (USD)</th>
                                     <th class="p-2.5 font-semibold text-right w-28">Subtotal</th>
                                     <th class="p-2.5 text-center w-10"></th>
                                 </tr>
@@ -1544,7 +1664,7 @@ const executeCsvImport = () => {
                                                 class="w-full bg-white border border-gray-200 rounded p-1.5 text-xs text-gray-900 focus:border-[#F8B803] focus:outline-none mb-1">
                                             <option :value="null">-- Select Product from Inventory --</option>
                                             <option v-for="p in products" :key="p.id" :value="p.id">
-                                                {{ p.name }} ({{ p.sku }}) - ₱{{ p.price }} [Stock: {{ p.stock }}]
+                                                {{ p.name }} ({{ p.sku }}) - {{ formatCurrency(p.price) }} [Stock: {{ p.stock }}]
                                             </option>
                                         </select>
                                         <div class="flex items-center gap-2">
@@ -1557,7 +1677,7 @@ const executeCsvImport = () => {
                                     <td class="p-2.5 text-center">
                                         <span :class="item.stock <= 0 ? 'bg-rose-100 text-rose-700' : (item.quantity > item.stock ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-700')"
                                               class="px-2 py-0.5 rounded-full text-[10px] font-semibold block">
-                                            {{ item.stock }} in stock
+                                            {{ item.stock }} available
                                         </span>
                                         <span v-if="item.quantity > item.stock" class="text-[10px] text-rose-600 font-semibold block mt-1 leading-tight">
                                             ⚠️ Insufficient stock
@@ -1567,6 +1687,12 @@ const executeCsvImport = () => {
                                     <!-- Qty -->
                                     <td class="p-2.5">
                                         <input v-model.number="item.quantity" type="number" min="1" class="w-full bg-white border border-gray-200 rounded p-1.5 text-xs text-center font-semibold text-gray-900 focus:border-[#F8B803] focus:outline-none" />
+                                    </td>
+
+                                    <!-- Supplier cost (internal) -->
+                                    <td class="p-2.5">
+                                        <input v-model.number="item.unit_cost" type="number" min="0" step="0.01" placeholder="—" class="w-full bg-gray-50 border border-gray-200 rounded p-1.5 text-xs text-right text-gray-700 focus:border-[#F8B803] focus:outline-none" />
+                                        <span v-if="lineMargin(item) !== null" class="block text-[10px] mt-0.5 text-right" :class="(lineMargin(item) ?? 0) < 0 ? 'text-rose-600 font-semibold' : 'text-gray-500'">Margin {{ lineMargin(item) }}%</span>
                                     </td>
 
                                     <!-- Unit Price -->
@@ -1638,7 +1764,7 @@ const executeCsvImport = () => {
                             </div>
 
                             <div class="flex justify-between items-center text-gray-600">
-                                <span>Quotation Discount (₱):</span>
+                                <span>Quotation Discount (USD):</span>
                                 <input v-model.number="form.discount" type="number" min="0" step="0.01" class="w-24 bg-white border border-gray-200 rounded p-1 text-xs text-right font-mono font-semibold text-rose-600 focus:outline-none" />
                             </div>
 
@@ -1702,19 +1828,18 @@ const executeCsvImport = () => {
 
             <div class="space-y-3">
                 <label class="block text-xs font-semibold text-gray-700">Select New Status</label>
+                <p class="text-[11px] text-gray-500">Approval, sending and the customer's answer have their own buttons.</p>
                 <div class="grid grid-cols-1 gap-2">
-                    <label v-for="opt in statusOptions" :key="opt.value" 
+                    <label v-for="opt in manualStatusOptions" :key="opt.value" 
                            :class="targetStatus === opt.value ? 'border-[#F8B803] bg-[#F8B803]/10 ring-1 ring-[#F8B803]' : 'border-gray-200 bg-white'"
                            class="border rounded-xl p-3 cursor-pointer flex items-center justify-between transition-colors">
                         <div class="flex items-center gap-2">
                             <input type="radio" v-model="targetStatus" :value="opt.value" class="accent-[#4b5320]" />
                             <span class="text-sm font-semibold text-gray-900">{{ opt.label }}</span>
                         </div>
-                        <span :class="opt.badgeClass" class="text-xs px-2 py-0.5 rounded-full border">
-                            {{ opt.label }}
-                        </span>
                     </label>
                 </div>
+                <textarea v-model="statusRemarks" rows="2" maxlength="1000" placeholder="Remarks (optional), e.g. waiting for supplier price on item 3" class="field-control"></textarea>
             </div>
 
             <div class="flex justify-end gap-3 mt-6 pt-3 border-t border-gray-100">
@@ -1742,160 +1867,128 @@ const executeCsvImport = () => {
     </div>
 
     <!-- ========================================================================= -->
-    <!-- CONVERT TO SALE MODAL -->
+    <!-- GENERATE SALES ORDER -->
     <!-- ========================================================================= -->
-    <div v-if="showConvertModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-        <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-lg shadow-xl animate-in fade-in duration-150">
-            <div class="flex items-center gap-3 mb-4">
-                <div class="p-3 bg-emerald-100 text-emerald-700 rounded-xl">
-                    <ShoppingCart class="w-6 h-6" />
+    <div v-if="showConvertModal && activeQuotation" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+        <div class="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-gray-200 bg-white p-6 shadow-xl">
+            <h3 class="text-lg font-semibold text-gray-900">Generate Sales Order</h3>
+            <p class="mt-1 text-xs text-gray-500">From accepted quotation {{ activeQuotation.quotation_number }} for {{ activeQuotation.client_name }}.</p>
+
+            <div class="mt-4 space-y-2 rounded-xl border border-gray-200 bg-gray-50 p-4 text-xs">
+                <div class="flex justify-between"><span class="text-gray-500">Items</span><span class="font-semibold text-gray-900">{{ activeQuotation.items.length }} line(s), {{ getQuoteTotalQuantity(activeQuotation) }} unit(s)</span></div>
+                <div class="flex justify-between"><span class="text-gray-500">Total (copied from the quotation)</span><span class="font-semibold text-gray-900">{{ formatCurrency(activeQuotation.grand_total) }}</span></div>
+                <div class="flex justify-between"><span class="text-gray-500">Customer email</span><span class="font-semibold text-gray-900">{{ activeQuotation.email || 'None: no email will be sent' }}</span></div>
+            </div>
+
+            <div class="mt-4 space-y-4">
+                <div>
+                    <span class="field-label">Fulfillment</span>
+                    <div class="grid grid-cols-2 gap-2">
+                        <label v-for="opt in [{ v: 'delivery', l: 'Delivery' }, { v: 'pickup', l: 'Customer pickup' }]" :key="opt.v"
+                               :class="convertFulfillmentType === opt.v ? 'border-[#4b5320] bg-[#4b5320]/5' : 'border-gray-200'"
+                               class="flex cursor-pointer items-center gap-2 rounded-xl border p-3 text-sm">
+                            <input v-model="convertFulfillmentType" type="radio" :value="opt.v" class="accent-[#4b5320]" />
+                            {{ opt.l }}
+                        </label>
+                    </div>
+                </div>
+                <div v-if="convertFulfillmentType === 'delivery'">
+                    <label class="field-label" for="convert-address">Delivery address</label>
+                    <textarea id="convert-address" v-model="convertDeliveryAddress" rows="2" maxlength="500" class="field-control"></textarea>
                 </div>
                 <div>
-                    <h3 class="text-xl font-semibold text-gray-900">Convert Quote to Sale</h3>
-                    <p class="text-xs text-gray-500">Record sales invoice and deduct items from inventory stock</p>
+                    <label class="field-label" for="convert-notes">Delivery or pickup instructions (optional)</label>
+                    <textarea id="convert-notes" v-model="convertDeliveryInstructions" rows="2" maxlength="1000" class="field-control"></textarea>
                 </div>
             </div>
 
-            <div class="bg-gray-50 p-4 rounded-xl border border-gray-200 space-y-2 text-xs mb-4">
-                <div class="flex justify-between"><span class="text-gray-500">Quotation ID:</span> <span class="font-semibold text-gray-900">{{ activeQuotation?.quotation_number }}</span></div>
-                <div class="flex justify-between"><span class="text-gray-500">Client / Company:</span> <span class="font-semibold text-gray-900">{{ activeQuotation?.client_name }}</span></div>
-                <div class="flex justify-between"><span class="text-gray-500">Items to Transfer:</span> <span class="font-semibold text-gray-900">{{ activeQuotation?.items.length }} items</span></div>
-                <div class="flex justify-between pt-2 border-t border-gray-200"><span class="text-gray-700 font-semibold">Total Sales Amount:</span> <span class="font-semibold text-base text-[#4b5320]">{{ formatCurrency(activeQuotation?.grand_total || 0) }}</span></div>
+            <div v-if="lowStockLines.length" class="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                <p class="font-semibold">Not enough available stock for:</p>
+                <ul class="mt-1 list-disc pl-4">
+                    <li v-for="i in lowStockLines" :key="i.id ?? i.sku">{{ i.product_name }}: {{ i.available_stock ?? 0 }} available, {{ i.quantity }} ordered</li>
+                </ul>
+                <p class="mt-1">The order can still be created; what is available is reserved when it is confirmed.</p>
             </div>
 
-            <div class="space-y-4 mb-4">
-                <!-- Payment Details -->
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Payment Method</label>
-                        <select v-model="paymentMethod" class="w-full bg-white border border-gray-200 rounded-lg p-2.5 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none">
-                            <option>Bank Transfer / Check</option>
-                            <option>GCash</option>
-                            <option>Direct Cash</option>
-                            <option>Cash on Delivery (COD)</option>
-                            <option>Credit Terms (30 Days)</option>
-                        </select>
-                    </div>
+            <p class="mt-4 text-xs text-gray-600">
+                The order starts as <strong>Pending Payment</strong>. Nothing is taken from stock and no payment is recorded now.
+                The customer is emailed the Sales Order with the payment instructions.
+            </p>
 
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Amount Paid (PHP)</label>
-                        <input
-                            v-model.number="convertAmountPaid"
-                            type="number"
-                            step="0.01"
-                            min="0"
-                            class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                            placeholder="0.00"
-                        />
-                    </div>
-                </div>
-
-                <div>
-                    <label class="block text-xs font-semibold text-gray-700 mb-1">Payment Reference / Transaction No.</label>
-                    <input
-                        v-model="convertPaymentReference"
-                        type="text"
-                        class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                        placeholder="e.g. GCash Ref #, Bank Check #, Deposit Slip #"
-                    />
-                </div>
-
-                <!-- Fulfillment / Delivery Section -->
-                <div class="pt-3 border-t border-gray-200">
-                    <h4 class="text-xs font-semibold text-[#4b5320] mb-2 flex items-center gap-1.5">
-                        <span>Fulfillment & Dispatch Setup</span>
-                    </h4>
-
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
-                        <div>
-                            <label class="block text-xs font-semibold text-gray-700 mb-1">Fulfillment Mode</label>
-                            <select v-model="convertFulfillmentType" class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none">
-                                <option value="Delivery">Jobsite / Client Delivery</option>
-                                <option value="Store Pickup">Customer Store Pickup</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-xs font-semibold text-gray-700 mb-1">Recipient Name</label>
-                            <input
-                                v-model="convertRecipientName"
-                                type="text"
-                                class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                                placeholder="Receiver name"
-                            />
-                        </div>
-                    </div>
-
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
-                        <div>
-                            <label class="block text-xs font-semibold text-gray-700 mb-1">Contact Phone</label>
-                            <input
-                                v-model="convertContactNumber"
-                                type="text"
-                                class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                                placeholder="Contact number"
-                            />
-                        </div>
-                        <div>
-                            <label class="block text-xs font-semibold text-gray-700 mb-1">Delivery Schedule</label>
-                            <input
-                                v-model="convertDeliverySchedule"
-                                type="date"
-                                class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                            />
-                        </div>
-                    </div>
-
-                    <div v-if="convertFulfillmentType === 'Delivery'" class="mb-3">
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Delivery Address</label>
-                        <textarea
-                            v-model="convertDeliveryAddress"
-                            rows="2"
-                            class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none resize-none"
-                            placeholder="Complete delivery address..."
-                        ></textarea>
-                    </div>
-
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Instructions / Notes</label>
-                        <input
-                            v-model="convertDeliveryInstructions"
-                            type="text"
-                            class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                            placeholder="Gate pass, delivery contact person, special instructions..."
-                        />
-                    </div>
-                </div>
-            </div>
-
-            <div class="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start gap-2 mb-6">
-                <AlertTriangle class="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                <span>
-                    Executing this conversion will immediately deduct item quantities from your active Inventory database, log stock movements, and initialize customer order fulfillment tracking.
-                </span>
-            </div>
-
-            <div class="flex justify-end gap-3">
-                <SpecularButton
-                    type="button"
-                    variant="secondary"
-                    size="md"
-                    :radius="10"
-                    @click="showConvertModal = false"
-                >
-                    Cancel
-                </SpecularButton>
-                <SpecularButton
-                    type="button"
-                    variant="success"
-                    size="md"
-                    :radius="10"
-                    @click="convertToSaleSubmit"
-                >
-                    <Check class="w-4 h-4" />
-                    <span>Confirm & Execute Sale</span>
-                </SpecularButton>
+            <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
+                <button type="button" class="secondary-button" @click="showConvertModal = false">Cancel</button>
+                <button type="button" class="brand-button" :disabled="workflowBusy" @click="convertToSaleSubmit">
+                    <ShoppingCart class="w-4 h-4" />
+                    {{ workflowBusy ? 'Creating…' : 'Generate Sales Order' }}
+                </button>
             </div>
         </div>
+    </div>
+
+    <!-- ========================================================================= -->
+    <!-- CUSTOMER'S ANSWER -->
+    <!-- ========================================================================= -->
+    <div v-if="showDecisionModal && activeQuotation" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+        <form class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-gray-200 bg-white p-6 shadow-xl" @submit.prevent="submitDecision">
+            <h3 class="text-lg font-semibold text-gray-900">Customer's answer</h3>
+            <p class="mt-1 text-xs text-gray-500">{{ activeQuotation.quotation_number }} · sent {{ formatDate(activeQuotation.sent_at ?? null) }} · valid until {{ formatDate(activeQuotation.valid_until) }}</p>
+
+            <div class="mt-4 space-y-4">
+                <div class="grid grid-cols-2 gap-2">
+                    <label v-for="opt in [{ v: 'accepted', l: 'Accepted' }, { v: 'rejected', l: 'Rejected' }]" :key="opt.v"
+                           :class="decision.decision === opt.v ? (opt.v === 'accepted' ? 'border-emerald-500 bg-emerald-50' : 'border-rose-400 bg-rose-50') : 'border-gray-200'"
+                           class="flex cursor-pointer items-center gap-2 rounded-xl border p-3 text-sm font-medium">
+                        <input v-model="decision.decision" type="radio" :value="opt.v" class="accent-[#4b5320]" />
+                        {{ opt.l }}
+                    </label>
+                </div>
+                <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div>
+                        <label class="field-label" for="decision-source">Received by</label>
+                        <select id="decision-source" v-model="decision.source" class="field-control">
+                            <option v-for="(label, key) in decisionSources" :key="key" :value="key">{{ label }}</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="field-label" for="decision-date">Date</label>
+                        <input id="decision-date" v-model="decision.decided_on" type="date" :max="new Date().toISOString().slice(0, 10)" class="field-control" />
+                    </div>
+                </div>
+                <div>
+                    <label class="field-label" for="decision-remarks">Remarks (optional)</label>
+                    <textarea id="decision-remarks" v-model="decision.remarks" rows="2" maxlength="1000" placeholder="e.g. PO number, who confirmed, reason for rejecting" class="field-control"></textarea>
+                </div>
+                <template v-if="decision.decision === 'accepted'">
+                    <div class="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+                        Saving the acceptance emails the customer a confirmation and creates the Sales Order (Pending) with the payment instructions.
+                    </div>
+                    <div>
+                        <span class="field-label">Fulfillment</span>
+                        <div class="grid grid-cols-2 gap-2">
+                            <label v-for="opt in [{ v: 'delivery', l: 'Delivery' }, { v: 'pickup', l: 'Customer pickup' }]" :key="opt.v"
+                                   :class="decision.fulfillment_type === opt.v ? 'border-[#4b5320] bg-[#4b5320]/5' : 'border-gray-200'"
+                                   class="flex cursor-pointer items-center gap-2 rounded-xl border p-3 text-sm">
+                                <input v-model="decision.fulfillment_type" type="radio" :value="opt.v" class="accent-[#4b5320]" />
+                                {{ opt.l }}
+                            </label>
+                        </div>
+                    </div>
+                    <div v-if="decision.fulfillment_type === 'delivery'">
+                        <label class="field-label" for="decision-address">Delivery address</label>
+                        <textarea id="decision-address" v-model="decision.delivery_address" rows="2" maxlength="500" class="field-control"></textarea>
+                    </div>
+                    <div>
+                        <label class="field-label" for="decision-instructions">Delivery or pickup instructions (optional)</label>
+                        <textarea id="decision-instructions" v-model="decision.delivery_instructions" rows="2" maxlength="1000" class="field-control"></textarea>
+                    </div>
+                </template>
+            </div>
+
+            <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
+                <button type="button" class="secondary-button" @click="showDecisionModal = false">Cancel</button>
+                <button type="submit" class="brand-button" :disabled="workflowBusy">{{ decision.decision === 'accepted' ? 'Save and create Sales Order' : 'Save answer' }}</button>
+            </div>
+        </form>
     </div>
 
     <!-- ========================================================================= -->
@@ -1912,7 +2005,7 @@ const executeCsvImport = () => {
                     </p>
                 </div>
                 <div class="flex items-center gap-2 shrink-0">
-                    <StatusBadge :status="activeQuotation.status" />
+                    <StatusBadge :status="activeQuotation.status_label ?? activeQuotation.status" />
                     <button type="button" @click="showViewModal = false" class="text-gray-400 hover:text-gray-600 p-1 rounded-lg hover:bg-gray-100" aria-label="Close">
                         <X class="w-5 h-5" />
                     </button>
@@ -1920,6 +2013,12 @@ const executeCsvImport = () => {
             </div>
 
             <div class="p-6 overflow-y-auto space-y-6 text-sm">
+                <dl class="grid grid-cols-2 gap-3 rounded-xl border border-gray-200 bg-gray-50 p-3 text-xs sm:grid-cols-4">
+                    <div><dt class="text-gray-500">Approved</dt><dd class="font-medium text-gray-900">{{ activeQuotation.approved_by ? `${activeQuotation.approved_by.name}, ${formatDate(activeQuotation.approved_at ?? null)}` : 'Not yet' }}</dd></div>
+                    <div><dt class="text-gray-500">Sent</dt><dd class="font-medium text-gray-900">{{ activeQuotation.sent_at ? formatDate(activeQuotation.sent_at) : 'Not yet' }}</dd></div>
+                    <div><dt class="text-gray-500">Email</dt><dd class="font-medium" :class="activeQuotation.email_status === 'failed' ? 'text-rose-600' : 'text-gray-900'">{{ activeQuotation.email_status_label ?? 'Not sent' }}</dd></div>
+                    <div><dt class="text-gray-500">Customer</dt><dd class="font-medium text-gray-900">{{ activeQuotation.customer_decision_at ? `${activeQuotation.status === 'rejected' ? 'Rejected' : 'Accepted'} (${decisionSources[activeQuotation.customer_decision_source ?? ''] ?? '—'})` : 'No answer yet' }}</dd></div>
+                </dl>
                 <p class="text-xs text-gray-500">
                     Client-submitted information. Product matches, prices and availability are not confirmed until you review and price the quotation.
                 </p>
@@ -1949,8 +2048,8 @@ const executeCsvImport = () => {
                             <span class="font-medium">{{ b.brand }}</span><span v-if="b.details" class="text-gray-600"> — {{ b.details }}</span>
                         </li>
                     </ul>
-                    <p v-if="activeQuotation.request_details?.unlisted_brands" class="mt-1.5 text-gray-700">
-                        <span class="text-gray-500">Not in our list:</span> {{ activeQuotation.request_details.unlisted_brands }}
+                    <p v-if="activeQuotation.request_details?.unlisted_brands" class="mt-1.5 whitespace-pre-line text-gray-700">
+                        <span class="text-gray-500">Other brands (not in our catalog):</span> {{ activeQuotation.request_details.unlisted_brands }}
                     </p>
                 </section>
 
@@ -2276,6 +2375,7 @@ const executeCsvImport = () => {
                             <span class="font-black text-gray-900 uppercase">Grand Total:</span>
                             <span class="font-black text-base text-[#4b5320] font-mono">{{ formatCurrency(activeQuotation?.grand_total || 0) }}</span>
                         </div>
+                        <p v-if="conversionNote" class="pt-1 text-[10px] leading-snug text-gray-500">{{ conversionNote }}</p>
                     </div>
                 </div>
 
@@ -2587,21 +2687,7 @@ const executeCsvImport = () => {
         </div>
     </div>
 
-    <!-- Floating Toast Notification -->
-    <div v-if="notification" class="fixed top-5 right-5 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl shadow-lg border text-sm transition-colors animate-in fade-in duration-200"
-         :class="{
-             'bg-emerald-50 border-emerald-200 text-emerald-800': notification.type === 'success',
-             'bg-rose-50 border-rose-200 text-rose-800': notification.type === 'error',
-             'bg-amber-50 border-amber-200 text-amber-800': notification.type === 'info'
-         }">
-        <CheckCircle2 v-if="notification.type === 'success'" class="w-4 h-4 text-emerald-600 shrink-0" />
-        <AlertCircle v-else-if="notification.type === 'error'" class="w-4 h-4 text-rose-600 shrink-0" />
-        <Clock v-else class="w-4 h-4 text-amber-600 shrink-0" />
-        <span class="font-medium">{{ notification.message }}</span>
-        <button @click="notification = null" class="ml-2 text-gray-400 hover:text-gray-600">
-            <X class="w-3.5 h-3.5" />
-        </button>
-    </div>
+    <ImportWizard :open="showSupplierQuoteImport" module="supplier_quotation" :suppliers="suppliers ?? []" @close="showSupplierQuoteImport = false" />
 </template>
 
 <style>

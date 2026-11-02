@@ -2,14 +2,23 @@
 
 namespace App\Http\Controllers;
 
+use App\Enums\DeliveryStatus;
+use App\Enums\SalesOrderStatus;
+use App\Exceptions\WorkflowException;
 use App\Models\Delivery;
 use App\Models\DeliveryAttemptLog;
+use App\Models\DeliveryRelease;
 use App\Models\OrderFulfillment;
 use App\Models\Product;
 use App\Models\PurchaseOrder;
 use App\Models\Supplier;
 use App\Models\Team;
 use App\Models\User;
+use App\Services\AuditLogger;
+use App\Services\Delivery\FulfillmentService;
+use App\Services\Documents\DocumentPdf;
+use App\Services\Procurement\ProcurementWorkflow;
+use App\Services\Sales\SalesOrderService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
@@ -43,8 +52,10 @@ class DeliveryController extends Controller
         // ---------------------------------------------------------
         $outboundQuery = OrderFulfillment::where('team_id', $team->id)
             ->with([
-                'sale:id,invoice_number,client_name,grand_total,sale_date',
-                'sale.items:id,sale_id,product_name,quantity,unit_price',
+                'sale:id,order_number,invoice_number,client_name,grand_total,sale_date,status,channel,fulfillment_type,hold_reason',
+                'sale.items:id,sale_id,sku,product_name,quantity,unit_price,reserved_quantity,deducted_quantity,released_quantity,delivered_quantity,cancelled_quantity',
+                'releases.items.saleItem:id,sku,product_name',
+                'releases.acknowledgedBy:id,name',
                 'commercialInvoice:id,invoice_number,total_cost',
                 'handledBy:id,name,email,role',
                 'rescheduledBy:id,name',
@@ -66,23 +77,15 @@ class DeliveryController extends Controller
                     ->orWhere('recipient_name', 'like', "%{$search}%")
                     ->orWhere('delivery_address', 'like', "%{$search}%")
                     ->orWhere('contact_number', 'like', "%{$search}%")
-                    ->orWhereHas('sale', fn ($sq) => $sq->where('invoice_number', 'like', "%{$search}%")->orWhere('client_name', 'like', "%{$search}%"));
+                    ->orWhereHas('sale', fn ($sq) => $sq->where('order_number', 'like', "%{$search}%")->orWhere('invoice_number', 'like', "%{$search}%")->orWhere('client_name', 'like', "%{$search}%"));
             });
         }
 
         $status = $request->input('status', 'All');
         if ($status && $status !== 'All') {
-            if ($status === 'Pending') {
-                $outboundQuery->whereIn('status', ['Pending', 'Preparing']);
-            } elseif ($status === 'In-Transit' || $status === 'Out for Delivery') {
-                $outboundQuery->where('status', 'Out for Delivery');
-            } elseif ($status === 'Failed') {
-                $outboundQuery->whereIn('status', ['Delivery Attempt Failed', 'Maximum Attempts Reached']);
-            } else {
-                $outboundQuery->where('status', $status);
-            }
+            $groups = self::STATUS_GROUPS;
+            $outboundQuery->whereIn('status', $groups[$status] ?? [$status]);
         }
-
         $dateFrom = $request->input('date_from');
         if ($dateFrom) {
             $outboundQuery->whereDate('delivery_schedule', '>=', $dateFrom);
@@ -98,19 +101,38 @@ class DeliveryController extends Controller
             ->paginate(12, ['*'], 'outbound_page')
             ->withQueryString();
 
-        // Outbound Metrics
-        $baseMetricsQuery = fn () => OrderFulfillment::where('team_id', $team->id)
-            ->when($isDeliveryStaff, fn ($q) => $q->where('handled_by_id', $user->id));
+        // Outbound Metrics - computed in a single aggregate query
+        $toPrepareList = "'".implode("','", self::STATUS_GROUPS['to_prepare'])."'";
+        $deliveredList = "'".implode("','", self::STATUS_GROUPS['delivered'])."'";
+        $problemsList = "'".implode("','", self::STATUS_GROUPS['problems'])."'";
+        $maxAttempts = OrderFulfillment::MAX_ATTEMPTS;
+
+        $metricsRow = OrderFulfillment::where('team_id', $team->id)
+            ->when($isDeliveryStaff, fn ($q) => $q->where('handled_by_id', $user->id))
+            ->selectRaw("
+                COUNT(*) as total_assigned,
+                SUM(CASE WHEN status IN ({$toPrepareList}) THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN status = 'out_for_delivery' THEN 1 ELSE 0 END) as in_transit,
+                SUM(CASE WHEN status IN ({$deliveredList}) THEN 1 ELSE 0 END) as delivered,
+                SUM(CASE WHEN status IN ({$problemsList}) THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN status = 'out_for_delivery' AND attempt_count < {$maxAttempts} THEN 1 ELSE 0 END) as attempts_remaining
+            ")
+            ->first();
 
         $outboundMetrics = [
-            'totalAssigned' => $baseMetricsQuery()->count(),
-            'pending' => $baseMetricsQuery()->whereIn('status', ['Pending', 'Preparing'])->count(),
-            'inTransit' => $baseMetricsQuery()->where('status', 'Out for Delivery')->count(),
-            'delivered' => $baseMetricsQuery()->where('status', 'Delivered')->count(),
-            'failed' => $baseMetricsQuery()->whereIn('status', ['Delivery Attempt Failed', 'Maximum Attempts Reached'])->count(),
-            'attemptsRemaining' => $baseMetricsQuery()->where('attempt_count', '<', OrderFulfillment::MAX_ATTEMPTS)->whereNotIn('status', ['Delivered', 'Cancelled'])->count(),
+            'totalAssigned' => (int) ($metricsRow->total_assigned ?? 0),
+            'pending' => (int) ($metricsRow->pending ?? 0),
+            'inTransit' => (int) ($metricsRow->in_transit ?? 0),
+            'delivered' => (int) ($metricsRow->delivered ?? 0),
+            'failed' => (int) ($metricsRow->failed ?? 0),
+            'attemptsRemaining' => (int) ($metricsRow->attempts_remaining ?? 0),
         ];
 
+        $outboundDeliveries->getCollection()->each(function (OrderFulfillment $f) use ($user) {
+            $f->setAttribute('allowed_actions', $this->allowedActions($f, $user));
+            $f->setAttribute('status_choices', $this->statusChoices($f, $user));
+            $f->setAttribute('open_release', $f->releases->first(fn ($r) => in_array($r->status, DeliveryRelease::OPEN, true)));
+        });
         // Available Delivery Staff list (for Admin assignment dropdown)
         $deliveryStaffList = [];
         if ($isAdmin) {
@@ -138,8 +160,11 @@ class DeliveryController extends Controller
             $inboundQuery = Delivery::where('team_id', $team->id)
                 ->with([
                     'supplier:id,name',
-                    'purchaseOrder:id,po_number',
+                    'purchaseOrder:id,po_number,promised_delivery_date,quantity,status',
                     'receivedBy:id,name',
+                    'inspectedBy:id,name',
+                    'postedBy:id,name',
+                    'invoices:id,delivery_id,invoice_number,status',
                 ]);
 
             if ($search && $activeTab === 'inbound') {
@@ -159,13 +184,22 @@ class DeliveryController extends Controller
             }
 
             $inboundDeliveries = $inboundQuery->latest('delivery_date')->latest('id')->paginate(15, ['*'], 'inbound_page')->withQueryString();
+            $inboundDeliveries->getCollection()->each(fn (Delivery $d) => $d->setAttribute('inspection_status', $d->inspectionStatus()));
 
-            $baseInboundQuery = fn () => Delivery::where('team_id', $team->id);
+            $inboundRow = Delivery::where('team_id', $team->id)
+                ->selectRaw("
+                    COUNT(*) as total_deliveries,
+                    COALESCE(SUM(quantity), 0) as total_qty,
+                    COUNT(DISTINCT CASE WHEN purchase_order_number IS NOT NULL AND purchase_order_number != '' THEN purchase_order_number END) as linked_pos,
+                    SUM(CASE WHEN status = 'Delivered' THEN 1 ELSE 0 END) as delivered_count
+                ")
+                ->first();
+
             $inboundMetrics = [
-                'totalDeliveries' => $baseInboundQuery()->count(),
-                'totalQuantityDelivered' => (int) $baseInboundQuery()->sum('quantity'),
-                'linkedPosCount' => $baseInboundQuery()->whereNotNull('purchase_order_number')->where('purchase_order_number', '!=', '')->distinct('purchase_order_number')->count('purchase_order_number'),
-                'deliveredCount' => $baseInboundQuery()->where('status', 'Delivered')->count(),
+                'totalDeliveries' => (int) ($inboundRow->total_deliveries ?? 0),
+                'totalQuantityDelivered' => (int) ($inboundRow->total_qty ?? 0),
+                'linkedPosCount' => (int) ($inboundRow->linked_pos ?? 0),
+                'deliveredCount' => (int) ($inboundRow->delivered_count ?? 0),
             ];
 
             $products = Product::where('team_id', $team->id)
@@ -178,9 +212,14 @@ class DeliveryController extends Controller
                 ->orderBy('name')
                 ->get(['id', 'name']);
 
+            // Only orders sent to the supplier can receive goods.
             $purchaseOrders = PurchaseOrder::where('team_id', $team->id)
+                ->whereIn('status', PurchaseOrder::RECEIVABLE)
+                ->with('supplier:id,name')
                 ->latest('po_date')
-                ->get(['id', 'po_number', 'item_sku', 'description', 'unit_of_measure', 'quantity', 'supplier_id']);
+                ->get(['id', 'po_number', 'item_sku', 'description', 'unit_of_measure', 'quantity', 'supplier_id', 'status']);
+            $workflow = app(ProcurementWorkflow::class);
+            $purchaseOrders->each(fn (PurchaseOrder $po) => $po->setAttribute('remaining', $workflow->summary($po)['remaining']));
         }
 
         return Inertia::render('Deliveries/Index', [
@@ -189,6 +228,8 @@ class DeliveryController extends Controller
             'isAdmin' => $isAdmin,
             'outboundDeliveries' => $outboundDeliveries,
             'outboundMetrics' => $outboundMetrics,
+            'statusOptions' => collect(DeliveryStatus::cases())->map(fn ($c) => ['value' => $c->value, 'label' => $c->label(), 'badgeClass' => $c->badgeClass()])->values(),
+            'canPrepare' => $this->canPrepare($user),
             'deliveryStaffList' => $deliveryStaffList,
             'inboundDeliveries' => $inboundDeliveries,
             'inboundMetrics' => $inboundMetrics,
@@ -206,249 +247,341 @@ class DeliveryController extends Controller
         ]);
     }
 
+    /** Delivery status filters on the page → status codes. */
+    private const STATUS_GROUPS = [
+        'to_prepare' => ['order_confirmed', 'preparing', 'ready_for_delivery'],
+        'problems' => ['delivery_attempt_failed'],
+        'delivered' => ['delivered'],
+    ];
+
+    /** What each "Update status" choice does, the status it leads to, and what it asks for. */
+    private const STATUS_CHOICES = [
+        'prepare' => ['status' => 'preparing', 'label' => 'Preparing: start preparing the items', 'needs' => 'quantities'],
+        'ready' => ['status' => 'ready_for_delivery', 'label' => 'Ready for Delivery', 'needs' => null],
+        'dispatch' => ['status' => 'out_for_delivery', 'label' => 'Out for Delivery', 'needs' => null],
+        'retry' => ['status' => 'out_for_delivery', 'label' => 'Out for Delivery: try again', 'needs' => null],
+        'deliver' => ['status' => 'delivered', 'label' => 'Delivered (customer received it)', 'needs' => 'receipt'],
+        'handover' => ['status' => 'delivered', 'label' => 'Delivered (customer picked it up)', 'needs' => 'receipt'],
+        'attempt' => ['status' => 'delivery_attempt_failed', 'label' => 'Delivery Attempt Failed', 'needs' => 'attempt'],
+        'reschedule' => ['status' => 'ready_for_delivery', 'label' => 'Ready for Delivery: new delivery date', 'needs' => 'schedule'],
+        'return' => ['status' => 'preparing', 'label' => 'Preparing: the goods came back to the warehouse', 'needs' => 'reason'],
+        'cancel_release' => ['status' => null, 'label' => 'Undo: cancel the release being prepared', 'needs' => 'reason'],
+        'cancel_delivery' => ['status' => 'cancelled', 'label' => 'Cancelled: stop delivering what is left', 'needs' => 'reason'],
+    ];
+
     /**
-     * Start delivery attempt: Transition from Pending to Out for Delivery.
+     * One "Update status" action for admins and the assigned delivery staff (warehouse staff for
+     * preparing and pickups). The choice must be one this user is allowed to make now; each one
+     * runs the same rules as its own button.
      */
-    public function startDelivery(Request $request, mixed $current_team = null, mixed $fulfillment = null): RedirectResponse
+    public function updateStatus(Request $request, mixed $current_team = null, mixed $fulfillment = null): RedirectResponse
     {
-        $fulfillment = $this->resolveFulfillment($fulfillment, $current_team, $request);
-        $team = $this->getTeam($request, $current_team);
-        abort_if(! $team || $fulfillment->team_id !== $team->id, 403, 'Unauthorized delivery access.');
-
+        $fulfillment = $this->authorizedFulfillment($request, $fulfillment, $current_team);
+        $fulfillment->loadMissing(['sale', 'releases']);
         $user = $request->user();
-        if (! $user->isAdmin()) {
-            abort_if($fulfillment->handled_by_id !== $user->id, 403, 'You are not assigned to this delivery.');
-        }
+        $validated = $request->validate([
+            'action' => ['required', Rule::in(array_keys(self::STATUS_CHOICES))],
+            'remarks' => ['nullable', 'string', 'max:1000'],
+            'reason' => ['nullable', 'string', 'max:500'],
+            'quantities' => ['nullable', 'array'],
+            'quantities.*' => ['integer', 'min:0'],
+            'delivery_schedule' => ['nullable', 'date'],
+            'reset_attempts' => ['nullable', 'boolean'],
+        ]);
+        $action = $validated['action'];
+        abort_unless(in_array($action, $this->allowedActions($fulfillment, $user), true), 403, 'You cannot make this status change.');
 
-        // Validate current status
-        if (! in_array($fulfillment->status, ['Pending', 'Preparing', 'Delivery Attempt Failed'], true)) {
-            return back()->with('error', "Delivery cannot be dispatched from status '{$fulfillment->status}'.");
-        }
+        return match ($action) {
+            'prepare' => $this->prepareRelease($request, $current_team, $fulfillment),
+            'ready' => $this->markReady($request, $current_team, $fulfillment->openRelease()),
+            'dispatch', 'retry' => $this->startDelivery($request, $current_team, $fulfillment),
+            'deliver', 'handover' => $this->markDelivered($request, $current_team, $fulfillment),
+            'attempt' => $this->recordAttempt($request, $current_team, $fulfillment),
+            'reschedule' => $this->reschedule($request, $current_team, $fulfillment),
+            'return' => $this->returnToWarehouse($request, $current_team, $fulfillment),
+            'cancel_release' => $this->cancelRelease($request, $current_team, $fulfillment->openRelease()),
+            'cancel_delivery' => $this->runWorkflow(function () use ($fulfillment, $validated, $user) {
+                $reason = trim((string) ($validated['reason'] ?? '')) ?: throw new WorkflowException('Give a reason for cancelling the delivery.', 'reason');
+                app(SalesOrderService::class)->cancelRemaining($fulfillment->sale, null, $reason, $user);
 
-        // Validate attempts
-        if ($fulfillment->attempt_count >= OrderFulfillment::MAX_ATTEMPTS) {
-            return back()->with('error', 'Maximum delivery attempts reached (3/3). Administrator must reschedule.');
-        }
-
-        DB::transaction(function () use ($fulfillment, $user, $team) {
-            $prevStatus = $fulfillment->status;
-            $fulfillment->status = 'Out for Delivery';
-            if (! $fulfillment->dispatched_at) {
-                $fulfillment->dispatched_at = now();
-            }
-            $fulfillment->save();
-
-            DeliveryAttemptLog::create([
-                'team_id' => $team->id,
-                'order_fulfillment_id' => $fulfillment->id,
-                'attempt_number' => $fulfillment->attempt_count,
-                'previous_status' => $prevStatus,
-                'new_status' => 'Out for Delivery',
-                'staff_id' => $user->id,
-                'remarks' => "Driver started delivery dispatch for {$fulfillment->recipient_name}.",
-                'attempt_date' => now(),
-            ]);
-        });
-
-        return back()->with('success', "Delivery {$fulfillment->fulfillment_number} is now Out for Delivery.");
+                return "Delivery {$fulfillment->fulfillment_number}: the remaining items will not be delivered.";
+            }),
+        };
     }
 
-    /**
-     * Record an unsuccessful delivery attempt (Strict 3-attempt limit).
-     */
+    /** @return list<array{action: string, status: ?string, label: string, needs: ?string}> */
+    private function statusChoices(OrderFulfillment $f, User $user): array
+    {
+        return collect($this->allowedActions($f, $user))
+            ->filter(fn ($a) => isset(self::STATUS_CHOICES[$a]))
+            ->map(fn ($a) => ['action' => $a] + self::STATUS_CHOICES[$a])
+            ->values()->all();
+    }
+
+    /** Start a release: choose the items and quantities that go out next. */
+    public function prepareRelease(Request $request, mixed $current_team = null, mixed $fulfillment = null): RedirectResponse
+    {
+        $fulfillment = $this->authorizedFulfillment($request, $fulfillment, $current_team);
+        abort_unless($this->canPrepare($request->user()) || $fulfillment->handled_by_id === $request->user()->id, 403, 'You cannot prepare releases.');
+        $validated = $request->validate([
+            'quantities' => ['required', 'array'],
+            'quantities.*' => ['integer', 'min:0'],
+            'remarks' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        return $this->runWorkflow(function () use ($fulfillment, $validated, $request) {
+            $release = app(FulfillmentService::class)->prepareRelease($fulfillment, $validated['quantities'], $request->user(), $validated['remarks'] ?? null);
+
+            return "Release {$release->release_number} is being prepared.";
+        });
+    }
+
+    public function markReady(Request $request, mixed $current_team = null, mixed $release = null): RedirectResponse
+    {
+        $release = $this->authorizedRelease($request, $release, $current_team);
+        abort_unless($this->canPrepare($request->user()) || $release->fulfillment->handled_by_id === $request->user()->id, 403);
+
+        return $this->runWorkflow(function () use ($release, $request) {
+            app(FulfillmentService::class)->markReady($release, $request->user());
+
+            return "{$release->release_number} is ready".($release->type === 'pickup' ? ' for pickup.' : ' for dispatch.');
+        });
+    }
+
+    public function cancelRelease(Request $request, mixed $current_team = null, mixed $release = null): RedirectResponse
+    {
+        $release = $this->authorizedRelease($request, $release, $current_team);
+        abort_unless($this->canPrepare($request->user()), 403);
+        $reason = $request->validate(['reason' => ['required', 'string', 'max:500']])['reason'];
+
+        return $this->runWorkflow(function () use ($release, $reason, $request) {
+            app(FulfillmentService::class)->cancelRelease($release, $request->user(), $reason);
+
+            return "{$release->release_number} cancelled.";
+        });
+    }
+
+    /** Out for delivery: dispatch the ready release (stock leaves now), or go again after a failure/reschedule. */
+    public function startDelivery(Request $request, mixed $current_team = null, mixed $fulfillment = null): RedirectResponse
+    {
+        $fulfillment = $this->authorizedFulfillment($request, $fulfillment, $current_team);
+        $this->assertDriver($request, $fulfillment);
+
+        return $this->runWorkflow(function () use ($fulfillment, $request) {
+            $service = app(FulfillmentService::class);
+            $release = $fulfillment->openRelease() ?? throw new WorkflowException('Prepare a release and mark it ready first.');
+            // Goods already on the truck (failed attempt or new date): go again. Otherwise dispatch.
+            if ($release->status === DeliveryRelease::DISPATCHED) {
+                $service->retryDispatch($fulfillment, $request->user());
+            } else {
+                $service->dispatch($release, $request->user());
+            }
+
+            return "Delivery {$fulfillment->fulfillment_number} is out for delivery.";
+        });
+    }
+
     public function recordAttempt(Request $request, mixed $current_team = null, mixed $fulfillment = null): RedirectResponse
     {
-        $fulfillment = $this->resolveFulfillment($fulfillment, $current_team, $request);
-        $team = $this->getTeam($request, $current_team);
-        abort_if(! $team || $fulfillment->team_id !== $team->id, 403, 'Unauthorized delivery access.');
-
-        $user = $request->user();
-        if (! $user->isAdmin()) {
-            abort_if($fulfillment->handled_by_id !== $user->id, 403, 'You are not assigned to this delivery.');
-        }
+        $fulfillment = $this->authorizedFulfillment($request, $fulfillment, $current_team);
+        $this->assertDriver($request, $fulfillment);
 
         $validated = $request->validate([
-            'reason' => [
-                'required',
-                'string',
-                Rule::in([
-                    'Customer unavailable',
-                    'Incorrect or incomplete address',
-                    'Customer refused delivery',
-                    'Customer unreachable',
-                    'Other reason',
-                ]),
-            ],
+            'reason' => ['required', 'string', Rule::in(['Customer unavailable', 'Incorrect or incomplete address', 'Customer refused delivery', 'Customer unreachable', 'Other reason'])],
             'remarks' => ['required', 'string', 'min:3', 'max:1000'],
             'attempt_photo' => ['nullable', 'file', 'image', 'mimes:jpeg,jpg,png', 'max:5120'],
         ]);
 
-        return DB::transaction(function () use ($fulfillment, $user, $team, $validated, $request) {
-            // Lock record for update to prevent concurrent race condition attempts
-            $lockedFulfillment = OrderFulfillment::where('id', $fulfillment->id)
-                ->lockForUpdate()
-                ->firstOrFail();
+        $photo = $request->file('attempt_photo')?->store('proofs/deliveries/attempts', 'local');
 
-            if ($lockedFulfillment->status === 'Delivered') {
-                return back()->with('error', 'Cannot record attempt. Order is already successfully delivered.');
+        return $this->runWorkflow(function () use ($fulfillment, $validated, $photo, $request) {
+            try {
+                $attempt = app(FulfillmentService::class)->recordFailedAttempt($fulfillment, $validated['reason'], $validated['remarks'], $photo, $request->user());
+            } catch (\Throwable $e) {
+                if ($photo) {
+                    Storage::disk('local')->delete($photo);
+                }
+                throw $e;
             }
 
-            if ($lockedFulfillment->attempt_count >= OrderFulfillment::MAX_ATTEMPTS) {
-                return back()->with('error', 'Strict limit reached: 3 of 3 attempts used. Delivery cannot be attempted again without administrator approval.');
-            }
-
-            $prevStatus = $lockedFulfillment->status;
-            $newAttemptCount = $lockedFulfillment->attempt_count + 1;
-            $lockedFulfillment->attempt_count = $newAttemptCount;
-
-            // Handle optional photo evidence of failed attempt (e.g. closed gate/wrong address)
-            $photoPath = null;
-            if ($request->hasFile('attempt_photo')) {
-                $photoPath = $request->file('attempt_photo')->store('proofs/deliveries/attempts', 'local');
-            }
-
-            // After 3rd failed attempt, set to final state
-            if ($newAttemptCount >= OrderFulfillment::MAX_ATTEMPTS) {
-                $lockedFulfillment->status = 'Maximum Attempts Reached';
-            } else {
-                $lockedFulfillment->status = 'Delivery Attempt Failed';
-            }
-
-            $lockedFulfillment->notes = trim(($lockedFulfillment->notes ?? '')."\nAttempt {$newAttemptCount} failed: {$validated['reason']}. ".$validated['remarks']);
-            $lockedFulfillment->save();
-
-            // Create chronological audit log
-            DeliveryAttemptLog::create([
-                'team_id' => $team->id,
-                'order_fulfillment_id' => $lockedFulfillment->id,
-                'attempt_number' => $newAttemptCount,
-                'previous_status' => $prevStatus,
-                'new_status' => $lockedFulfillment->status,
-                'staff_id' => $user->id,
-                'failure_reason' => $validated['reason'],
-                'remarks' => $validated['remarks'],
-                'proof_image' => $photoPath,
-                'attempt_date' => now(),
-            ]);
-
-            if ($newAttemptCount >= OrderFulfillment::MAX_ATTEMPTS) {
-                return back()->with('warning', "Attempt {$newAttemptCount}/3 recorded. Maximum attempts reached. Delivery set to Maximum Attempts Reached and requires administrator follow-up.");
-            }
-
-            return back()->with('success', "Attempt {$newAttemptCount}/3 recorded successfully. Remaining attempts: ".(OrderFulfillment::MAX_ATTEMPTS - $newAttemptCount));
+            return $attempt >= OrderFulfillment::MAX_ATTEMPTS
+                ? 'Attempt 3/3 recorded. The limit is reached: an administrator has to reschedule or the goods have to be returned.'
+                : "Attempt {$attempt}/".OrderFulfillment::MAX_ATTEMPTS.' recorded.';
         });
     }
 
     /**
-     * Mark delivery as Delivered (Requires valid proof of delivery photo).
+     * Record what the customer received from the current release (all of it by default). For
+     * deliveries a photo proof is required; for pickups the receiver's name is enough.
      */
     public function markDelivered(Request $request, mixed $current_team = null, mixed $fulfillment = null): RedirectResponse
     {
-        $fulfillment = $this->resolveFulfillment($fulfillment, $current_team, $request);
-        $team = $this->getTeam($request, $current_team);
-        abort_if(! $team || $fulfillment->team_id !== $team->id, 403, 'Unauthorized delivery access.');
-
-        $user = $request->user();
-        if (! $user->isAdmin()) {
-            abort_if($fulfillment->handled_by_id !== $user->id, 403, 'You are not assigned to this delivery.');
-        }
+        $fulfillment = $this->authorizedFulfillment($request, $fulfillment, $current_team);
+        $pickup = $fulfillment->isPickup();
+        $pickup ? abort_unless($this->canPrepare($request->user()) || $fulfillment->handled_by_id === $request->user()->id, 403) : $this->assertDriver($request, $fulfillment);
 
         $validated = $request->validate([
-            'proof_of_delivery' => ['required', 'file', 'image', 'mimes:jpeg,jpg,png', 'max:5120'],
-            'recipient_name' => ['nullable', 'string', 'max:255'],
+            'proof_of_delivery' => [$pickup ? 'nullable' : 'required', 'file', 'image', 'mimes:jpeg,jpg,png', 'max:5120'],
+            'recipient_name' => [$pickup ? 'required' : 'nullable', 'string', 'max:255'],
             'remarks' => ['nullable', 'string', 'max:1000'],
+            'quantities' => ['nullable', 'array'],
+            'quantities.*' => ['integer', 'min:0'],
         ], [
             'proof_of_delivery.required' => 'Proof of delivery photo is required to mark this order as Delivered.',
             'proof_of_delivery.image' => 'The proof of delivery must be a valid image file (JPG or PNG).',
             'proof_of_delivery.mimes' => 'Only JPEG, JPG, and PNG image formats are accepted.',
             'proof_of_delivery.max' => 'The proof of delivery image size cannot exceed 5 MB.',
+            'recipient_name.required' => 'Enter the name of the person who picked up the order.',
         ]);
 
-        return DB::transaction(function () use ($fulfillment, $user, $team, $validated, $request) {
-            $lockedFulfillment = OrderFulfillment::where('id', $fulfillment->id)
-                ->lockForUpdate()
-                ->firstOrFail();
+        $release = $fulfillment->openRelease();
+        if (! $release) {
+            return back()->withErrors(['error' => 'There is no release on its way for this order.']);
+        }
 
-            if ($lockedFulfillment->status === 'Delivered') {
-                return back()->with('error', 'Delivery is already marked as Delivered.');
+        $proof = $request->file('proof_of_delivery')?->store('proofs/deliveries', 'local');
+
+        return $this->runWorkflow(function () use ($release, $validated, $proof, $fulfillment, $request) {
+            try {
+                $status = app(FulfillmentService::class)->recordReceipt($release, $validated['quantities'] ?? [], ($validated['recipient_name'] ?? null) ?: ($fulfillment->recipient_name ?: 'Customer'), $proof, $validated['remarks'] ?? null, $request->user());
+            } catch (\Throwable $e) {
+                if ($proof) {
+                    Storage::disk('local')->delete($proof);
+                }
+                throw $e;
             }
 
-            // Secure private storage
-            $proofPath = $request->file('proof_of_delivery')->store('proofs/deliveries', 'local');
-
-            $prevStatus = $lockedFulfillment->status;
-            $lockedFulfillment->status = 'Delivered';
-            $lockedFulfillment->proof_of_delivery = $proofPath;
-            if (! $lockedFulfillment->dispatched_at) {
-                $lockedFulfillment->dispatched_at = now();
-            }
-            $lockedFulfillment->delivered_at = now();
-
-            if (! empty($validated['recipient_name'])) {
-                $lockedFulfillment->recipient_name = $validated['recipient_name'];
-            }
-
-            if (! empty($validated['remarks'])) {
-                $lockedFulfillment->notes = trim(($lockedFulfillment->notes ?? '')."\nDelivered: ".$validated['remarks']);
-            }
-
-            $lockedFulfillment->save();
-
-            // Record completion in history
-            DeliveryAttemptLog::create([
-                'team_id' => $team->id,
-                'order_fulfillment_id' => $lockedFulfillment->id,
-                'attempt_number' => min(OrderFulfillment::MAX_ATTEMPTS, $lockedFulfillment->attempt_count + 1),
-                'previous_status' => $prevStatus,
-                'new_status' => 'Delivered',
-                'staff_id' => $user->id,
-                'failure_reason' => null,
-                'remarks' => $validated['remarks'] ?: 'Order successfully received and verified by customer.',
-                'proof_image' => $proofPath,
-                'attempt_date' => now(),
-            ]);
-
-            return back()->with('success', "Delivery {$lockedFulfillment->fulfillment_number} marked as Delivered successfully with photo proof.");
+            return $status === DeliveryStatus::Delivered
+                ? "Delivery {$fulfillment->fulfillment_number}: everything has been received."
+                : "Delivery {$fulfillment->fulfillment_number}: partial delivery recorded. The remaining quantities stay outstanding.";
         });
     }
 
-    /**
-     * Mark delivery as Return to Warehouse.
-     */
+    /** The goods came back to the warehouse (stock is put back and held for the order). */
     public function returnToWarehouse(Request $request, mixed $current_team = null, mixed $fulfillment = null): RedirectResponse
+    {
+        $fulfillment = $this->authorizedFulfillment($request, $fulfillment, $current_team);
+        $this->assertDriver($request, $fulfillment);
+        $reason = $request->validate(['reason' => ['required', 'string', 'max:500']])['reason'];
+
+        return $this->runWorkflow(function () use ($fulfillment, $reason, $request) {
+            $release = $fulfillment->openRelease() ?? throw new WorkflowException('There is no release on its way for this order.');
+            app(FulfillmentService::class)->returnRelease($release, $reason, $request->user());
+
+            return "{$release->release_number} returned to the warehouse. The stock is back and held for the order.";
+        });
+    }
+
+    /** Stream a release's proof of delivery. */
+    public function releaseProof(Request $request, mixed $current_team = null, mixed $release = null): StreamedResponse
+    {
+        $release = $this->authorizedRelease($request, $release, $current_team);
+        $user = $request->user();
+        abort_unless($user->isAdmin() || $this->canPrepare($user) || $release->fulfillment->handled_by_id === $user->id || $user->hasModule('sales'), 403);
+        abort_if(! $release->proof_path || ! Storage::disk('local')->exists($release->proof_path), 404);
+
+        return Storage::disk('local')->response($release->proof_path, null, ['Cache-Control' => 'private, no-store', 'X-Content-Type-Options' => 'nosniff']);
+    }
+
+    /** Printable delivery receipt / release slip for one release. */
+    public function releasePdf(Request $request, mixed $current_team = null, mixed $release = null)
+    {
+        $release = $this->authorizedRelease($request, $release, $current_team);
+
+        return response(app(DocumentPdf::class)->deliveryReceipt($release), 200, [
+            'Content-Type' => 'application/pdf',
+            'Content-Disposition' => 'inline; filename="'.$release->release_number.'.pdf"',
+            'Cache-Control' => 'private, no-store',
+        ]);
+    }
+
+    /** Warehouse staff (and administrators) prepare releases and hand over pickups. */
+    private function canPrepare(User $user): bool
+    {
+        return $user->isAdmin() || $user->hasAnyModule(['inventory', 'procurement']);
+    }
+
+    private function assertDriver(Request $request, OrderFulfillment $fulfillment): void
+    {
+        $user = $request->user();
+        if (! $user->isAdmin()) {
+            abort_if($fulfillment->handled_by_id !== $user->id, 403, 'You are not assigned to this delivery.');
+        }
+    }
+
+    /** @return list<string> */
+    private function allowedActions(OrderFulfillment $f, User $user): array
+    {
+        $status = $f->status;
+        if (! $status) {
+            return [];
+        }
+        $pickup = $f->isPickup();
+        $driver = $user->isAdmin() || $f->handled_by_id === $user->id;
+        $warehouse = $this->canPrepare($user) || $f->handled_by_id === $user->id;
+        $open = $f->releases->first(fn ($r) => in_array($r->status, DeliveryRelease::OPEN, true));
+        $orderOpen = in_array($f->sale?->status, [SalesOrderStatus::Confirmed, SalesOrderStatus::Processing], true);
+        $actions = [];
+
+        if ($warehouse && $orderOpen && ! $open && $status->canMoveTo(DeliveryStatus::Preparing, $pickup)) {
+            $actions[] = 'prepare';
+        }
+        if ($warehouse && $open?->status === DeliveryRelease::PREPARING) {
+            $actions[] = 'ready';
+        }
+        if ($this->canPrepare($user) && $open && in_array($open->status, [DeliveryRelease::PREPARING, DeliveryRelease::READY], true)) {
+            $actions[] = 'cancel_release';
+        }
+        if (! $pickup && $driver && $open?->status === DeliveryRelease::READY && $orderOpen && ! $f->sale?->hold_reason) {
+            $actions[] = 'dispatch';
+        }
+        if ($pickup && $warehouse && $open?->status === DeliveryRelease::READY) {
+            $actions[] = 'handover';
+        }
+        if (! $pickup && $driver && $status === DeliveryStatus::OutForDelivery) {
+            $actions[] = 'deliver';
+            if ($f->attempt_count < OrderFulfillment::MAX_ATTEMPTS) {
+                $actions[] = 'attempt';
+            }
+        }
+        $onTruck = $open?->status === DeliveryRelease::DISPATCHED;
+        $rescheduled = $status === DeliveryStatus::ReadyForDelivery && $onTruck;
+        if (! $pickup && $driver && (($status === DeliveryStatus::DeliveryAttemptFailed && $f->attempt_count < OrderFulfillment::MAX_ATTEMPTS) || $rescheduled)) {
+            $actions[] = 'retry';
+        }
+        if (! $pickup && $driver && $onTruck && $status !== DeliveryStatus::OutForDelivery) {
+            $actions[] = 'return';
+        }
+        if ($user->isAdmin() && $status === DeliveryStatus::DeliveryAttemptFailed) {
+            $actions[] = 'reschedule';
+        }
+        $owed = $f->sale?->items?->contains(fn ($l) => $l->releasable_quantity > 0) ?? false;
+        if ($user->isAdmin() && $orderOpen && ! $open && $owed && in_array($status, [DeliveryStatus::OrderConfirmed, DeliveryStatus::Preparing], true)) {
+            $actions[] = 'cancel_delivery';
+        }
+        if ($user->isAdmin() && ! $status->isFinal()) {
+            $actions[] = 'assign';
+        }
+
+        return $actions;
+    }
+
+    private function authorizedFulfillment(Request $request, mixed $fulfillment, mixed $current_team): OrderFulfillment
     {
         $fulfillment = $this->resolveFulfillment($fulfillment, $current_team, $request);
         $team = $this->getTeam($request, $current_team);
         abort_if(! $team || $fulfillment->team_id !== $team->id, 403, 'Unauthorized delivery access.');
 
-        $user = $request->user();
-        if (! $user->isAdmin()) {
-            abort_if($fulfillment->handled_by_id !== $user->id, 403, 'You are not assigned to this delivery.');
-        }
+        return $fulfillment;
+    }
 
-        $validated = $request->validate([
-            'remarks' => ['required', 'string', 'min:3', 'max:1000'],
-        ]);
+    private function authorizedRelease(Request $request, mixed $release, mixed $current_team): DeliveryRelease
+    {
+        $team = $this->getTeam($request, $current_team);
+        $id = $release instanceof DeliveryRelease ? $release->id : (int) ($release ?? $request->route('release'));
+        $release = DeliveryRelease::with('fulfillment')->where('team_id', $team?->id)->findOrFail($id);
 
-        DB::transaction(function () use ($fulfillment, $user, $team, $validated) {
-            $prevStatus = $fulfillment->status;
-            $fulfillment->status = 'Return to Warehouse';
-            $fulfillment->notes = trim(($fulfillment->notes ?? '')."\nReturn to Warehouse: ".$validated['remarks']);
-            $fulfillment->save();
-
-            DeliveryAttemptLog::create([
-                'team_id' => $team->id,
-                'order_fulfillment_id' => $fulfillment->id,
-                'attempt_number' => $fulfillment->attempt_count,
-                'previous_status' => $prevStatus,
-                'new_status' => 'Return to Warehouse',
-                'staff_id' => $user->id,
-                'remarks' => $validated['remarks'],
-                'attempt_date' => now(),
-            ]);
-        });
-
-        return back()->with('success', "Delivery {$fulfillment->fulfillment_number} has been marked for Return to Warehouse.");
+        return $release;
     }
 
     /**
@@ -474,9 +607,9 @@ class DeliveryController extends Controller
         DeliveryAttemptLog::create([
             'team_id' => $team->id,
             'order_fulfillment_id' => $fulfillment->id,
-            'attempt_number' => $fulfillment->attempt_count,
-            'previous_status' => $fulfillment->status,
-            'new_status' => $fulfillment->status,
+            'previous_status' => $fulfillment->status?->value ?? 'none',
+            'new_status' => $fulfillment->status?->value ?? 'none',
+            'attempt_number' => 0,
             'staff_id' => $user->id,
             'remarks' => "Administrator assigned delivery to {$assignedUser->name}.",
             'attempt_date' => now(),
@@ -504,41 +637,11 @@ class DeliveryController extends Controller
             'reset_attempts' => ['nullable', 'boolean'],
         ]);
 
-        DB::transaction(function () use ($fulfillment, $user, $team, $validated) {
-            $prevStatus = $fulfillment->status;
-            $fulfillment->delivery_schedule = $validated['delivery_schedule'];
-            $fulfillment->rescheduled_at = now();
-            $fulfillment->rescheduled_by_id = $user->id;
-            $fulfillment->status = 'Pending';
+        return $this->runWorkflow(function () use ($fulfillment, $user, $validated) {
+            app(FulfillmentService::class)->reschedule($fulfillment, $validated['delivery_schedule'], (bool) ($validated['reset_attempts'] ?? false), $validated['notes'] ?? null, $validated['staff_id'] ?? null, $user);
 
-            if (! empty($validated['staff_id'])) {
-                $fulfillment->handled_by_id = $validated['staff_id'];
-            }
-
-            // Admin decision: Reset attempt counter or grant fresh attempts
-            if (! empty($validated['reset_attempts'])) {
-                $fulfillment->attempt_count = 0;
-            }
-
-            if (! empty($validated['notes'])) {
-                $fulfillment->notes = trim(($fulfillment->notes ?? '')."\nRescheduled: ".$validated['notes']);
-            }
-
-            $fulfillment->save();
-
-            DeliveryAttemptLog::create([
-                'team_id' => $team->id,
-                'order_fulfillment_id' => $fulfillment->id,
-                'attempt_number' => $fulfillment->attempt_count,
-                'previous_status' => $prevStatus,
-                'new_status' => 'Pending',
-                'staff_id' => $user->id,
-                'remarks' => 'Administrator authorized rescheduling to '.Carbon::parse($validated['delivery_schedule'])->format('M d, Y').'. '.($validated['notes'] ?? ''),
-                'attempt_date' => now(),
-            ]);
+            return "Delivery {$fulfillment->fulfillment_number} rescheduled.";
         });
-
-        return back()->with('success', "Delivery {$fulfillment->fulfillment_number} rescheduled successfully.");
     }
 
     /**
@@ -594,73 +697,6 @@ class DeliveryController extends Controller
     // -------------------------------------------------------------
     // INBOUND SUPPLIER DELIVERY METHODS (Preserved for compatibility)
     // -------------------------------------------------------------
-
-    /**
-     * Store a new inbound supplier delivery record.
-     */
-    public function store(Request $request): RedirectResponse
-    {
-        $team = $this->getTeam($request);
-        abort_if(! $team, 403, 'No active team selected.');
-
-        $validated = $request->validate([
-            'delivery_date' => ['required', 'date'],
-            'delivery_number' => ['nullable', 'string', 'max:100'],
-            'purchase_order_number' => ['nullable', 'string', 'max:100'],
-            'purchase_order_id' => ['nullable', 'integer', Rule::exists('purchase_orders', 'id')->where('team_id', $team->id)],
-            'quantity' => ['required', 'integer', 'min:1'],
-            'unit' => ['nullable', 'string', 'max:50'],
-            'description' => ['required', 'string', 'max:1000'],
-            'supplier_id' => ['nullable', 'integer', Rule::exists('suppliers', 'id')->where('team_id', $team->id)],
-            'status' => ['nullable', 'string', 'max:50'],
-            'notes' => ['nullable', 'string', 'max:1000'],
-        ]);
-
-        $deliveryNumber = ! empty($validated['delivery_number'])
-            ? trim($validated['delivery_number'])
-            : Delivery::generateDeliveryNumber($team->id, $validated['delivery_date']);
-
-        $poNumber = ! empty($validated['purchase_order_number']) ? trim($validated['purchase_order_number']) : null;
-        $poId = $validated['purchase_order_id'] ?? null;
-        $supplierId = $validated['supplier_id'] ?? null;
-
-        if ($poNumber && ! $poId) {
-            $foundPo = PurchaseOrder::where('team_id', $team->id)
-                ->where('po_number', $poNumber)
-                ->first();
-            if ($foundPo) {
-                $poId = $foundPo->id;
-                if (! $supplierId && $foundPo->supplier_id) {
-                    $supplierId = $foundPo->supplier_id;
-                }
-            }
-        } elseif ($poId && ! $poNumber) {
-            $foundPo = PurchaseOrder::find($poId);
-            if ($foundPo) {
-                $poNumber = $foundPo->po_number;
-                if (! $supplierId && $foundPo->supplier_id) {
-                    $supplierId = $foundPo->supplier_id;
-                }
-            }
-        }
-
-        Delivery::create([
-            'team_id' => $team->id,
-            'delivery_date' => $validated['delivery_date'],
-            'delivery_number' => $deliveryNumber,
-            'purchase_order_number' => $poNumber,
-            'purchase_order_id' => $poId,
-            'quantity' => $validated['quantity'],
-            'unit' => $validated['unit'] ?? 'pcs',
-            'description' => $validated['description'],
-            'supplier_id' => $supplierId,
-            'received_by_id' => $request->user()?->id,
-            'status' => $validated['status'] ?? 'Delivered',
-            'notes' => $validated['notes'] ?? null,
-        ]);
-
-        return back()->with('success', "Delivery {$deliveryNumber} recorded successfully.");
-    }
 
     /**
      * Delete an inbound delivery record.

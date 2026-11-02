@@ -12,9 +12,8 @@
             }
         </style>
 
-        <link rel="icon" type="image/png" href="/LOGO_MR_PRIDE.png">
-        <link rel="shortcut icon" type="image/png" href="/LOGO_MR_PRIDE.png">
-        <link rel="apple-touch-icon" href="/LOGO_MR_PRIDE.png">
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+        <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 
         @fonts
 

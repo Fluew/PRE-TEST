@@ -63,7 +63,7 @@ test('procurement index loads commercial invoices and purchase orders', function
     );
 });
 
-test('can manually create commercial invoice with sample format CI-035-0722', function () {
+test('an invoice cannot be recorded without its purchase order and delivery', function () {
     $team = Team::factory()->create(['slug' => 'test-team']);
     $user = User::factory()->create([
         'role' => 'admin',
@@ -73,27 +73,20 @@ test('can manually create commercial invoice with sample format CI-035-0722', fu
     $team->members()->attach($user, ['role' => TeamRole::Owner->value]);
     $deviceData = createTrustedDeviceFor($user);
 
-    $response = $this->actingAs($user)
+    // Invoices are now recorded only against their purchase order and inbound delivery.
+    $this->actingAs($user)
         ->withCookies($deviceData['cookies'])
         ->post("/{$team->slug}/procurement/commercial-invoices", [
             'invoice_date' => '2026-10-25',
             'invoice_number' => 'CI-035-0722',
             'quantity' => 20,
-            'description' => 'Single Gang Outlet Grounded',
             'unit_cost' => 95.50,
-        ]);
-
-    $response->assertSessionHasNoErrors();
-    $this->assertDatabaseHas('commercial_invoices', [
-        'team_id' => $team->id,
-        'invoice_number' => 'CI-035-0722',
-        'quantity' => 20,
-        'unit_cost' => 95.50,
-        'total_cost' => 1910.00,
-    ]);
+        ])
+        ->assertSessionHasErrors(['purchase_order_id', 'delivery_id']);
+    $this->assertDatabaseCount('commercial_invoices', 0);
 });
 
-test('can manually create purchase order with sample format 4000005472', function () {
+test('a purchase order cannot be created without an approved purchase request', function () {
     $team = Team::factory()->create(['slug' => 'test-team']);
     $user = User::factory()->create([
         'role' => 'admin',
@@ -103,28 +96,18 @@ test('can manually create purchase order with sample format 4000005472', functio
     $team->members()->attach($user, ['role' => TeamRole::Owner->value]);
     $deviceData = createTrustedDeviceFor($user);
 
-    $response = $this->actingAs($user)
+    // Purchase orders are created only from an approved purchase request now.
+    $this->actingAs($user)
         ->withCookies($deviceData['cookies'])
         ->post("/{$team->slug}/procurement/purchase-orders", [
             'po_date' => '2026-10-25',
             'po_number' => '4000005472',
             'quantity' => 50,
-            'item_sku' => '068SSCR2',
             'description' => '0.68mm Stainless Steel Conduit Rod 2m',
-            'unit_of_measure' => 'PCS',
             'unit_cost' => 450.00,
-        ]);
-
-    $response->assertSessionHasNoErrors();
-    $this->assertDatabaseHas('purchase_orders', [
-        'team_id' => $team->id,
-        'po_number' => '4000005472',
-        'quantity' => 50,
-        'item_sku' => '068SSCR2',
-        'unit_of_measure' => 'PCS',
-        'unit_cost' => 450.00,
-        'total_cost' => 22500.00,
-    ]);
+        ])
+        ->assertNotFound();
+    $this->assertDatabaseCount('purchase_orders', 0);
 });
 
 test('can import commercial invoices csv with required headers', function () {

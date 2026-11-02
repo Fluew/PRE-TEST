@@ -292,7 +292,11 @@ watch(
   }
 );
 
+// Teleports are not part of the server-rendered HTML, so only mount after hydration.
+const mounted = ref(false);
+
 onMounted(() => {
+  mounted.value = true;
   window.addEventListener('resize', handleResize, { passive: true });
   window.addEventListener('keydown', handleKeydown);
 });
@@ -338,7 +342,7 @@ onBeforeUnmount(() => {
     </button>
 
     <!-- Teleport Fullscreen Menu Overlay to Body to prevent clipping -->
-    <Teleport to="body">
+    <Teleport v-if="mounted" to="body">
       <div
         v-if="isOpen || isAnimating"
         class="fixed inset-0 z-[100] lg:hidden overflow-hidden"
@@ -382,7 +386,7 @@ onBeforeUnmount(() => {
               class="flex items-center gap-3 group"
             >
               <img
-                src="/LOGO_MR_PRIDE.png"
+                src="/LOGO_MR_PRIDE.webp"
                 alt="MR-Pride"
                 class="size-10 object-contain drop-shadow"
               />

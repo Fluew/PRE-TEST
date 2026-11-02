@@ -135,8 +135,9 @@ trait HasTeams
      */
     public function toUserTeams(bool $includeCurrent = false): Collection
     {
-        return $this->teams()
-            ->get()
+        $teams = $this->relationLoaded('teams') ? $this->teams : $this->teams()->get();
+
+        return $teams
             ->map(fn (Team $team) => ! $includeCurrent && $this->isCurrentTeam($team) ? null : $this->toUserTeam($team))
             ->filter()
             ->values();

@@ -1,9 +1,14 @@
 <script setup lang="ts">
 import { Head, router, usePage } from '@inertiajs/vue3';
 import { useCanDelete } from '@/composables/useCanDelete';
+import { useCurrency } from '@/composables/useCurrency';
+import { showToast } from '@/composables/useFlashToast';
 import { ref, computed, watch } from 'vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
 import GlideSelect from '@/components/vue-bits/GlideSelect.vue';
+import ProductPriorityBreakdown, { type ProductPriority } from '@/components/evaluation/ProductPriorityBreakdown.vue';
+import PurchaseRequestCreator, { type PrCandidate } from '@/components/procurement/PurchaseRequestCreator.vue';
+import ImportWizard from '@/components/import/ImportWizard.vue';
 import {
     Upload, 
     Download, 
@@ -65,14 +70,15 @@ interface Product {
     name: string;
     category: string;
     brand?: string | null;
-    unit: string;
-    price: number | string;
-    cost_price: number | string;
+    unit: string | null;
+    price: number | string | null;
+    cost_price: number | string | null;
     stock: number;
+    missing_fields?: string[] | null;
     min_stock?: number;
     reorder_level: number;
     reorder_quantity: number;
-    status: 'In Stock' | 'Low Stock' | 'Out of Stock';
+    status: 'In Stock' | 'Low Stock' | 'Out of Stock' | 'Incomplete';
     description?: string;
     supplier_id?: number | null;
     supplier?: Supplier | null;
@@ -95,6 +101,9 @@ interface PaginatedProducts {
     links: PaginationLink[];
 }
 
+type InventoryView = 'table' | 'prioritization' | 'history';
+
+
 const props = defineProps<{
     products: PaginatedProducts;
     summary: {
@@ -103,15 +112,17 @@ const props = defineProps<{
         low_stock: number;
         out_of_stock: number;
         requiring_reorder: number;
+        incomplete?: number;
     };
     categories: string[];
     suppliers: Supplier[];
     recent_movements: StockMovement[];
+    priorities: ProductPriority[];
     filters: {
         search?: string;
         category?: string;
         status?: string;
-        view?: 'table' | 'history';
+        view?: InventoryView;
     };
 }>();
 
@@ -123,23 +134,49 @@ const teamSlug = computed(() => (page.props as any).currentTeam?.slug || (page.p
 const searchQuery = ref(props.filters?.search || '');
 const selectedCategory = ref(props.filters?.category || 'All Categories');
 const selectedStatus = ref(props.filters?.status || 'All');
-const activeView = ref<'table' | 'history'>(props.filters?.view || 'table');
+const activeView = ref<InventoryView>(props.filters?.view || 'table');
 
-// Toast Notification
-const notification = ref<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
-const showNotification = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
-    notification.value = { message, type };
-    setTimeout(() => {
-        notification.value = null;
-    }, 4000);
+const priorityById = computed(() => new Map(props.priorities.map((p) => [p.product.id, p])));
+const veryHighCount = computed(() => props.priorities.filter((p) => p.classification === 'Very High Priority').length);
+const incompleteCount = computed(() => props.priorities.filter((p) => !p.complete).length);
+const selectedPriority = ref<ProductPriority | null>(null);
+
+// Reorder recommendations → Purchase Request. Staff choose; nothing is ordered automatically.
+const reorderRecommendations = computed(() => props.priorities.filter((p) => p.reorder.needed));
+const selectedForRequest = ref<number[]>([]);
+const showPrCreator = ref(false);
+const prCandidates = computed<PrCandidate[]>(() =>
+    props.priorities
+        .filter((p) => selectedForRequest.value.includes(p.product.id))
+        .map((p) => ({
+            product_id: p.product.id,
+            name: p.product.name,
+            sku: p.product.sku,
+            unit: p.product.unit,
+            current_stock: p.criteria.find((c) => c.key === 'stock')?.inputs?.available ?? null,
+            forecast: p.reorder.forecast,
+            ahp_score: p.score,
+            classification: p.classification,
+            recommended_quantity: p.reorder.needed ? p.reorder.suggested_quantity : null,
+        })),
+);
+const onRequestsSubmitted = () => {
+    showPrCreator.value = false;
+    selectedForRequest.value = [];
 };
+const priorityBadgeClass = (p: ProductPriority) => {
+    switch (p.classification) {
+        case 'Very High Priority': return 'border-rose-200 bg-rose-50 text-rose-700';
+        case 'High Priority': return 'border-amber-200 bg-amber-50 text-amber-700';
+        case 'Moderate Priority': return 'border-blue-200 bg-blue-50 text-blue-700';
+        case 'Low Priority':
+        case 'Very Low Priority': return 'border-gray-200 bg-gray-50 text-gray-700';
+        default: return 'border-dashed border-amber-300 bg-white text-amber-700';
+    }
+};
+const priorityInput = (p: ProductPriority, key: string) => p.criteria.find((c) => c.key === key)?.inputs ?? {};
 
-// Check for flash messages
-watch(() => page.props.flash, (flash: any) => {
-    if (flash?.success) showNotification(flash.success, 'success');
-    if (flash?.error) showNotification(flash.error, 'error');
-    if (flash?.info) showNotification(flash.info, 'info');
-}, { immediate: true, deep: true });
+// Flash toasts are handled globally by useFlashToast in AppSidebarLayout
 
 // Filter debounce navigation
 let searchTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -176,7 +213,7 @@ const filterByStatus = (st: string) => {
     triggerNavigation();
 };
 
-const changeView = (view: 'table' | 'history') => {
+const changeView = (view: InventoryView) => {
     activeView.value = view;
     triggerNavigation();
 };
@@ -237,12 +274,12 @@ watch(() => props.filters, (newFilters) => {
     }
 }, { deep: true });
 
-// Format currency
-const formatPrice = (val: string | number | undefined): string => {
-    if (val === undefined || val === null) return '₱0.00';
-    const num = typeof val === 'number' ? val : parseFloat(String(val).replace(/[^0-9.]/g, ''));
-    if (isNaN(num)) return '₱0.00';
-    return `₱${num.toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+// Stored prices are USD; shown in the user's display currency (header switch). Values from an
+// import preview may still be text such as "1,200.00".
+const { formatMoney } = useCurrency();
+const formatPrice = (val: string | number | null | undefined): string => {
+    const num = typeof val === 'number' ? val : parseFloat(String(val ?? '').replace(/[^0-9.-]/g, ''));
+    return formatMoney(Number.isNaN(num) ? 0 : num);
 };
 
 const formatDate = (dateStr: string | undefined): string => {
@@ -362,23 +399,6 @@ const formAdjust = ref({
     remarks: '',
 });
 
-// CSV Import State
-const fileInputRef = ref<HTMLInputElement | null>(null);
-const importedFile = ref<File | null>(null);
-const isDragging = ref(false);
-const importMode = ref<'append' | 'replace'>('append');
-const isValidatingCsv = ref(false);
-const isImportingCsv = ref(false);
-const csvValidationResult = ref<{
-    method?: string;
-    warning?: string | null;
-    total_rows: number;
-    valid_count: number;
-    invalid_count: number;
-    valid_rows: any[];
-    invalid_rows: any[];
-} | null>(null);
-const csvError = ref<string | null>(null);
 
 // ==========================================
 // CRUD & MODAL HANDLERS
@@ -494,7 +514,7 @@ const saveProduct = () => {
         onError: (errs) => {
             formErrors.value = errs;
             isSubmitting.value = false;
-            showNotification('Please check the form for errors.', 'error');
+            showToast('Please check the form for errors.', 'error');
         },
         onFinish: () => {
             isSubmitting.value = false;
@@ -539,7 +559,7 @@ const deleteProduct = () => {
         },
         onError: () => {
             isSubmitting.value = false;
-            showNotification('Failed to remove product.', 'error');
+            showToast('Failed to remove product.', 'error');
         },
         onFinish: () => {
             isSubmitting.value = false;
@@ -608,7 +628,7 @@ const submitStockIn = () => {
         onError: (errs) => {
             formErrors.value = errs;
             isSubmitting.value = false;
-            showNotification(errs.quantity || 'Failed to record Stock-In.', 'error');
+            showToast(errs.quantity || 'Failed to record Stock-In.', 'error');
         },
         onFinish: () => {
             isSubmitting.value = false;
@@ -683,7 +703,7 @@ const submitStockOut = () => {
         onError: (errs) => {
             formErrors.value = errs;
             isSubmitting.value = false;
-            showNotification(errs.quantity || 'Failed to record Stock-Out.', 'error');
+            showToast(errs.quantity || 'Failed to record Stock-Out.', 'error');
         },
         onFinish: () => {
             isSubmitting.value = false;
@@ -754,7 +774,7 @@ const submitAdjust = () => {
         onError: (errs) => {
             formErrors.value = errs;
             isSubmitting.value = false;
-            showNotification(errs.physical_count || 'Failed to adjust stock.', 'error');
+            showToast(errs.physical_count || 'Failed to adjust stock.', 'error');
         },
         onFinish: () => {
             isSubmitting.value = false;
@@ -766,146 +786,7 @@ const submitAdjust = () => {
 // CSV IMPORT & EXPORT
 // ==========================================
 const openImportModal = () => {
-    importedFile.value = null;
-    csvValidationResult.value = null;
-    csvError.value = null;
-    importMode.value = 'append';
     showImportModal.value = true;
-};
-
-const handleFileSelect = (event: Event) => {
-    const target = event.target as HTMLInputElement;
-    if (target.files && target.files[0]) {
-        processUploadedCsv(target.files[0]);
-    }
-};
-
-const handleDrop = (event: DragEvent) => {
-    isDragging.value = false;
-    if (event.dataTransfer?.files && event.dataTransfer.files[0]) {
-        processUploadedCsv(event.dataTransfer.files[0]);
-    }
-};
-
-// Same list the server accepts (FileReader::EXTENSIONS, plus .txt as CSV).
-const IMPORT_EXTENSIONS = ['pdf', 'xlsx', 'xls', 'csv', 'txt', 'jpg', 'jpeg', 'png'];
-const IMPORT_ACCEPT = IMPORT_EXTENSIONS.map((ext) => `.${ext}`).join(',');
-const IMPORT_MAX_BYTES = 10 * 1024 * 1024;
-// Files read by OCR need every row checked, so show more of them.
-const previewRows = computed(() => csvValidationResult.value?.valid_rows.slice(0, csvValidationResult.value?.warning ? 100 : 25) ?? []);
-const isOcrFile = computed(() => /\.(jpe?g|png|pdf)$/i.test(importedFile.value?.name || ''));
-
-const processUploadedCsv = async (file: File) => {
-    const ext = file.name.split('.').pop()?.toLowerCase() || '';
-    const problem = !IMPORT_EXTENSIONS.includes(ext)
-        ? 'This file type is not supported. Please upload a PDF, Excel (.xlsx/.xls), CSV, JPG or PNG file.'
-        : file.size > IMPORT_MAX_BYTES
-          ? 'The file is larger than 10 MB. Please upload a smaller file.'
-          : null;
-    if (problem) {
-        csvError.value = problem;
-        importedFile.value = null;
-        csvValidationResult.value = null;
-        return;
-    }
-
-    importedFile.value = file;
-    csvError.value = null;
-    isValidatingCsv.value = true;
-    csvValidationResult.value = null;
-
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('execute', '0');
-
-    // Fetch CSRF token
-    const token = (document.querySelector('meta[name="csrf-token"]') as HTMLMetaElement)?.content || '';
-
-    try {
-        const response = await fetch(`/${teamSlug.value}/inventory/import-csv`, {
-            method: 'POST',
-            body: formData,
-            headers: {
-                'X-CSRF-TOKEN': token,
-                'Accept': 'application/json',
-            }
-        });
-        const data = await response.json();
-        if (response.ok && data.success) {
-            csvValidationResult.value = data;
-        } else {
-            csvError.value = data.message || 'We could not read this file.';
-            csvValidationResult.value = null;
-        }
-    } catch (err: any) {
-        csvError.value = err.message || 'We could not read this file.';
-        csvValidationResult.value = null;
-    } finally {
-        isValidatingCsv.value = false;
-    }
-};
-
-const promptCsvImport = () => {
-    if (!importedFile.value || !csvValidationResult.value || csvValidationResult.value.valid_count === 0) {
-        showNotification('No valid rows available to import.', 'error');
-        return;
-    }
-
-    openConfirmModal({
-        title: 'Confirm Bulk Import',
-        description: `Are you sure you want to import ${csvValidationResult.value.valid_count} products into your catalog?`,
-        details: [
-            { label: 'File', value: importedFile.value.name },
-            { label: 'Import Strategy', value: importMode.value === 'replace' ? 'Replace & Overwrite Existing' : 'Append New Records' },
-            { label: 'Valid Records', value: `${csvValidationResult.value.valid_count} products` },
-            { label: 'Invalid / Skipped', value: `${csvValidationResult.value.invalid_count} row(s)` },
-        ],
-        confirmText: 'Execute Import',
-        confirmVariant: 'brand',
-        action: confirmCsvImport,
-    });
-};
-
-const confirmCsvImport = () => {
-    if (!importedFile.value || !csvValidationResult.value || csvValidationResult.value.valid_count === 0) {
-        showNotification('No valid rows available to import.', 'error');
-        return;
-    }
-
-    isImportingCsv.value = true;
-    const formData = new FormData();
-    formData.append('file', importedFile.value);
-    formData.append('mode', importMode.value);
-    formData.append('execute', '1');
-
-    router.post(`/${teamSlug.value}/inventory/import-csv`, formData as any, {
-        onSuccess: () => {
-            showImportModal.value = false;
-            isImportingCsv.value = false;
-        },
-        onError: (errors: Record<string, string>) => {
-            isImportingCsv.value = false;
-            showNotification(errors.file || 'Failed to process the import.', 'error');
-        }
-    });
-};
-
-const downloadSampleTemplate = () => {
-    const headers = 'SKU,Product Name,Category,Unit,Cost Price,Selling Price,Current Stock,Reorder Level,Reorder Quantity\n';
-    const sampleRows = [
-        'BRK-MCCB-100,"Molded Case Circuit Breaker 100A 3P",Breakers,pcs,75.00,120.00,25,10,50',
-        'WR-THHN-35,"Copper Building Wire THHN 3.5mm² 150m",Wiring,rolls,45.00,68.00,12,15,60',
-        'LGT-BAY-200,"High Bay Industrial LED Luminaire 200W",Lighting,units,80.00,135.00,5,8,30',
-        'TLS-DMM-87,"Digital Multimeter Industrial Class",Tools,sets,160.00,240.00,8,5,15'
-    ].join('\n');
-
-    const blob = new Blob([headers + sampleRows], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'mr_pride_inventory_template.csv';
-    link.click();
-    URL.revokeObjectURL(link.href);
-    showNotification('Sample CSV template downloaded!', 'info');
 };
 
 // Export: the chosen format, with the filters currently applied to the list.
@@ -923,7 +804,7 @@ const exportInventory = () => {
     const format = exportFormat.value;
     const total = props.products?.total ?? 0;
     if (['pdf', 'png', 'jpg'].includes(format) && total > EXPORT_MAX_DOCUMENT_ROWS) {
-        showNotification(`${total} products is more than a ${format.toUpperCase()} export can hold (${EXPORT_MAX_DOCUMENT_ROWS}). Filter the list, or export to Excel or CSV.`, 'error');
+        showToast(`${total} products is more than a ${format.toUpperCase()} export can hold (${EXPORT_MAX_DOCUMENT_ROWS}). Filter the list, or export to Excel or CSV.`, 'error');
         return;
     }
 
@@ -936,7 +817,7 @@ const exportInventory = () => {
 
     const label = exportFormats.find((f) => f.value === format)?.label ?? format;
     const many = ['png', 'jpg'].includes(format) && total > 50 ? ` (${Math.ceil(total / 50)} images in a .zip)` : '';
-    showNotification(`Preparing ${total} product${total === 1 ? '' : 's'} as ${label}${many}...`, 'success');
+    showToast(`Preparing ${total} product${total === 1 ? '' : 's'} as ${label}${many}...`, 'success');
 };
 </script>
 
@@ -944,30 +825,6 @@ const exportInventory = () => {
     <Head title="Inventory Management" />
 
     <div class="workspace-page relative">
-        <!-- Floating Toast Notification -->
-        <transition enter-active-class="transform ease-out duration-300 transition"
-                    enter-from-class="translate-y-2 opacity-0 sm:translate-y-0 sm:translate-x-2"
-                    enter-to-class="translate-y-0 opacity-100 sm:translate-x-0"
-                    leave-active-class="transition ease-in duration-200"
-                    leave-from-class="opacity-100"
-                    leave-to-class="opacity-0">
-            <div v-if="notification" 
-                 :class="[
-                     notification.type === 'success' ? 'bg-emerald-600 text-white' : '',
-                     notification.type === 'error' ? 'bg-rose-600 text-white' : '',
-                     notification.type === 'info' ? 'bg-gray-900 text-white' : '',
-                 ]"
-                 class="fixed top-6 right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-xl shadow-lg border border-white/10">
-                <CheckCircle2 v-if="notification.type === 'success'" class="w-5 h-5 text-white" />
-                <AlertCircle v-else-if="notification.type === 'error'" class="w-5 h-5 text-white" />
-                <Package v-else class="w-5 h-5 text-[#F8B803]" />
-                <span class="text-sm font-medium">{{ notification.message }}</span>
-                <button @click="notification = null" class="ml-2 text-white/70 hover:text-white">
-                    <X class="w-4 h-4" />
-                </button>
-            </div>
-        </transition>
-
         <!-- Header & Action Controls -->
         <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-4">
             <div>
@@ -1116,20 +973,53 @@ const exportInventory = () => {
                         class="w-full py-2 px-3 bg-white border border-gray-200 rounded-lg text-sm text-gray-900 focus:border-gray-900 focus:ring-1 focus:ring-gray-900 focus:outline-none transition-colors">
                     <option value="All">All Statuses</option>
                     <option value="Needs Reorder">Needs Reorder ({{ summary.requiring_reorder }})</option>
+                    <option value="Incomplete">Incomplete imports ({{ summary.incomplete ?? 0 }})</option>
                     <option value="Out of Stock">Out of Stock</option>
                     <option value="Low Stock">Low Stock</option>
                     <option value="In Stock">In Stock</option>
                 </select>
             </div>
 
-            <div class="w-48">
+            <div class="w-64">
                 <select v-model="activeView" 
                         @change="changeView(activeView)"
                         class="w-full py-2 px-3 bg-white border border-gray-200 rounded-lg text-sm font-medium text-gray-900 focus:border-gray-900 focus:ring-1 focus:ring-gray-900 focus:outline-none transition-colors">
-                    <option value="table">Product Catalog</option>
+                    <option value="table">Product Catalog ({{ products.total }})</option>
+                    <option value="prioritization">AHP Product Prioritization ({{ priorities.length }})</option>
                     <option value="history">Movement History ({{ filteredMovements.length }})</option>
                 </select>
             </div>
+        </div>
+
+        <!-- Module Navigation Tabs -->
+        <div class="flex items-center gap-1 border-b border-gray-200 pb-px mb-1 overflow-x-auto text-xs sm:text-sm">
+            <button
+                type="button"
+                @click="changeView('table')"
+                :class="activeView === 'table' ? 'border-[#4b5320] text-[#4b5320] font-semibold bg-white' : 'border-transparent text-gray-500 hover:text-gray-900 hover:border-gray-300'"
+                class="px-3.5 py-2 border-b-2 whitespace-nowrap transition-colors cursor-pointer"
+            >
+                Product Catalog ({{ products.total }})
+            </button>
+            <button
+                type="button"
+                @click="changeView('prioritization')"
+                :class="activeView === 'prioritization' ? 'border-[#4b5320] text-[#4b5320] font-semibold bg-white' : 'border-transparent text-gray-500 hover:text-gray-900 hover:border-gray-300'"
+                class="px-3.5 py-2 border-b-2 whitespace-nowrap transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+                <span>AHP Product Prioritization</span>
+                <span v-if="veryHighCount > 0" class="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700">
+                    {{ veryHighCount }} Very High
+                </span>
+            </button>
+            <button
+                type="button"
+                @click="changeView('history')"
+                :class="activeView === 'history' ? 'border-[#4b5320] text-[#4b5320] font-semibold bg-white' : 'border-transparent text-gray-500 hover:text-gray-900 hover:border-gray-300'"
+                class="px-3.5 py-2 border-b-2 whitespace-nowrap transition-colors cursor-pointer"
+            >
+                Movement History ({{ filteredMovements.length }})
+            </button>
         </div>
 
         <!-- ========================================================================= -->
@@ -1147,6 +1037,7 @@ const exportInventory = () => {
                             <th class="pb-3 font-semibold text-center">Stock</th>
                             <th class="pb-3 font-semibold">Reorder Level</th>
                             <th class="pb-3 font-semibold">Status</th>
+                            <th class="pb-3 font-semibold text-center">AHP Priority</th>
                             <th class="pb-3 font-semibold text-right">Actions</th>
                         </tr>
                     </thead>
@@ -1156,6 +1047,9 @@ const exportInventory = () => {
                             <td class="py-3.5">
                                 <div class="font-medium text-gray-900 hover:text-[#4b5320] cursor-pointer" @click="openViewModal(product)">
                                     {{ product.name }}
+                                </div>
+                                <div v-if="product.missing_fields?.length" class="text-[11px] text-amber-700 mt-0.5">
+                                    Missing {{ product.missing_fields.map((f) => f.replace('_', ' ')).join(', ') }}: edit to complete<template v-if="product.missing_fields.some((f) => ['unit', 'price'].includes(f))"> and activate</template>
                                 </div>
                                 <div v-if="product.supplier" class="text-[11px] text-gray-400 flex items-center gap-1 mt-0.5">
                                     <Building2 class="w-3 h-3 text-gray-400" />
@@ -1167,7 +1061,7 @@ const exportInventory = () => {
                                     {{ product.category }}
                                 </span>
                             </td>
-                            <td class="py-3.5 text-gray-900 font-medium">{{ formatPrice(product.price) }}</td>
+                            <td class="py-3.5 text-gray-900 font-medium">{{ product.price === null ? '—' : formatPrice(product.price) }}</td>
                             <td class="py-3.5 text-center">
                                 <span class="font-semibold text-gray-900">{{ product.stock }}</span>
                                 <span class="text-xs text-gray-400 ml-1">({{ product.unit || 'pcs' }})</span>
@@ -1180,30 +1074,47 @@ const exportInventory = () => {
                                     {{ product.status }}
                                 </span>
                             </td>
+                            <td class="py-3.5 text-center">
+                                <button
+                                    v-if="priorityById.get(product.id)"
+                                    type="button"
+                                    @click.stop="selectedPriority = priorityById.get(product.id) ?? null"
+                                    :class="priorityBadgeClass(priorityById.get(product.id)!)"
+                                    class="px-2.5 py-0.5 rounded-full text-[11px] font-semibold border inline-flex items-center gap-1 hover:opacity-85 transition-opacity cursor-pointer"
+                                    title="View the AHP calculation"
+                                >
+                                    <template v-if="priorityById.get(product.id)!.complete">
+                                        <span>{{ priorityById.get(product.id)!.classification }}</span>
+                                        <span class="text-[10px] opacity-75 font-mono">{{ priorityById.get(product.id)!.score!.toFixed(2) }}</span>
+                                    </template>
+                                    <span v-else>Incomplete data</span>
+                                </button>
+                                <span v-else class="text-xs text-gray-400">—</span>
+                            </td>
                             <td class="py-3.5 text-right">
                                 <div class="inline-flex items-center gap-1">
                                     <button @click="openViewModal(product)" 
-                                            class="p-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-md transition-colors"
+                                            class="p-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-md transition-colors cursor-pointer"
                                             title="View Product Details & Movement History">
                                         <Eye class="w-4 h-4" />
                                     </button>
                                     <button @click="openStockInModal(product)" 
-                                            class="p-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-md transition-colors"
+                                            class="p-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-md transition-colors cursor-pointer"
                                             title="Quick Stock-In">
                                         <ArrowDownLeft class="w-4 h-4" />
                                     </button>
                                     <button @click="openStockOutModal(product)" 
-                                            class="p-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-md transition-colors"
+                                            class="p-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-md transition-colors cursor-pointer"
                                             title="Quick Stock-Out">
                                         <ArrowUpRight class="w-4 h-4" />
                                     </button>
                                     <button @click="openEditModal(product)" 
-                                            class="p-1.5 text-gray-500 hover:text-[#4b5320] hover:bg-[#F8B803]/10 rounded-md transition-colors"
+                                            class="p-1.5 text-gray-500 hover:text-[#4b5320] hover:bg-[#F8B803]/10 rounded-md transition-colors cursor-pointer"
                                             title="Edit Product">
                                         <Pencil class="w-4 h-4" />
                                     </button>
                                     <button v-if="canDelete" @click="openDeleteModal(product)" 
-                                            class="p-1.5 text-gray-400 hover:text-rose-600 hover:bg-rose-50 rounded-md transition-colors"
+                                            class="p-1.5 text-gray-400 hover:text-rose-600 hover:bg-rose-50 rounded-md transition-colors cursor-pointer"
                                             title="Archive/Delete Product">
                                         <Trash2 class="w-4 h-4" />
                                     </button>
@@ -1211,7 +1122,7 @@ const exportInventory = () => {
                             </td>
                         </tr>
                         <tr v-if="products.data.length === 0">
-                            <td colspan="8" class="py-14 text-center text-gray-400">
+                            <td colspan="9" class="py-14 text-center text-gray-400">
                                 <Package class="w-12 h-12 mx-auto mb-2 opacity-30 text-[#4b5320]" />
                                 <p class="text-base font-semibold text-gray-700">No products found</p>
                                 <p class="text-xs text-gray-400 mt-1">Try clearing your filters or create a new product using the button above.</p>
@@ -1248,9 +1159,90 @@ const exportInventory = () => {
         </div>
 
         <!-- ========================================================================= -->
-        <!-- VIEW 2: RECENT MOVEMENTS AUDIT TRAIL -->
+        <!-- VIEW 2: AHP PRODUCT PRIORITIZATION -->
         <!-- ========================================================================= -->
-        <div v-else class="flex-1 rounded-xl bg-white border border-gray-200 p-6 flex flex-col">
+        <div v-else-if="activeView === 'prioritization'" class="flex-1 space-y-4">
+            <section class="panel p-5">
+                <h2 class="text-base font-semibold text-gray-900">AHP Product Prioritization</h2>
+                <p class="mt-1 text-sm text-gray-500">
+                    Replenishment priority from measurable records: Demand Forecasting 40% (SMA forecast from the Demand Forecasting module),
+                    Current Stock 30%, Product Movement 20%, Supplier Availability 10%. It ranks products; it does not authorize a purchase.
+                </p>
+                <p class="mt-2 font-mono text-xs text-gray-600">Priority Score = (Demand × 0.40) + (Stock × 0.30) + (Movement × 0.20) + (Availability × 0.10)</p>
+                <p class="mt-2 text-xs text-gray-500">
+                    80–100 Very High · 60–79.99 High · 40–59.99 Moderate · 20–39.99 Low · 0–19.99 Very Low.
+                    <span v-if="incompleteCount">{{ incompleteCount }} of {{ priorities.length }} products have incomplete data and are not classified.</span>
+                </p>
+            </section>
+
+            <section class="panel flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between" aria-labelledby="reorder-heading">
+                <div>
+                    <h3 id="reorder-heading" class="text-sm font-semibold text-gray-900">Reorder recommendations ({{ reorderRecommendations.length }})</h3>
+                    <p class="text-xs text-gray-500">Tick products below, then create purchase requests for admin approval. Nothing is ordered and stock does not change until goods are received, inspected and invoiced.</p>
+                </div>
+                <div class="flex gap-2">
+                    <button type="button" class="secondary-button" :disabled="!reorderRecommendations.length" @click="selectedForRequest = reorderRecommendations.map((p) => p.product.id)">Select all recommended</button>
+                    <button type="button" class="brand-button" :disabled="!selectedForRequest.length" @click="showPrCreator = true">Create purchase request ({{ selectedForRequest.length }})</button>
+                </div>
+            </section>
+
+            <section class="panel overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead>
+                        <tr>
+                            <th class="w-8"><span class="sr-only">Select</span></th>
+                            <th>#</th>
+                            <th>Product</th>
+                            <th class="text-right">Available</th>
+                            <th class="text-right">SMA forecast</th>
+                            <th class="text-right">Units moved</th>
+                            <th class="text-right">Suppliers available</th>
+                            <th class="text-right">Score</th>
+                            <th>Priority</th>
+                            <th>Reorder recommendation</th>
+                            <th class="sr-only">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="(p, i) in priorities" :key="p.product.id" class="border-t border-gray-100">
+                            <td><input v-model="selectedForRequest" type="checkbox" :value="p.product.id" :aria-label="`Select ${p.product.name}`" class="rounded border-gray-300" /></td>
+                            <td class="text-gray-400">{{ p.complete ? i + 1 : '—' }}</td>
+                            <td>
+                                <div class="font-medium text-gray-900">{{ p.product.name }}</div>
+                                <div class="font-mono text-xs text-gray-500">{{ p.product.sku }}</div>
+                            </td>
+                            <td class="text-right font-mono">{{ priorityInput(p, 'stock').available }}</td>
+                            <td class="text-right font-mono">{{ priorityInput(p, 'demand').forecast ?? '—' }}</td>
+                            <td class="text-right font-mono">{{ p.criteria.find((c) => c.key === 'movement')?.available ? priorityInput(p, 'movement').units : '—' }}</td>
+                            <td class="text-right font-mono">
+                                {{ priorityInput(p, 'supplier_availability').verified ? `${priorityInput(p, 'supplier_availability').available} / ${priorityInput(p, 'supplier_availability').verified}` : '—' }}
+                            </td>
+                            <td class="text-right font-mono">{{ p.complete ? p.score!.toFixed(2) : '—' }}</td>
+                            <td>
+                                <button type="button" :class="priorityBadgeClass(p)" class="rounded-full border px-2.5 py-0.5 text-xs font-semibold" @click="selectedPriority = p">
+                                    {{ p.classification ?? 'Incomplete data' }}
+                                </button>
+                            </td>
+                            <td>
+                                <span v-if="p.reorder.needed" class="text-sm font-medium text-amber-700">Reorder {{ p.reorder.suggested_quantity }} {{ p.product.unit }}</span>
+                                <span v-else class="text-sm text-gray-500">No reorder needed</span>
+                            </td>
+                            <td class="text-right">
+                                <button type="button" class="text-xs font-medium text-[#4b5320] hover:underline" @click="selectedPriority = p">View Calculation</button>
+                            </td>
+                        </tr>
+                        <tr v-if="!priorities.length">
+                            <td colspan="11" class="py-10 text-center text-gray-400">No active products to prioritize.</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+        </div>
+
+        <!-- ========================================================================= -->
+        <!-- VIEW 4: RECENT MOVEMENTS AUDIT TRAIL -->
+        <!-- ========================================================================= -->
+        <div v-else-if="activeView === 'history'" class="flex-1 rounded-xl bg-white border border-gray-200 p-6 flex flex-col">
             <div class="flex items-center justify-between pb-4 mb-4 border-b border-gray-100">
                 <div>
                     <h3 class="text-lg font-semibold text-gray-900">Inventory Movement Audit Trail</h3>
@@ -1585,7 +1577,7 @@ const exportInventory = () => {
                         <label for="prod_cost_price"
                                class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
                                :class="hasNumVal(formProduct.cost_price) ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                            Cost Price (₱)
+                            Cost Price (USD)
                         </label>
                     </div>
 
@@ -1602,7 +1594,7 @@ const exportInventory = () => {
                         <label for="prod_price"
                                class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
                                :class="hasNumVal(formProduct.price) ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                            Selling Price (₱)
+                            Selling Price (USD)
                         </label>
                         <span v-if="formErrors.price" class="text-rose-600 text-xs mt-1 block">{{ formErrors.price }}</span>
                     </div>
@@ -2112,216 +2104,7 @@ const exportInventory = () => {
         </div>
     </div>
 
-    <!-- ========================================================================= -->
-    <!-- CSV IMPORT MODAL (REAL VALIDATION, PREVIEW, & IMPORT) -->
-    <!-- ========================================================================= -->
-    <div v-if="showImportModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 overflow-y-auto">
-        <div class="bg-white border border-gray-200 rounded-xl w-full max-w-2xl shadow-xl overflow-hidden flex flex-col max-h-[90vh] animate-in fade-in duration-150">
-            <!-- Modal Header -->
-            <div class="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
-                <div class="flex items-center gap-3">
-                    <div class="p-2 bg-[#F8B803]/20 text-[#4b5320] rounded-lg">
-                        <FileSpreadsheet class="w-5 h-5" />
-                    </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Import Inventory</h3>
-                        <p class="text-xs text-gray-500">PDF, Excel, CSV, JPG or PNG &middot; checked and previewed before anything is saved</p>
-                    </div>
-                </div>
-                <button @click="showImportModal = false" class="text-gray-400 hover:text-gray-600 p-1 rounded-lg hover:bg-gray-100">
-                    <X class="w-5 h-5" />
-                </button>
-            </div>
-
-            <div class="p-6 overflow-y-auto space-y-4">
-                <!-- Dropzone -->
-                <div @dragover.prevent="isDragging = true"
-                     @dragleave.prevent="isDragging = false"
-                     @drop.prevent="handleDrop"
-                     :class="[
-                         isDragging ? 'border-[#F8B803] bg-[#F8B803]/5' : 'border-gray-300 hover:border-gray-400 bg-gray-50/60',
-                         importedFile ? 'border-emerald-500 bg-emerald-50/20' : ''
-                     ]"
-                     class="border-2 border-dashed rounded-xl p-5 text-center transition-colors cursor-pointer flex flex-col items-center justify-center gap-2"
-                     @click="fileInputRef?.click()">
-                    
-                    <input ref="fileInputRef" 
-                           type="file" 
-                           :accept="IMPORT_ACCEPT"
-                           class="hidden" 
-                           @change="handleFileSelect" />
-
-                    <div v-if="!importedFile" class="flex flex-col items-center">
-                        <div class="w-10 h-10 rounded-full bg-white flex items-center justify-center text-gray-400 mb-2 border border-gray-100">
-                            <Upload class="w-5 h-5 text-[#4b5320]" />
-                        </div>
-                        <p class="text-sm font-semibold text-gray-800">
-                            Click to select a file or drag and drop it here
-                        </p>
-                        <p class="text-xs text-gray-500 mt-0.5">PDF, Excel (.xlsx/.xls), CSV, JPG or PNG &middot; up to 10 MB</p>
-                        <p class="text-xs text-gray-400 mt-0.5">Columns: SKU, Name, Category, Brand, Unit, Cost Price, Selling Price, Stock, Reorder Level, Reorder Quantity</p>
-                    </div>
-
-                    <div v-else class="flex items-center justify-between w-full bg-white p-3 rounded-lg border border-emerald-200">
-                        <div class="flex items-center gap-3 text-left">
-                            <div class="p-2 bg-emerald-100 text-emerald-700 rounded-md">
-                                <FileSpreadsheet class="w-6 h-6" />
-                            </div>
-                            <div>
-                                <p class="text-sm font-semibold text-gray-900">{{ importedFile.name }}</p>
-                                <p class="text-xs text-gray-500">{{ (importedFile.size / 1024).toFixed(1) }} KB</p>
-                            </div>
-                        </div>
-                        <button @click.stop="importedFile = null; csvValidationResult = null;" class="text-xs text-rose-600 hover:text-rose-800 font-medium px-2.5 py-1 bg-rose-50 rounded">
-                            Change File
-                        </button>
-                    </div>
-                </div>
-
-                <!-- Template Download alert -->
-                <div class="bg-amber-50/70 border border-amber-200/80 rounded-xl p-3 flex items-center justify-between gap-3 text-xs text-amber-900">
-                    <div class="flex items-center gap-2">
-                        <AlertCircle class="w-4 h-4 text-amber-600 shrink-0" />
-                        <span>Ensure your column headers match standard template columns.</span>
-                    </div>
-                    <button @click="downloadSampleTemplate" class="px-2.5 py-1.5 bg-white border border-amber-300 rounded-md font-semibold text-amber-800 hover:bg-amber-100/50 flex items-center gap-1.5 shrink-0">
-                        <Download class="w-3.5 h-3.5" />
-                        <span>Template</span>
-                    </button>
-                </div>
-
-                <!-- Validation Loader -->
-                <div v-if="isValidatingCsv" class="py-6 text-center text-xs text-gray-500">
-                    <RefreshCw class="w-5 h-5 animate-spin mx-auto mb-2 text-[#4b5320]" />
-                    <template v-if="isOcrFile">Reading your file&hellip; photos and scanned PDFs can take up to a minute.</template>
-                    <template v-else>Reading and checking the rows&hellip;</template>
-                </div>
-
-                <!-- OCR warning -->
-                <div v-if="csvValidationResult?.warning" class="p-3 bg-amber-50 border border-amber-200 text-amber-900 text-xs rounded-xl flex items-start gap-2">
-                    <AlertTriangle class="w-4 h-4 shrink-0 text-amber-600" />
-                    <span>{{ csvValidationResult.warning }}</span>
-                </div>
-
-                <!-- Error Message -->
-                <div v-if="csvError" class="p-3 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-xl flex items-center gap-2">
-                    <AlertCircle class="w-4 h-4 shrink-0" />
-                    <span>{{ csvError }}</span>
-                </div>
-
-                <!-- Validation Summary & Preview -->
-                <div v-if="csvValidationResult" class="space-y-3">
-                    <!-- Status Banner -->
-                    <div class="grid grid-cols-2 gap-3">
-                        <div class="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 flex items-center justify-between">
-                            <span class="text-xs font-semibold">Valid Records Ready:</span>
-                            <span class="text-lg font-semibold">{{ csvValidationResult.valid_count }}</span>
-                        </div>
-                        <div :class="csvValidationResult.invalid_count > 0 ? 'bg-rose-50 border-rose-200 text-rose-800' : 'bg-gray-50 border-gray-200 text-gray-500'" 
-                             class="p-3 border rounded-xl flex items-center justify-between">
-                            <span class="text-xs font-semibold">Invalid / Rejected Rows:</span>
-                            <span class="text-lg font-semibold">{{ csvValidationResult.invalid_count }}</span>
-                        </div>
-                    </div>
-
-                    <!-- Invalid Rows Details -->
-                    <div v-if="csvValidationResult.invalid_rows.length > 0" class="p-3 bg-rose-50/70 border border-rose-200 rounded-xl text-xs space-y-1 max-h-32 overflow-y-auto">
-                        <div class="font-semibold text-rose-800 mb-1">The following rows failed validation and will be skipped:</div>
-                        <div v-for="(inv, idx) in csvValidationResult.invalid_rows" :key="idx" class="text-rose-700 flex items-start gap-2">
-                            <span class="font-mono font-semibold">Row {{ inv.row }}:</span>
-                            <span>{{ inv.sku }} &mdash; {{ inv.errors.join('; ') }}</span>
-                        </div>
-                    </div>
-
-                    <!-- Preview Table -->
-                    <div v-if="csvValidationResult.valid_rows.length > 0" class="space-y-1">
-                        <h4 class="text-xs font-semibold text-gray-600">
-                            Data Preview ({{ previewRows.length < csvValidationResult.valid_rows.length ? `first ${previewRows.length} of ${csvValidationResult.valid_rows.length}` : `${previewRows.length}` }} items)
-                        </h4>
-                        <div class="border border-gray-200 rounded-lg overflow-hidden max-h-56 overflow-y-auto">
-                            <table class="w-full text-left text-xs border-collapse">
-                                <thead class="bg-gray-50 text-gray-600 border-b border-gray-200 sticky top-0">
-                                    <tr>
-                                        <th class="p-2 font-semibold">SKU</th>
-                                        <th class="p-2 font-semibold">Name</th>
-                                        <th class="p-2 font-semibold">Category</th>
-                                        <th class="p-2 font-semibold">Selling Price</th>
-                                        <th class="p-2 font-semibold text-center">Stock</th>
-                                        <th class="p-2 font-semibold">Action Type</th>
-                                    </tr>
-                                </thead>
-                                <tbody class="divide-y divide-gray-100 bg-white">
-                                    <tr v-for="(row, idx) in previewRows" :key="idx" class="hover:bg-gray-50">
-                                        <td class="p-2 font-mono text-gray-600 font-medium">{{ row.sku }}</td>
-                                        <td class="p-2 font-medium text-gray-900">{{ row.name }}</td>
-                                        <td class="p-2 text-gray-600">{{ row.category }}</td>
-                                        <td class="p-2 text-gray-800 font-semibold">{{ formatPrice(row.price) }}</td>
-                                        <td class="p-2 text-center font-semibold text-gray-900">{{ row.stock }}</td>
-                                        <td class="p-2">
-                                            <span v-if="row.is_update" class="px-2 py-0.5 rounded text-[10px] font-semibold bg-blue-50 text-blue-700 border border-blue-200">
-                                                Update Existing
-                                            </span>
-                                            <span v-else class="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                                New Item
-                                            </span>
-                                        </td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-
-                    <!-- Import Mode -->
-                    <div class="pt-2 border-t border-gray-100">
-                        <label class="block text-xs font-semibold text-gray-700 mb-2">Import Strategy</label>
-                        <div :class="canDelete ? 'grid-cols-2' : 'grid-cols-1'" class="grid gap-3">
-                            <label :class="importMode === 'append' ? 'border-[#F8B803] bg-[#F8B803]/5 ring-1 ring-[#F8B803]' : 'border-gray-200 bg-white'"
-                                   class="border rounded-xl p-3 cursor-pointer transition-colors flex items-start gap-2">
-                                <input type="radio" v-model="importMode" value="append" class="mt-1 accent-[#4b5320]" />
-                                <div>
-                                    <span class="text-xs font-semibold text-gray-900 block">Merge & Update</span>
-                                    <span class="text-[11px] text-gray-500 block">Append new items and update matching existing SKUs.</span>
-                                </div>
-                            </label>
-
-                            <label v-if="canDelete" :class="importMode === 'replace' ? 'border-rose-500 bg-rose-50/20 ring-1 ring-rose-500' : 'border-gray-200 bg-white'"
-                                   class="border rounded-xl p-3 cursor-pointer transition-colors flex items-start gap-2">
-                                <input type="radio" v-model="importMode" value="replace" class="mt-1 accent-rose-600" />
-                                <div>
-                                    <span class="text-xs font-semibold text-gray-900 block">Replace Active List</span>
-                                    <span class="text-[11px] text-gray-500 block">Archive existing catalog and initialize fresh list.</span>
-                                </div>
-                            </label>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Modal Footer -->
-            <div class="px-6 py-4 border-t border-gray-100 bg-gray-50 flex justify-end items-center gap-3">
-                <SpecularButton
-                    type="button"
-                    variant="secondary"
-                    size="md"
-                    :radius="10"
-                    @click="showImportModal = false"
-                >
-                    Cancel
-                </SpecularButton>
-                <SpecularButton
-                    type="button"
-                    variant="brand"
-                    size="md"
-                    :radius="10"
-                    @click="promptCsvImport"
-                    :disabled="!csvValidationResult || csvValidationResult.valid_count === 0 || isImportingCsv"
-                >
-                    <Check class="w-4 h-4" />
-                    <span>Confirm Import ({{ csvValidationResult?.valid_count || 0 }} Items)</span>
-                </SpecularButton>
-            </div>
-        </div>
-    </div>
+    <ImportWizard :open="showImportModal" module="inventory" @close="showImportModal = false" @completed="router.reload({ only: ['products', 'summary', 'priorities'] })" />
 
     <!-- ========================================================================= -->
     <!-- CONFIRM DELETE / ARCHIVE MODAL -->
@@ -2408,7 +2191,7 @@ const exportInventory = () => {
                     size="md"
                     :radius="10"
                     @click="handleConfirmedAction"
-                    :disabled="isSubmitting || isImportingCsv"
+                    :disabled="isSubmitting"
                 >
                     <Check class="w-4 h-4 mr-1.5" />
                     <span>{{ confirmOptions.confirmText || 'Confirm & Save' }}</span>
@@ -2416,4 +2199,30 @@ const exportInventory = () => {
             </div>
         </div>
     </div>
+
+    <!-- ========================================================================= -->
+    <!-- AHP PRODUCT CALCULATION BREAKDOWN MODAL -->
+    <!-- ========================================================================= -->
+    <div v-if="selectedPriority" class="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4" @click.self="selectedPriority = null">
+        <div class="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-gray-200 bg-white" role="dialog" aria-modal="true" aria-labelledby="priority-title">
+            <div class="flex items-start justify-between gap-3 border-b border-gray-100 px-6 py-4">
+                <div>
+                    <h3 id="priority-title" class="text-base font-semibold text-gray-900">{{ selectedPriority.product.name }}</h3>
+                    <p class="font-mono text-xs text-gray-500">{{ selectedPriority.product.sku }}</p>
+                </div>
+                <div class="text-right">
+                    <div class="text-xl font-semibold text-gray-900">{{ selectedPriority.complete ? `${selectedPriority.score!.toFixed(2)} / 100` : 'Incomplete' }}</div>
+                    <div class="text-xs text-gray-500">{{ selectedPriority.classification ?? 'Not classified' }}</div>
+                </div>
+            </div>
+            <div class="overflow-y-auto px-6 py-4">
+                <ProductPriorityBreakdown :priority="selectedPriority" />
+            </div>
+            <div class="flex justify-end border-t border-gray-100 bg-gray-50/50 px-6 py-3">
+                <button type="button" class="secondary-button" @click="selectedPriority = null">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <PurchaseRequestCreator :open="showPrCreator" :candidates="prCandidates" @close="showPrCreator = false" @submitted="onRequestsSubmitted" />
 </template>

@@ -26,7 +26,7 @@ function attachmentActor(string $role, Team $team): array
     return [$user, $deviceData['cookies']];
 }
 
-it('allows customer to submit public quotation request with file attachment', function () {
+it('no longer accepts a specifications/BOQ attachment on the public form', function () {
     $brand = Brand::firstOrCreate(['name' => 'Schneider Electric'], ['is_partnered' => true]);
     $file = UploadedFile::fake()->create('project_specifications.pdf', 1024, 'application/pdf');
 
@@ -44,17 +44,16 @@ it('allows customer to submit public quotation request with file attachment', fu
             ],
         ],
         'attachment' => $file,
-        'materials' => [['description' => '30A 2-pole breaker', 'quantity' => 50]],
-        'materials_confirmed' => true,
     ]);
 
     $response->assertSessionHasNoErrors();
     $response->assertRedirect();
 
+    // The request is saved; the file sent to the removed field is not.
     $quotation = Quotation::where('email', 'juan@acme.ph')->latest('id')->first();
     expect($quotation)->not->toBeNull();
-    expect($quotation->attachment_path)->not->toBeNull();
-    Storage::disk('local')->assertExists($quotation->attachment_path);
+    expect($quotation->attachment_path)->toBeNull();
+    expect(Storage::disk('local')->allFiles())->toBe([]);
 });
 
 it('allows authorized staff to download quotation attachment', function () {
@@ -76,7 +75,7 @@ it('allows authorized staff to download quotation attachment', function () {
         'tax_rate' => 12.00,
         'tax_amount' => 120.00,
         'grand_total' => 1120.00,
-        'status' => 'Pending',
+        'status' => 'pending',
         'attachment_path' => $path,
     ]);
 

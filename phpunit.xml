@@ -28,6 +28,8 @@
         <env name="DB_DATABASE" value=":memory:"/>
         <env name="DB_URL" value=""/>
         <env name="MAIL_MAILER" value="array"/>
+        <!-- Tests never render through a running Vite dev server. -->
+        <env name="INERTIA_SSR_ENABLED" value="false"/>
         <!-- Tests never call the real Resend API or redirect mail. -->
         <env name="RESEND_API_KEY" value=""/>
         <env name="RESEND_DEV_REDIRECT_TO" value=""/>

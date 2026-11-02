@@ -30,7 +30,7 @@ const categories = [
         title: 'Hardware, Power Tools, Hand Tools & Machineries',
         description:
             'Equip every job with dependable tools and machinery, from everyday repairs to demanding workshop and construction projects.',
-        image: '/PRODUCT_A.png',
+        image: '/PRODUCT_A.webp',
         imageAlt:
             'Hardware and machinery brand collection supplied by MR-Pride',
         caption: 'Tools & machinery • Our brand collection',
@@ -73,7 +73,7 @@ const categories = [
         title: 'Electrical Materials',
         description:
             'Find the essentials for reliable electrical installations, power distribution, and lighting in residential, commercial, and industrial spaces.',
-        image: '/PRODUCT_B.png',
+        image: '/PRODUCT_B.webp',
         imageAlt: 'Electrical materials brand collection supplied by MR-Pride',
         caption: 'Electrical supplies • Our brand collection',
         products: [
@@ -109,7 +109,7 @@ const categories = [
         title: 'Pipes & Conduits',
         description:
             'Build a dependable foundation for piping and electrical systems with pipes, conduits, and fittings for a wide range of installations.',
-        image: '/PRODUCT_C.png',
+        image: '/PRODUCT_C.webp',
         imageAlt: 'Pipe and conduit brand collection supplied by MR-Pride',
         caption: 'Pipes & conduits • Our brand collection',
         products: [
@@ -141,7 +141,7 @@ const categories = [
         title: 'Safety Products',
         description:
             'Support a safer workplace with fire protection, protective equipment, and safety essentials for industrial and electrical work.',
-        image: '/PRODUCT_D.png',
+        image: '/PRODUCT_D.webp',
         imageAlt: 'A selection of green and red fire extinguishers',
         caption: 'Workplace essentials • Fire protection & safety',
         products: [
@@ -332,7 +332,7 @@ onUnmounted(() => observer?.disconnect());
         >
             <div class="pointer-events-none absolute inset-0 z-0">
                 <img
-                    src="/PRODUCT_BACKGROUND.png"
+                    src="/PRODUCT_BACKGROUND.webp"
                     alt=""
                     class="h-full w-full object-cover object-right opacity-80 lg:object-center"
                     aria-hidden="true"

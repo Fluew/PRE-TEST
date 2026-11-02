@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Enums\SalesOrderStatus;
 use App\Models\Client;
 use App\Models\CommercialInvoice;
 use App\Models\Delivery;
@@ -396,7 +397,9 @@ class RecycleBinController extends Controller
     protected function restoreRecord(mixed $model, Request $request): void
     {
         DB::transaction(function () use ($model, $request) {
-            if ($model instanceof Sale) {
+            // Cancelled orders are archived as they are (cancelling already handled the stock),
+            // so restoring one only brings the record back.
+            if ($model instanceof Sale && $model->status !== SalesOrderStatus::Cancelled) {
                 $model->load('items');
 
                 foreach ($model->items as $item) {
@@ -495,7 +498,7 @@ class RecycleBinController extends Controller
             'commercial_invoice' => (string) ($model->invoice_number ?? "Invoice #{$model->id}"),
             'delivery' => (string) ($model->delivery_number ?? "Delivery #{$model->id}"),
             'inquiry' => (string) ($model->subject ?? ($model->name ? "Inquiry from {$model->name}" : "Inquiry #{$model->id}")),
-            'sale' => (string) ($model->invoice_number ?? "Sale #{$model->id}"),
+            'sale' => (string) ($model->order_number ?? $model->invoice_number ?? "Sale #{$model->id}"),
             default => "#{$model->id}",
         };
     }
@@ -524,17 +527,26 @@ class RecycleBinController extends Controller
             default => "ID: {$item->id}",
         };
 
+        // The record's main amount (stored USD), formatted in the browser in the user's display
+        // currency; the summary holds the rest.
+        $amount = match ($typeKey) {
+            'product' => $item->price,
+            'quotation', 'sale' => $item->grand_total,
+            'purchase_order', 'commercial_invoice' => $item->total_cost,
+            'purchase_request' => $item->estimated_cost,
+            default => null,
+        };
+
         $summary = match ($typeKey) {
-            'product' => sprintf('₱%s • %d %s', number_format((float) $item->price, 2), (int) $item->stock, $item->unit ?: 'pcs'),
+            'product' => sprintf('%d %s', (int) $item->stock, $item->unit ?: 'pcs'),
             'supplier' => $item->email ?: ($item->phone ?: 'Active supplier profile'),
             'client' => $item->phone ?: ($item->email ?: 'Client profile'),
-            'quotation' => sprintf('₱%s • %s', number_format((float) $item->grand_total, 2), $item->status instanceof \BackedEnum ? $item->status->value : (string) $item->status),
-            'purchase_order' => sprintf('₱%s • %d %s', number_format((float) $item->total_cost, 2), (int) $item->quantity, $item->unit_of_measure ?: 'units'),
-            'purchase_request' => sprintf('Qty: %d • ₱%s', (int) $item->quantity, number_format((float) $item->estimated_cost, 2)),
-            'commercial_invoice' => sprintf('Total: ₱%s • Qty: %d', number_format((float) $item->total_cost, 2), (int) $item->quantity),
+            'quotation' => $item->status instanceof \BackedEnum ? $item->status->label() : (string) $item->status,
+            'purchase_order' => sprintf('%d %s', (int) $item->quantity, $item->unit_of_measure ?: 'units'),
+            'purchase_request', 'commercial_invoice' => sprintf('Qty: %d', (int) $item->quantity),
             'delivery' => sprintf('Qty: %d %s • %s', (int) $item->quantity, $item->unit ?: 'units', $item->delivery_date?->format('M d, Y') ?? 'N/A'),
             'inquiry' => $item->message ? Str::limit($item->message, 80) : 'Customer contact inquiry',
-            'sale' => sprintf('₱%s • %s', number_format((float) $item->grand_total, 2), $item->payment_method ?: 'Paid'),
+            'sale' => $item->status instanceof \BackedEnum ? $item->status->label() : ($item->payment_method ?: 'Sale'),
             default => '',
         };
 
@@ -562,6 +574,7 @@ class RecycleBinController extends Controller
             'title' => $title,
             'identifier' => $identifier,
             'summary' => $summary,
+            'amount' => $amount !== null ? (float) $amount : null,
             'deleted_at_raw' => $item->deleted_at?->toIso8601String(),
             'deleted_at' => $item->deleted_at?->format('M d, Y h:i A') ?? 'N/A',
             'deleted_at_human' => $item->deleted_at?->diffForHumans() ?? 'Recently',

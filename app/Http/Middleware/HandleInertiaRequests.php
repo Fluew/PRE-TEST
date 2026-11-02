@@ -2,6 +2,8 @@
 
 namespace App\Http\Middleware;
 
+use App\Services\ExchangeRates;
+use App\Support\Currency;
 use Closure;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
@@ -18,7 +20,11 @@ class HandleInertiaRequests extends Middleware
      */
     public function handle(Request $request, Closure $next)
     {
-        Inertia::encryptHistory($request->user() !== null);
+        // Browsers only offer the crypto API on HTTPS (or localhost). Devices opening the dev
+        // server by LAN IP over plain HTTP can't encrypt, so Inertia warns on every visit there.
+        $canEncrypt = app()->isProduction() || $request->isSecure() || in_array($request->getHost(), ['localhost', '127.0.0.1'], true);
+
+        Inertia::encryptHistory($request->user() !== null && $canEncrypt);
 
         return parent::handle($request, $next);
     }
@@ -65,12 +71,22 @@ class HandleInertiaRequests extends Middleware
                 'can_delete' => (bool) $user?->isAdmin(),
                 'is_first_login' => fn () => (bool) $request->session()->get('is_first_login', false),
             ],
+            // Admin/Staff display currency (amounts are stored in USD). Only an already-cached rate is
+            // included, so pages never wait on the rate service; the browser fetches it when needed.
+            // Public visitors and customers get nothing.
+            'currency' => fn () => $user?->isAdminOrStaff() ? [
+                'preferred' => in_array($user->preferred_currency, Currency::SUPPORTED, true) ? $user->preferred_currency : Currency::DEFAULT,
+                'base' => Currency::BASE,
+                'rate' => app(ExchangeRates::class)->cached(),
+            ] : null,
             'sidebarOpen' => ! $request->hasCookie('sidebar_state') || $request->cookie('sidebar_state') === 'true',
             'currentTeam' => fn () => $user?->currentTeam ? $user->toUserTeam($user->currentTeam) : null,
             'teams' => fn () => $user?->toUserTeams(includeCurrent: true) ?? [],
             'flash' => [
                 'success' => fn () => $request->session()->get('success'),
                 'error' => fn () => $request->session()->get('error'),
+                'warning' => fn () => $request->session()->get('warning'),
+                'info' => fn () => $request->session()->get('info'),
                 'status' => fn () => $request->session()->get('status'),
                 'device_notice' => fn () => $request->session()->get('device_notice'),
             ],

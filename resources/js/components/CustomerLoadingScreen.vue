@@ -1,21 +1,24 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { onMounted, ref } from 'vue';
 import { useCustomerLoading } from '@/composables/useCustomerLoading';
 
 const { isVisible, init } = useCustomerLoading();
+// Teleports are not part of the server-rendered HTML, so only mount after hydration.
+const mounted = ref(false);
 
 onMounted(() => {
+    mounted.value = true;
     init();
 });
 </script>
 
 <template>
-    <Teleport to="body">
+    <Teleport v-if="mounted" to="body">
         <Transition
-            enter-active-class="transition-opacity duration-300 ease-out"
+            enter-active-class="transition-opacity duration-200 ease-out"
             enter-from-class="opacity-0"
             enter-to-class="opacity-100"
-            leave-active-class="transition-opacity duration-500 ease-in-out"
+            leave-active-class="transition-opacity duration-200 ease-in"
             leave-from-class="opacity-100"
             leave-to-class="opacity-0"
         >
@@ -54,7 +57,7 @@ onMounted(() => {
                             class="animate-logo-float relative flex size-28 items-center justify-center rounded-full border border-gray-200/90 bg-white p-3 shadow-2xl sm:size-36 dark:border-neutral-800 dark:bg-neutral-900"
                         >
                             <img
-                                src="/LOGO_MR_PRIDE.png"
+                                src="/LOGO_MR_PRIDE.webp"
                                 alt="MR-Pride Electrical Supplies"
                                 class="pointer-events-none size-full object-contain drop-shadow-md select-none"
                                 loading="eager"

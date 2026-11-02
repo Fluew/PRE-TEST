@@ -13,6 +13,7 @@ class DeliveryAttemptLog extends Model
     protected $fillable = [
         'team_id',
         'order_fulfillment_id',
+        'delivery_release_id',
         'attempt_number',
         'previous_status',
         'new_status',

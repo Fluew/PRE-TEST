@@ -3,10 +3,15 @@
 namespace App\Http\Controllers;
 
 use App\Models\Product;
+use App\Models\ProductSupplier;
 use App\Models\Supplier;
-use App\Models\Team;
+use App\Models\SupplierQuote;
+use App\Services\AuditLogger;
+use App\Services\Suppliers\SupplierEvaluator;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Validation\Rule;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -14,16 +19,16 @@ use Inertia\Response;
 class SupplierController extends Controller
 {
     /**
-     * Display a listing of suppliers with AHP scores.
+     * Suppliers with their record-based evaluation (see SupplierEvaluator).
      */
-    public function index(Request $request): Response
+    public function index(Request $request, SupplierEvaluator $evaluator): Response
     {
         $team = $request->user()->currentTeam;
         abort_if(! $team, 403, 'No active team selected.');
 
         $search = $request->input('search');
         $status = $request->input('status', 'All');
-        $sort = $request->input('sort', 'ahp_desc');
+        $sort = $request->input('sort', 'score_desc');
 
         $query = Supplier::where('team_id', $team->id);
 
@@ -40,18 +45,32 @@ class SupplierController extends Controller
             $query->where('status', $status);
         }
 
-        if ($sort === 'name_asc') {
-            $query->orderBy('name', 'asc');
-        } elseif ($sort === 'name_desc') {
-            $query->orderBy('name', 'desc');
-        } else {
-            $query->orderByDesc('ahp_score')->orderBy('name', 'asc');
+        $evaluations = $evaluator->forTeam($team->id);
+        $all = $query->orderBy('name', $sort === 'name_desc' ? 'desc' : 'asc')
+            ->get(['id', 'name', 'contact_person', 'phone', 'email', 'address', 'status'])
+            ->each(fn ($s) => $s->setAttribute('evaluation', $evaluations[$s->id] ?? null));
+
+        if (! in_array($sort, ['name_asc', 'name_desc'], true)) {
+            // Complete scores first (highest first), then incomplete ones by name.
+            $all = $all->sortBy([
+                fn ($a, $b) => ($b->evaluation['complete'] ?? false) <=> ($a->evaluation['complete'] ?? false),
+                fn ($a, $b) => ($b->evaluation['score'] ?? -1) <=> ($a->evaluation['score'] ?? -1),
+                fn ($a, $b) => strcmp($a->name, $b->name),
+            ])->values();
         }
 
-        $suppliers = $query->paginate(15)->withQueryString();
+        $page = LengthAwarePaginator::resolveCurrentPage();
+        $suppliers = new LengthAwarePaginator($all->forPage($page, 15)->values(), $all->count(), 15, $page, [
+            'path' => $request->url(),
+            'query' => $request->query(),
+        ]);
 
         return Inertia::render('Suppliers/Index', [
             'suppliers' => $suppliers,
+            'weights' => config('evaluation.supplier.weights'),
+            'periodMonths' => (int) config('evaluation.supplier.period_months'),
+            'products' => Product::where('team_id', $team->id)->where('is_active', true)->orderBy('name')->get(['id', 'name', 'sku', 'unit']),
+            'canVerify' => $request->user()->isAdmin(),
             'filters' => [
                 'search' => $search,
                 'status' => $status,
@@ -127,59 +146,181 @@ class SupplierController extends Controller
     }
 
     /**
-     * Run AHP evaluation for all active suppliers in the team.
-     *
-     * Uses the Analytic Hierarchy Process with pairwise comparisons
-     * across three criteria: Price / Cost, Quality, Delivery Reliability.
+     * The records behind a supplier's evaluation: its quotes and product availability.
      */
-    public function runAhp(Request $request): RedirectResponse
+    public function records(Request $request, mixed $current_team = null, mixed $supplier = null): JsonResponse
     {
-        $team = $request->user()->currentTeam;
-        abort_if(! $team, 403, 'No active team selected.');
+        $supplier = $this->resolveSupplier($supplier, $current_team, $request);
+        $this->authorizeTeam($request, $supplier->team_id);
+
+        $person = fn ($u) => $u ? ['id' => $u->id, 'name' => $u->name] : null;
+
+        return response()->json([
+            'quotes' => SupplierQuote::where('supplier_id', $supplier->id)->with(['product:id,name,sku', 'verifiedBy:id,name'])
+                ->orderByDesc('quoted_on')->orderByDesc('id')->get()
+                ->map(fn ($q) => [
+                    'id' => $q->id,
+                    'product' => $q->product?->only(['id', 'name', 'sku']),
+                    'reference' => $q->reference,
+                    'unit_price' => (float) $q->unit_price,
+                    'currency' => $q->currency,
+                    'unit' => $q->unit,
+                    'tax_inclusive' => $q->tax_inclusive,
+                    'quoted_on' => $q->quoted_on->toDateString(),
+                    'valid_until' => $q->valid_until?->toDateString(),
+                    'expired' => $q->valid_until !== null && $q->valid_until->lt(today()),
+                    'notes' => $q->notes,
+                    'verified_at' => $q->verified_at?->toIso8601String(),
+                    'verified_by' => $person($q->verifiedBy),
+                ]),
+            'availability' => ProductSupplier::where('supplier_id', $supplier->id)->with(['product:id,name,sku', 'verifiedBy:id,name'])
+                ->orderByDesc('updated_at')->get()
+                ->map(fn ($a) => [
+                    'id' => $a->id,
+                    'product' => $a->product?->only(['id', 'name', 'sku']),
+                    'is_available' => $a->is_available,
+                    'notes' => $a->notes,
+                    'verified_at' => $a->verified_at?->toIso8601String(),
+                    'verified_by' => $person($a->verifiedBy),
+                ]),
+        ]);
+    }
+
+    /** Record a supplier quote. It counts in Price Competitiveness only after an administrator verifies it. */
+    public function storeQuote(Request $request, mixed $current_team = null, mixed $supplier = null): RedirectResponse
+    {
+        $supplier = $this->resolveSupplier($supplier, $current_team, $request);
+        $this->authorizeTeam($request, $supplier->team_id);
 
         $validated = $request->validate([
-            'criteria_weights' => ['required', 'array', 'size:3'],
-            'criteria_weights.price' => ['required', 'numeric', 'min:0'],
-            'criteria_weights.quality' => ['required', 'numeric', 'min:0'],
-            'criteria_weights.delivery' => ['required', 'numeric', 'min:0'],
-            'supplier_scores' => ['required', 'array', 'min:1'],
-            'supplier_scores.*.id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where('team_id', $team->id)],
-            'supplier_scores.*.price' => ['required', 'integer', 'min:1', 'max:10'],
-            'supplier_scores.*.quality' => ['required', 'integer', 'min:1', 'max:10'],
-            'supplier_scores.*.delivery' => ['required', 'integer', 'min:1', 'max:10'],
+            'product_id' => ['required', 'integer', Rule::exists('products', 'id')->where('team_id', $supplier->team_id)],
+            'reference' => ['nullable', 'string', 'max:100'],
+            'unit_price' => ['required', 'numeric', 'gt:0', 'max:9999999999'],
+            'currency' => ['required', Rule::in(['USD', 'PHP'])],
+            'unit' => ['required', 'string', 'max:50'],
+            'tax_inclusive' => ['required', 'boolean'],
+            'quoted_on' => ['required', 'date', 'before_or_equal:today'],
+            'valid_until' => ['nullable', 'date', 'after_or_equal:quoted_on'],
+            'notes' => ['nullable', 'string', 'max:1000'],
+        ]);
+        $validated['unit'] = mb_strtolower(trim($validated['unit']));
+
+        $duplicate = SupplierQuote::where('supplier_id', $supplier->id)
+            ->where('product_id', $validated['product_id'])
+            ->whereDate('quoted_on', $validated['quoted_on'])
+            ->where('unit', $validated['unit'])
+            ->where('currency', $validated['currency'])
+            ->where('tax_inclusive', (bool) $validated['tax_inclusive'])
+            ->exists();
+        if ($duplicate) {
+            return back()->withErrors(['product_id' => 'This supplier already has a quote for this product, date and terms.']);
+        }
+
+        $quote = SupplierQuote::create($validated + [
+            'team_id' => $supplier->team_id,
+            'supplier_id' => $supplier->id,
+            'recorded_by_id' => $request->user()->id,
+        ]);
+        AuditLogger::record('supplier_quote.recorded', "Quote recorded for {$supplier->name}.", $quote, [], $request->user());
+
+        return back()->with('success', 'Quote recorded. An administrator must verify it before it counts.');
+    }
+
+    public function verifyQuote(Request $request, mixed $current_team = null, mixed $quote = null): RedirectResponse
+    {
+        $quote = $this->findTeamRecord(SupplierQuote::class, $quote ?? $request->route('quote'), $request);
+        abort_unless($request->user()->isAdmin(), 403);
+
+        $quote->update(['verified_at' => now(), 'verified_by_id' => $request->user()->id]);
+        AuditLogger::record('supplier_quote.verified', 'Supplier quote verified.', $quote, [], $request->user());
+
+        return back()->with('success', 'Quote verified.');
+    }
+
+    public function destroyQuote(Request $request, mixed $current_team = null, mixed $quote = null): RedirectResponse
+    {
+        $quote = $this->findTeamRecord(SupplierQuote::class, $quote ?? $request->route('quote'), $request);
+        if ($quote->verified_at && ! $request->user()->isAdmin()) {
+            return back()->withErrors(['quote' => 'Only an administrator can remove a verified quote.']);
+        }
+
+        AuditLogger::record('supplier_quote.removed', 'Supplier quote removed.', $quote, $quote->only(['product_id', 'unit_price', 'quoted_on']), $request->user());
+        $quote->delete();
+
+        return back()->with('success', 'Quote removed.');
+    }
+
+    /**
+     * Record whether this supplier can currently supply a product. A change needs verifying again.
+     */
+    public function storeAvailability(Request $request, mixed $current_team = null, mixed $supplier = null): RedirectResponse
+    {
+        $supplier = $this->resolveSupplier($supplier, $current_team, $request);
+        $this->authorizeTeam($request, $supplier->team_id);
+
+        $validated = $request->validate([
+            'product_id' => ['required', 'integer', Rule::exists('products', 'id')->where('team_id', $supplier->team_id)],
+            'is_available' => ['required', 'boolean'],
+            'notes' => ['nullable', 'string', 'max:1000'],
         ]);
 
-        // Normalize criteria weights so they sum to 1
-        $weights = $validated['criteria_weights'];
-        $totalWeight = array_sum($weights);
-        if ($totalWeight <= 0) {
-            return back()->withErrors(['criteria_weights' => 'Criteria weights must sum to a positive number.']);
+        $record = ProductSupplier::updateOrCreate(
+            ['product_id' => $validated['product_id'], 'supplier_id' => $supplier->id],
+            [
+                'team_id' => $supplier->team_id,
+                'is_available' => $validated['is_available'],
+                'notes' => $validated['notes'] ?? null,
+                'recorded_by_id' => $request->user()->id,
+                'verified_at' => null,
+                'verified_by_id' => null,
+            ],
+        );
+        AuditLogger::record('supplier_availability.recorded', "Availability recorded for {$supplier->name}.", $record, ['is_available' => $record->is_available], $request->user());
+
+        return back()->with('success', 'Availability recorded. An administrator must verify it before it counts.');
+    }
+
+    public function verifyAvailability(Request $request, mixed $current_team = null, mixed $availability = null): RedirectResponse
+    {
+        $record = $this->findTeamRecord(ProductSupplier::class, $availability ?? $request->route('availability'), $request);
+        abort_unless($request->user()->isAdmin(), 403);
+
+        $record->update(['verified_at' => now(), 'verified_by_id' => $request->user()->id]);
+        AuditLogger::record('supplier_availability.verified', 'Supplier availability verified.', $record, [], $request->user());
+
+        return back()->with('success', 'Availability verified.');
+    }
+
+    public function destroyAvailability(Request $request, mixed $current_team = null, mixed $availability = null): RedirectResponse
+    {
+        $record = $this->findTeamRecord(ProductSupplier::class, $availability ?? $request->route('availability'), $request);
+        if ($record->verified_at && ! $request->user()->isAdmin()) {
+            return back()->withErrors(['availability' => 'Only an administrator can remove a verified availability record.']);
         }
-        $normalizedWeights = [
-            'price' => $weights['price'] / $totalWeight,
-            'quality' => $weights['quality'] / $totalWeight,
-            'delivery' => $weights['delivery'] / $totalWeight,
-        ];
 
-        // Calculate AHP score for each supplier
-        foreach ($validated['supplier_scores'] as $scores) {
-            $ahpScore = ($scores['price'] / 10) * $normalizedWeights['price']
-                + ($scores['quality'] / 10) * $normalizedWeights['quality']
-                + ($scores['delivery'] / 10) * $normalizedWeights['delivery'];
+        AuditLogger::record('supplier_availability.removed', 'Supplier availability record removed.', $record, $record->only(['product_id', 'is_available']), $request->user());
+        $record->delete();
 
-            Supplier::where('id', $scores['id'])
-                ->where('team_id', $team->id)
-                ->update([
-                    'ahp_score' => round($ahpScore, 3),
-                    'metrics' => [
-                        'price' => $scores['price'],
-                        'quality' => $scores['quality'],
-                        'delivery' => $scores['delivery'],
-                    ],
-                ]);
-        }
+        return back()->with('success', 'Availability record removed.');
+    }
 
-        return back()->with('success', 'AHP evaluation completed successfully.');
+    private function authorizeTeam(Request $request, int $teamId): void
+    {
+        abort_if($request->user()->currentTeam?->id !== $teamId, 403);
+    }
+
+    /**
+     * @template T of \Illuminate\Database\Eloquent\Model
+     *
+     * @param  class-string<T>  $class
+     * @return T
+     */
+    private function findTeamRecord(string $class, mixed $id, Request $request)
+    {
+        $record = $id instanceof $class ? $id : $class::findOrFail((int) $id);
+        $this->authorizeTeam($request, $record->team_id);
+
+        return $record;
     }
 
     /**

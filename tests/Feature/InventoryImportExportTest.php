@@ -1,6 +1,8 @@
 <?php
 
 use App\Enums\TeamRole;
+use App\Models\ImportBatch;
+use App\Models\ImportRow;
 use App\Models\Product;
 use App\Models\Team;
 use App\Models\User;
@@ -8,6 +10,7 @@ use App\Services\MaterialList\OcrEngine;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Storage;
 use PhpOffice\PhpSpreadsheet\IOFactory;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
@@ -62,6 +65,7 @@ function invFakeOcr(string $text): void
 }
 
 beforeEach(function () {
+    Storage::fake('local');
     $this->team = Team::factory()->create(['slug' => 'inv-team', 'name' => 'Inventory Team']);
     [$this->user, $this->cookies] = invActor($this->team);
 });
@@ -141,48 +145,69 @@ it('rejects unknown export formats', function () {
 });
 
 // --- Import ---------------------------------------------------------------------------------
+// Imports go through the reviewed document import (/imports/inventory): the file is read into
+// preview rows, staff review them, and only new products are created on confirm. Stock and
+// prices of existing products are never changed by an import.
 
-it('imports an Excel file that it exported (round trip)', function () {
-    invProduct($this->team, ['sku' => 'BRK-60', 'name' => 'Circuit Breaker 60A', 'brand' => 'Schneider', 'stock' => 12, 'price' => 450]);
+function invImport($t, UploadedFile $file): ImportBatch
+{
+    $id = $t->actingAs($t->user)->withCookies($t->cookies)
+        ->post("/{$t->team->slug}/imports/inventory", ['file' => $file])->assertCreated()->json('id');
+
+    return ImportBatch::findOrFail($id);
+}
+
+/** @return list<list<mixed>> */
+function invRowValues(ImportBatch $batch, array $fields): array
+{
+    return $batch->rows()->orderBy('row_number')->get()->map(fn ($r) => array_map(fn ($f) => $r->values[$f] ?? null, $fields))->all();
+}
+
+it('the old one-step inventory import address is gone', function () {
+    $this->actingAs($this->user)->withCookies($this->cookies)
+        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => invXlsx([['SKU', 'Name'], ['A', 'B']])])
+        ->assertNotFound();
+});
+
+it('reads an Excel file that it exported, showing existing products without changing them', function () {
+    $existing = invProduct($this->team, ['sku' => 'BRK-60', 'name' => 'Circuit Breaker 60A', 'brand' => 'Schneider', 'stock' => 12, 'price' => 450]);
 
     $content = $this->actingAs($this->user)->withCookies($this->cookies)
         ->get("/{$this->team->slug}/inventory/export?format=xlsx")->streamedContent();
     $path = tempnam(sys_get_temp_dir(), 'inv').'.xlsx';
     file_put_contents($path, $content);
 
-    $preview = $this->actingAs($this->user)->withCookies($this->cookies)
-        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => new UploadedFile($path, 'export.xlsx', null, null, true)])
-        ->assertOk()->json();
+    $batch = invImport($this, new UploadedFile($path, 'export.xlsx', null, null, true));
+    $row = $batch->rows()->sole();
 
-    expect($preview['valid_count'])->toBe(1)
-        ->and($preview['valid_rows'][0])->toMatchArray(['sku' => 'BRK-60', 'name' => 'Circuit Breaker 60A', 'brand' => 'Schneider', 'stock' => 12, 'price' => 450.0, 'is_update' => true])
-        ->and($preview['warning'])->toBeNull();
+    expect($batch->status)->toBe(ImportBatch::READY)
+        ->and($row->status)->toBe(ImportRow::EXISTING)
+        ->and($row->matched_product_id)->toBe($existing->id)
+        ->and([$row->values['sku'], $row->values['name'], $row->values['brand'], $row->values['stock'], $row->values['price']])
+        ->toEqual(['BRK-60', 'Circuit Breaker 60A', 'Schneider', 12.0, 450.0]);
 });
 
-it('finds the header row below a title and saves new products from Excel', function () {
+it('finds the header row below a title and creates only new products, with no stock', function () {
     $file = invXlsx([
         ['Mr. Pride stock list - October'],
         [],
-        ['SKU', 'Product Name', 'Category', 'Selling Price', 'Stock'],
-        ['WR-35', 'THHN Wire 3.5mm', 'Wiring', 68, 25],
-        ['', 'Missing SKU', 'Wiring', 10, 1],
+        ['SKU', 'Product Name', 'Category', 'Unit', 'Selling Price', 'Stock'],
+        ['WR-35', 'THHN Wire 3.5mm', 'Wiring', 'roll', 68, 25],
+        ['', 'Missing SKU', 'Wiring', 'pcs', 10, 1],
     ]);
 
-    $preview = $this->actingAs($this->user)->withCookies($this->cookies)
-        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => $file])->assertOk()->json();
-
-    expect($preview['valid_count'])->toBe(1)
-        ->and($preview['invalid_rows'][0])->toMatchArray(['row' => 5, 'errors' => ['SKU is required.']]);
+    $batch = invImport($this, $file);
+    expect(invRowValues($batch, ['sku', 'name']))->toEqual([['WR-35', 'THHN Wire 3.5mm'], [null, 'Missing SKU']]);
 
     $this->actingAs($this->user)->withCookies($this->cookies)
-        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => $file, 'mode' => 'append', 'execute' => true])
-        ->assertSessionHasNoErrors();
+        ->post("/{$this->team->slug}/imports/batches/{$batch->id}/confirm")->assertOk()->assertJson(['created' => 2]);
 
     expect(Product::where('team_id', $this->team->id)->where('sku', 'WR-35')->first())
-        ->name->toBe('THHN Wire 3.5mm')->stock->toBe(25);
+        ->name->toBe('THHN Wire 3.5mm')->stock->toBe(0);
+    expect(Product::where('name', 'Missing SKU')->value('sku'))->toStartWith('PRD-');
 });
 
-it('reads a photo of a stock list with OCR and fixes misread digits', function () {
+it('reads a photo of a stock list with OCR and reports misread digits', function () {
     invFakeOcr(ocrTsv([
         'INVENTORY COUNT - Branch 2',
         'SKU      Product Name          Stock    Selling Price',
@@ -191,60 +216,54 @@ it('reads a photo of a stock list with OCR and fixes misread digits', function (
         '                                         Page 1 of 1',
     ]));
 
-    $res = $this->actingAs($this->user)->withCookies($this->cookies)
-        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => invPng()])->assertOk();
+    $batch = invImport($this, invPng());
 
-    expect($res->json('method'))->toBe('ocr')
-        ->and($res->json('warning'))->toContain('text recognition')
-        ->and($res->json('invalid_count'))->toBe(0)
-        ->and(collect($res->json('valid_rows'))->map(fn ($r) => [$r['sku'], $r['name'], $r['stock'], $r['price']])->all())
-        ->toEqual([['BRK-60', 'Circuit Breaker 60A', 10, 450], ['LED-9', 'LED Bulb 9W', 15, 85]]);
+    expect($batch->status)->toBe(ImportBatch::READY)
+        ->and($batch->extraction_method)->toBe('ocr')
+        ->and(invRowValues($batch, ['sku', 'name', 'stock', 'price']))
+        ->toEqual([['BRK-60', 'Circuit Breaker 60A', 10.0, 450.0], ['LED-9', 'LED Bulb 9W', 15.0, 85.0]])
+        ->and($batch->rows()->get()->flatMap->issues->pluck('message')->implode(' '))->toContain('read by OCR as "1O"');
+
+    // OCR values need an explicit check before import.
+    $this->actingAs($this->user)->withCookies($this->cookies)
+        ->post("/{$this->team->slug}/imports/batches/{$batch->id}/confirm")->assertStatus(422);
 });
 
-it('explains when a photo has no readable column headers', function () {
+it('turns a photo without readable column headers into lines for staff to fix', function () {
     invFakeOcr(ocrTsv(['just some blurry words', 'nothing useful']));
 
-    $this->actingAs($this->user)->withCookies($this->cookies)
-        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => invPng()])
+    $batch = invImport($this, invPng());
+
+    expect($batch->rows()->get()->flatMap->issues->pluck('message')->implode(' '))->toContain('No column headers were recognised');
+});
+
+it('rejects files that are not what their name says, before storing anything', function (string $name, string $content) {
+    $this->actingAs($this->user)->withCookies($this->cookies)->withCredentials()
+        ->postJson("/{$this->team->slug}/imports/inventory", ['file' => UploadedFile::fake()->createWithContent($name, $content)])
         ->assertStatus(422)
-        ->assertJson(['success' => false])
-        ->assertJsonPath('message', fn ($m) => str_contains($m, 'column headers are clearly visible'));
-});
+        ->assertJsonValidationErrors('file');
 
-it('rejects files that are not what their name says', function () {
-    $fake = UploadedFile::fake()->createWithContent('stock.xlsx', 'this is not a spreadsheet');
-
-    $this->actingAs($this->user)->withCookies($this->cookies)
-        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => $fake])
-        ->assertStatus(422)
-        ->assertJsonPath('message', fn ($m) => str_contains($m, "doesn't look like a valid .xlsx file"));
-});
-
-it('turns a read failure during the final import into a form error', function () {
-    $fake = UploadedFile::fake()->createWithContent('stock.pdf', 'not a pdf');
-
-    $this->actingAs($this->user)->withCookies($this->cookies)
-        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => $fake, 'mode' => 'append', 'execute' => true])
-        ->assertSessionHasErrors('file');
-});
+    expect(ImportBatch::count())->toBe(0);
+})->with([
+    'fake excel' => ['stock.xlsx', 'this is not a spreadsheet'],
+    'fake pdf' => ['stock.pdf', 'not a pdf'],
+]);
 
 // --- Round trips with the real tools (skipped when they are not installed) ------------------
 
-it('imports a PDF it exported, keeping every column apart', function () {
+it('reads a PDF it exported, keeping every column apart', function () {
     invProduct($this->team, ['sku' => 'BRK-60', 'name' => 'Molded Case Circuit Breaker 100A 3P', 'brand' => 'Schneider', 'stock' => 1200, 'price' => 1450, 'cost_price' => 980]);
     invProduct($this->team, ['sku' => 'TP-7', 'name' => 'Tape', 'stock' => 0, 'price' => 35]);
 
     $pdf = $this->actingAs($this->user)->withCookies($this->cookies)
         ->get("/{$this->team->slug}/inventory/export?format=pdf")->assertOk()->getContent();
-    $file = UploadedFile::fake()->createWithContent('inventory.pdf', $pdf);
+    $batch = invImport($this, UploadedFile::fake()->createWithContent('inventory.pdf', $pdf));
 
-    $rows = $this->actingAs($this->user)->withCookies($this->cookies)
-        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => $file])->assertOk()->json('valid_rows');
-
-    expect(collect($rows)->map(fn ($r) => [$r['sku'], $r['name'], $r['brand'], $r['stock'], $r['price'], $r['cost_price']])->all())->toEqual([
-        ['TP-7', 'Tape', null, 0, 35, 80],
-        ['BRK-60', 'Molded Case Circuit Breaker 100A 3P', 'Schneider', 1200, 1450, 980],
-    ]);
+    expect($batch->extraction_method)->toBe('pdf-text')
+        ->and(invRowValues($batch, ['sku', 'name', 'brand', 'stock', 'price', 'cost_price']))->toEqual([
+            ['TP-7', 'Tape', null, 0.0, 35.0, 80.0],
+            ['BRK-60', 'Molded Case Circuit Breaker 100A 3P', 'Schneider', 1200.0, 1450.0, 980.0],
+        ]);
 })->skip(fn () => ! app(OcrEngine::class)->pdfTextAvailable(), 'Poppler (pdftotext) is not installed');
 
 it('reads a PNG it exported with real OCR', function () {
@@ -252,10 +271,8 @@ it('reads a PNG it exported with real OCR', function () {
 
     $png = $this->actingAs($this->user)->withCookies($this->cookies)
         ->get("/{$this->team->slug}/inventory/export?format=png")->assertOk()->getContent();
-    $file = UploadedFile::fake()->createWithContent('inventory.png', $png);
+    $batch = invImport($this, UploadedFile::fake()->createWithContent('inventory.png', $png));
+    $row = $batch->rows()->orderBy('row_number')->first();
 
-    $rows = $this->actingAs($this->user)->withCookies($this->cookies)
-        ->post("/{$this->team->slug}/inventory/import-csv", ['file' => $file])->assertOk()->json('valid_rows');
-
-    expect($rows[0])->toMatchArray(['name' => 'Circuit Breaker 60A', 'stock' => 25, 'price' => 450.0]);
+    expect([$row->values['name'], $row->values['stock'], $row->values['price']])->toEqual(['Circuit Breaker 60A', 25.0, 450.0]);
 })->skip(fn () => ! app(OcrEngine::class)->tesseractAvailable(), 'Tesseract is not installed');

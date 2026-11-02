@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Settings\CurrencyController;
 use App\Http\Controllers\Settings\MaintenanceController;
 use App\Http\Controllers\Settings\ProfileController;
 use App\Http\Controllers\Settings\SecurityController;
@@ -19,6 +20,10 @@ Route::middleware(['auth', ...$internal, 'no_cache'])->group(function () {
 
     Route::get('settings/profile', [ProfileController::class, 'edit'])->name('profile.edit');
     Route::patch('settings/profile', [ProfileController::class, 'update'])->name('profile.update');
+
+    // Header currency switch (display only; amounts are stored in USD).
+    Route::put('settings/currency', [CurrencyController::class, 'update'])->middleware('throttle:30,1')->name('currency.update');
+    Route::get('settings/currency/rate', [CurrencyController::class, 'rate'])->middleware('throttle:30,1')->name('currency.rate');
 });
 
 Route::middleware(['auth', 'verified', ...$internal, 'no_cache'])->group(function () {

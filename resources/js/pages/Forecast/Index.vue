@@ -14,6 +14,7 @@ import {
 } from 'chart.js';
 import { Line } from 'vue-chartjs';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
+import { useCurrency } from '@/composables/useCurrency';
 import {
   TrendingUp,
   Download,
@@ -76,8 +77,8 @@ interface ProductWindow {
     stock: number;
     threshold: number;
     reorderQuantity: number;
-    avgMonthlyDemand: number;
-    daysOfSupply: number;
+    avgMonthlyDemand: number | null;
+    daysOfSupply: number | null;
     recommendedRestock: number;
     urgency: 'Safe' | 'Needs Reorder' | 'Critical Low' | 'Out of Stock';
 }
@@ -87,8 +88,11 @@ interface CategoryWindow {
     totalItems: number;
     totalStock: number;
     lowStockItems: number;
-    avgMonthlyDemand: number;
+    avgMonthlyDemand: number | null;
 }
+
+// Stored prices are USD; shown in the user's display currency (header switch).
+const { formatMoney } = useCurrency();
 
 const props = defineProps<{
     fromDate: string;
@@ -104,6 +108,10 @@ const props = defineProps<{
         labels: string[];
         historical: number[];
         forecast: (number | null)[];
+        hasData: boolean;
+        steps: { month: string; inputs: { month: string; units: number }[]; sum: number; window: number; forecast: number }[];
+        sourceRecords: { source: string; date: string; reference: string | null; units: number }[];
+        sourceRecordCount: number;
     };
     suggestedRestocks: RestockItem[];
     minDate: string;
@@ -559,7 +567,7 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                             </span>
                         </div>
                         <p class="text-xs text-gray-500 mt-0.5">
-                            Unit Price: <span class="font-semibold text-gray-800">₱{{ Number(productWindow.price).toLocaleString('en-PH', { minimumFractionDigits: 2 }) }}</span>
+                            Unit Price: <span class="font-semibold text-gray-800">{{ formatMoney(productWindow.price) }}</span>
                             &nbsp;·&nbsp; Unit: <span class="font-medium text-gray-700">{{ productWindow.unit }}</span>
                         </p>
                     </div>
@@ -618,10 +626,12 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                         <Sparkles class="w-3.5 h-3.5 text-[#F8B803]" />
                     </div>
                     <div class="text-2xl font-semibold text-gray-900 tracking-tight">
-                        ~{{ productWindow.avgMonthlyDemand }} <span class="text-xs font-medium text-gray-500">{{ productWindow.unit }}/mo</span>
+                        <template v-if="productWindow.avgMonthlyDemand !== null">~{{ productWindow.avgMonthlyDemand }} <span class="text-xs font-medium text-gray-500">{{ productWindow.unit }}/mo</span></template>
+                        <span v-else class="text-sm font-medium text-gray-500">Insufficient data</span>
                     </div>
                     <p class="text-[11px] text-gray-500 mt-2">
-                        Burn velocity: <strong class="text-gray-800">{{ (productWindow.avgMonthlyDemand / 30).toFixed(1) }}</strong> {{ productWindow.unit }}/day
+                        <template v-if="productWindow.avgMonthlyDemand !== null">Burn velocity: <strong class="text-gray-800">{{ (productWindow.avgMonthlyDemand / 30).toFixed(1) }}</strong> {{ productWindow.unit }}/day</template>
+                        <template v-else>No sales records in this period, so there is no forecast.</template>
                     </p>
                 </div>
 
@@ -634,14 +644,16 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                     <div
                         :class="[
                             'text-2xl font-semibold tracking-tight',
+                            productWindow.daysOfSupply === null ? 'text-gray-500' :
                             productWindow.daysOfSupply <= 7 ? 'text-red-600' :
                             productWindow.daysOfSupply <= 20 ? 'text-amber-600' : 'text-emerald-700'
                         ]"
                     >
-                        {{ productWindow.daysOfSupply }} <span class="text-xs font-medium text-gray-500">days</span>
+                        <template v-if="productWindow.daysOfSupply !== null">{{ productWindow.daysOfSupply }} <span class="text-xs font-medium text-gray-500">days</span></template>
+                        <span v-else class="text-sm font-medium">Insufficient data</span>
                     </div>
                     <p class="text-[11px] text-gray-500 mt-2">
-                        {{ productWindow.daysOfSupply <= 14 ? '⚠️ Stockout risk imminent' : 'Estimated supply at current pace' }}
+                        {{ productWindow.daysOfSupply === null ? 'Needs a demand forecast' : productWindow.daysOfSupply <= 14 ? 'Stockout risk imminent' : 'Estimated supply at current pace' }}
                     </p>
                 </div>
 
@@ -655,7 +667,7 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                         +{{ productWindow.recommendedRestock }} <span class="text-xs font-medium text-gray-500">{{ productWindow.unit }}</span>
                     </div>
                     <p class="text-[11px] text-gray-500 mt-2">
-                        Est. Cost: <strong class="text-gray-800">₱{{ (productWindow.recommendedRestock * productWindow.price).toLocaleString('en-PH', { minimumFractionDigits: 0, maximumFractionDigits: 0 }) }}</strong>
+                        Est. Cost: <strong class="text-gray-800">{{ formatMoney(productWindow.recommendedRestock * productWindow.price, { decimals: 0 }) }}</strong>
                     </p>
                 </div>
             </div>
@@ -707,7 +719,7 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                 </div>
                 <div class="bg-white/90 rounded-xl p-3.5 border border-gray-200">
                     <span class="text-[11px] font-semibold text-gray-500 block mb-1">Monthly Forecast Velocity</span>
-                    <div class="text-2xl font-semibold text-[#4b5320] tracking-tight">~{{ categoryWindow.avgMonthlyDemand }}</div>
+                    <div class="text-2xl font-semibold text-[#4b5320] tracking-tight">{{ categoryWindow.avgMonthlyDemand !== null ? `~${categoryWindow.avgMonthlyDemand}` : 'Insufficient data' }}</div>
                     <span class="text-[11px] text-gray-400">Predicted units/month</span>
                 </div>
             </div>
@@ -838,5 +850,42 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                 </div>
             </div>
         </div>
+
+        <section class="panel p-5" aria-labelledby="sma-calc-heading">
+            <h2 id="sma-calc-heading" class="text-base font-semibold text-gray-900">How this forecast is calculated</h2>
+            <p class="mt-1 text-sm text-gray-500">
+                SMA-{{ smaWindow }}: each month's forecast is the plain average of the {{ smaWindow }} months before it.
+                Monthly demand is the larger of outgoing stock movements and units on confirmed, processing or completed Sales Orders.
+            </p>
+            <div v-if="!forecastData.hasData" class="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                Insufficient data: no sales or outgoing stock records exist for this selection and period, so no forecast is shown. Nothing is estimated.
+            </div>
+            <template v-else>
+                <details class="mt-3">
+                    <summary class="text-sm font-medium text-[#4b5320]">View Calculation ({{ forecastData.steps.length }} forecast months)</summary>
+                    <p class="mt-2 font-mono text-xs text-gray-600">SMA = (Sum of demand in the previous {{ smaWindow }} months) / {{ smaWindow }}</p>
+                    <ul class="mt-2 space-y-1 font-mono text-xs text-gray-700">
+                        <li v-for="step in forecastData.steps" :key="step.month">
+                            {{ step.month }}: ({{ step.inputs.map((i) => i.units).join(' + ') }}) / {{ step.window }} = {{ step.sum }} / {{ step.window }} ≈ <strong>{{ step.forecast }}</strong>
+                        </li>
+                        <li v-if="!forecastData.steps.length" class="font-sans text-gray-500">The period is shorter than {{ smaWindow }} months, so there is no forecast month yet.</li>
+                    </ul>
+                </details>
+                <details class="mt-2">
+                    <summary class="text-sm font-medium text-[#4b5320]">Source records ({{ forecastData.sourceRecordCount }})</summary>
+                    <div class="mt-2 max-h-80 overflow-auto">
+                        <table class="w-full text-left text-xs">
+                            <thead><tr><th class="py-1">Date</th><th>Source</th><th>Reference</th><th class="text-right">Units</th></tr></thead>
+                            <tbody>
+                                <tr v-for="(r, i) in forecastData.sourceRecords" :key="i" class="border-t border-gray-100">
+                                    <td class="py-1">{{ r.date }}</td><td>{{ r.source }}</td><td>{{ r.reference }}</td><td class="text-right">{{ r.units }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                        <p v-if="forecastData.sourceRecordCount > forecastData.sourceRecords.length" class="mt-1 text-xs text-gray-500">Showing the latest {{ forecastData.sourceRecords.length }}; export the CSV for the monthly totals.</p>
+                    </div>
+                </details>
+            </template>
+        </section>
     </div>
 </template>

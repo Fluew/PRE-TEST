@@ -25,22 +25,27 @@ const resolvedVariant = computed<StatusVariant>(() => {
     const normalized = String(props.status).trim().toLowerCase();
 
     // Success / positive
-    if (['in stock', 'delivered', 'completed', 'approved', 'active', 'verified', 'safe', 'converted', 'received', 'success', 'paid'].includes(normalized)) {
+    if (['in stock', 'delivered', 'completed', 'approved', 'active', 'verified', 'safe', 'converted', 'received', 'success', 'paid',
+        'accepted', 'converted to sales order', 'confirmed', 'picked up', 'issued'].includes(normalized)) {
         return 'success';
     }
 
     // Warning / attention required
-    if (['low stock', 'pending', 'pending payment', 'pending inspection', 'pending review', 'needs reorder', 'in transit', 'soon', 'warning', 'partially received'].includes(normalized)) {
+    if (['low stock', 'pending', 'pending payment', 'pending inspection', 'pending review', 'needs reorder', 'in transit', 'soon', 'warning', 'partially received',
+        'for approval', 'awaiting supplier pricing', 'payment submitted', 'under verification', 'on hold', 'order confirmed', 'preparing order', 'unpaid'].includes(normalized)) {
         return 'warning';
     }
 
     // Danger / destructive
-    if (['out of stock', 'critical low', 'cancelled', 'canceled', 'rejected', 'expired', 'revoked', 'urgent', 'danger', 'failed', 'inactive', 'deactivated', 'deleted'].includes(normalized)) {
+    if (['out of stock', 'critical low', 'cancelled', 'canceled', 'rejected', 'expired', 'revoked', 'urgent', 'danger', 'failed', 'inactive', 'deactivated', 'deleted',
+        'payment rejected', 'delivery failed', 'delivery attempt failed', 'returned'].includes(normalized)) {
         return 'danger';
     }
 
     // Informational / blue
-    if (['sent', 'ordered', 'submitted', 'in progress', 'info', 'reviewing'].includes(normalized)) {
+    if (['sent', 'ordered', 'submitted', 'in progress', 'info', 'reviewing',
+        'under review', 'under preparation', 'preparing', 'sent to customer', 'ready for delivery', 'processing', 'partially paid', 'ready for dispatch', 'ready for pickup',
+        'out for delivery', 'partially delivered', 'partially picked up', 'delivery rescheduled', 'refunded'].includes(normalized)) {
         return 'info';
     }
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Head, Link } from '@inertiajs/vue3';
-import { ShieldAlert, Laptop, ArrowRight, Home, RefreshCw, Lock } from '@lucide/vue';
+import { ShieldAlert, Laptop, ArrowRight, Home, RefreshCw, Lock, KeyRound } from '@lucide/vue';
 import { Button } from '@/components/ui/button';
 
 defineOptions({
@@ -30,62 +30,69 @@ const reloadPage = () => {
 </script>
 
 <template>
-    <Head title="Access Denied - MRP ElectroDesk" />
+    <Head title="Access Denied | MR-Pride" />
 
-    <div class="space-y-6">
+    <div class="space-y-4 sm:space-y-4.5">
         <!-- Shield Icon & Warning Banner -->
-        <div class="rounded-xl border border-red-200/80 bg-red-50/70 p-6 text-center">
+        <div class="rounded-xl border border-red-400/40 bg-red-500/20 p-5 text-center text-white sm:p-6">
             <div
-                class="mx-auto mb-4 flex size-14 items-center justify-center rounded-xl bg-red-100 text-red-600"
+                class="mx-auto mb-3 flex size-12 items-center justify-center rounded-full bg-red-400/30 text-red-200 sm:size-14"
             >
-                <ShieldAlert class="size-7" />
+                <ShieldAlert class="size-6 sm:size-7" />
             </div>
 
-            <h3 class="text-lg font-semibold tracking-tight text-red-950">
+            <h3 class="text-base font-semibold tracking-tight text-white sm:text-lg">
                 {{ title }}
             </h3>
 
-            <p class="mt-2 text-xs leading-relaxed text-red-800/90 sm:text-sm">
+            <p class="mt-1.5 text-xs leading-relaxed text-white/90 sm:text-sm">
                 {{ message }}
             </p>
         </div>
 
         <!-- Technical explanation card -->
-        <div class="rounded-xl border border-gray-200/80 bg-white/60 p-4 text-xs text-gray-600">
+        <div class="rounded-xl border border-white/20 bg-white/10 p-3.5 text-xs leading-relaxed text-white/90 sm:p-4">
             <div class="flex items-start gap-3">
-                <div class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[#4b5320]/10 text-[#4b5320]">
+                <div class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[#F8B803] font-semibold text-gray-950 sm:size-8.5">
                     <Lock class="size-4" />
                 </div>
-                <div>
-                    <h4 class="font-semibold text-gray-900">
-                        Browser-Based Trusted Device Identity
+                <div class="min-w-0 flex-1">
+                    <h4 class="text-xs font-semibold text-white sm:text-sm">
+                        Zero-Trust Workstation Policy
                     </h4>
-                    <p class="mt-1 leading-relaxed text-gray-600">
-                        MRP ElectroDesk enforces zero-trust role-based access. Only authorized and pre-enrolled browser
-                        installations receive the cryptographic credential required to open the login portal.
+                    <p class="mt-0.5 text-[11px] text-white/80 sm:text-xs">
+                        Only verified workstations holding an authorized cryptographic credential can open the login portal.
                     </p>
                 </div>
             </div>
         </div>
 
         <!-- Action Buttons -->
-        <div class="flex flex-col gap-2.5 pt-2">
+        <div class="space-y-2.5 pt-1">
             <Link
                 v-if="canEnroll"
                 href="/device/enroll"
-                class="flex w-full items-center justify-center gap-2 rounded-xl bg-[#F8B803] py-2.5 text-sm font-semibold text-gray-950 transition-colors hover:bg-[#fac52e] focus:outline-none"
+                class="flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl bg-[#F8B803] py-2.5 text-xs font-semibold text-gray-950 shadow-md transition-colors hover:bg-[#fac52e] focus:outline-none sm:py-3 sm:text-sm"
             >
                 <Laptop class="size-4" />
-                Enroll With Code
+                Enroll Workstation
                 <ArrowRight class="size-4" />
             </Link>
 
-            <div class="flex gap-2">
+            <Link
+                href="/device/recover"
+                class="flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-white/20 bg-white/10 py-2.5 text-xs font-semibold text-white transition-colors hover:bg-white/20 focus:outline-none sm:py-3 sm:text-sm"
+            >
+                <KeyRound class="size-3.5 text-[#F8B803]" />
+                Admin Emergency Recovery Key
+            </Link>
+
+            <div class="flex gap-2 pt-1">
                 <Button
                     type="button"
                     variant="outline"
                     @click="reloadPage"
-                    class="flex-1 rounded-xl border-gray-200 py-2.5 text-xs font-semibold text-gray-700 hover:bg-gray-100"
+                    class="flex-1 cursor-pointer rounded-xl border-white/20 bg-white/10 py-2.5 text-xs font-semibold text-white hover:bg-white/20 sm:py-3"
                 >
                     <RefreshCw class="mr-1.5 size-3.5" />
                     Retry
@@ -93,7 +100,7 @@ const reloadPage = () => {
 
                 <Link
                     href="/"
-                    class="flex flex-1 items-center justify-center gap-1.5 rounded-xl border border-gray-200 bg-white py-2.5 text-xs font-semibold text-gray-700 hover:bg-gray-100"
+                    class="flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-xl border-white/20 bg-white/10 py-2.5 text-xs font-semibold text-white hover:bg-white/20 sm:py-3"
                 >
                     <Home class="size-3.5" />
                     Home Page

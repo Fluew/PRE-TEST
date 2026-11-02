@@ -16,6 +16,10 @@ import {
 } from 'chart.js';
 import { Line, Bar, Doughnut } from 'vue-chartjs';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
+import { type Evaluation } from '@/components/evaluation/ScoreBreakdown.vue';
+import ProductPriorityBreakdown, { type ProductPriority } from '@/components/evaluation/ProductPriorityBreakdown.vue';
+import SupplierEvaluationBreakdown from '@/components/evaluation/SupplierEvaluationBreakdown.vue';
+import { useCurrency } from '@/composables/useCurrency';
 import {
   Package,
   AlertTriangle,
@@ -125,19 +129,22 @@ interface ProcurementItem {
 }
 
 interface SupplierAhpItem {
-    rank: number;
+    rank: number | null;
     id: number;
     name: string;
     contact_person: string;
     email: string;
     phone: string;
-    ahp_score: number;
+    /** 0–100, null when the evaluation lacks data. */
+    ahp_score: number | null;
+    classification: string | null;
+    complete: boolean;
     metrics: {
-        price: number;
-        quality: number;
-        delivery: number;
-        service: number;
+        price: number | null;
+        quality: number | null;
+        delivery: number | null;
     };
+    evaluation: Evaluation & { period?: { from: string; to: string } };
     status: string;
 }
 
@@ -220,6 +227,10 @@ const props = defineProps<{
         historical: number[];
         forecast: (number | null)[];
         year: number;
+        window: number;
+        hasData: boolean;
+        steps: { month: string; inputs: { month: string; units: number }[]; sum: number; window: number; forecast: number }[];
+        sourceRecordCount: number;
     };
     procurementAnalytics: {
         statusDistribution: Record<string, number>;
@@ -229,16 +240,37 @@ const props = defineProps<{
     ahpAnalytics: {
         topSuppliers: SupplierAhpItem[];
         suppliersList: SupplierAhpItem[];
+        weights: { delivery: number; price: number; quality: number };
+        deliverySplit: { on_time: number; fulfillment: number };
+        periodMonths: number;
+        classes: Record<string, string>;
+    };
+    productPriority: {
+        items: ProductPriority[];
+        weights: { demand: number; stock: number; movement: number; supplier_availability: number };
+        classes: Record<string, string>;
+        movementMonths: number;
+        smaWindow: number;
     };
 }>();
+
+// Calculation breakdowns: same backend results as Inventory, Suppliers and Demand Forecasting.
+const stepByMonth = computed(() => new Map(props.forecastAnalytics.steps.map((s) => [s.month, s])));
+const selectedProductPriority = ref<ProductPriority | null>(null);
+const selectedSupplierEval = ref<SupplierAhpItem | null>(null);
+const priorityContribution = (p: ProductPriority, key: string) => p.criteria.find((c) => c.key === key);
+const pctW = (w: number) => `${Math.round(w * 100)}%`;
+const priorityKeys = ['demand', 'stock', 'movement', 'supplier_availability'];
+// Class thresholds come from config as {minScore: label}; shown highest first.
+const classBands = (classes: Record<string, string>) =>
+    Object.entries(classes).map(([min, label]) => ({ min: Number(min), label })).sort((a, b) => b.min - a.min);
 
 const page = usePage();
 const teamSlug = computed(() => (page.props as any).currentTeam?.slug || (page.props as any).team?.slug || '');
 
-// Currency and number formatters
-const formatCurrency = (amount: number) => {
-    return new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' }).format(amount);
-};
+// Currency and number formatters. Stored amounts are USD; shown in the user's display currency
+// (header switch). Money charts plot toDisplayAmount() values and label them with formatDisplayAmount().
+const { formatMoney: formatCurrency, toDisplayAmount, formatDisplayAmount, displayCurrency } = useCurrency();
 const formatNumber = (num: number) => {
     return new Intl.NumberFormat('en-PH').format(num);
 };
@@ -246,7 +278,7 @@ const formatNumber = (num: number) => {
 // ─────────────────────────────────────────────────────────────
 // ACTIVE TAB SELECTION
 // ─────────────────────────────────────────────────────────────
-type TabKey = 'overview' | 'inventory' | 'low-stock' | 'sales' | 'forecast' | 'procurement' | 'ahp';
+type TabKey = 'overview' | 'inventory' | 'low-stock' | 'sales' | 'forecast' | 'procurement' | 'priority' | 'ahp';
 const activeTab = ref<TabKey>('overview');
 
 // ─────────────────────────────────────────────────────────────
@@ -422,8 +454,8 @@ const categoryBarData = computed(() => ({
 const topValueBarData = computed(() => ({
     labels: props.inventoryAnalytics.topProductsByValuation.map(p => p.name.length > 18 ? p.name.substring(0, 18) + '...' : p.name),
     datasets: [{
-        label: 'Total Valuation (₱)',
-        data: props.inventoryAnalytics.topProductsByValuation.map(p => p.valuation),
+        label: `Total Valuation (${displayCurrency.value})`,
+        data: props.inventoryAnalytics.topProductsByValuation.map(p => toDisplayAmount(p.valuation)),
         backgroundColor: 'rgba(248, 184, 3, 0.85)', // gold
         borderRadius: 6,
     }],
@@ -444,8 +476,8 @@ const lowStockSeverityData = computed(() => ({
 const salesRevenueTrendData = computed(() => ({
     labels: props.quotationsSalesAnalytics.salesTrend.labels,
     datasets: [{
-        label: 'Sales Revenue (₱)',
-        data: props.quotationsSalesAnalytics.salesTrend.data,
+        label: `Sales Revenue (${displayCurrency.value})`,
+        data: props.quotationsSalesAnalytics.salesTrend.data.map(v => toDisplayAmount(v)),
         borderColor: '#10b981',
         backgroundColor: 'rgba(16, 185, 129, 0.1)',
         fill: true,
@@ -494,7 +526,7 @@ const forecastChartData = computed(() => ({
             pointRadius: 3,
         },
         {
-            label: 'SMA-3 Forecast (+8% Trend)',
+            label: 'SMA-3 Forecast',
             data: props.forecastAnalytics.forecast,
             borderColor: '#F8B803',
             borderDash: [5, 5],
@@ -522,10 +554,10 @@ const procurementDonutData = computed(() => {
 
 // 10. AHP Top Suppliers Bar Chart
 const ahpBarData = computed(() => ({
-    labels: props.ahpAnalytics.topSuppliers.map(s => s.name),
+    labels: props.ahpAnalytics.topSuppliers.filter(s => s.complete).map(s => s.name),
     datasets: [{
-        label: 'AHP Composite Score (0.000 - 1.000)',
-        data: props.ahpAnalytics.topSuppliers.map(s => s.ahp_score),
+        label: 'Supplier Evaluation Score (0–100)',
+        data: props.ahpAnalytics.topSuppliers.filter(s => s.complete).map(s => s.ahp_score),
         backgroundColor: '#4b5320',
         borderRadius: 6,
     }],
@@ -555,6 +587,29 @@ const horizontalBarOptions = {
         y: { ticks: { font: { size: 11 } } },
     },
 };
+
+// Money charts: axis ticks and tooltips in the display currency (the plotted values already are).
+const moneyTick = (value: number | string) => formatDisplayAmount(value, { decimals: 0 });
+const moneyTooltip = (axis: 'x' | 'y') => ({
+    callbacks: {
+        label: (ctx: any) => `${ctx.dataset.label ?? ''}: ${formatDisplayAmount(ctx.parsed?.[axis])}`,
+    },
+});
+
+const moneyLineOptions = computed(() => ({
+    ...standardChartOptions,
+    plugins: { ...standardChartOptions.plugins, tooltip: moneyTooltip('y') },
+    scales: { y: { ticks: { callback: moneyTick } } },
+}));
+
+const moneyHorizontalBarOptions = computed(() => ({
+    ...horizontalBarOptions,
+    plugins: { ...horizontalBarOptions.plugins, tooltip: moneyTooltip('x') },
+    scales: {
+        ...horizontalBarOptions.scales,
+        x: { ...horizontalBarOptions.scales.x, ticks: { ...horizontalBarOptions.scales.x.ticks, callback: moneyTick } },
+    },
+}));
 </script>
 
 <template>
@@ -729,7 +784,7 @@ const horizontalBarOptions = {
                 <div class="flex items-center justify-between border-b border-gray-100 py-2">
                     <span class="text-gray-500">Top supplier (AHP)</span>
                     <span class="font-medium text-gray-900">
-                        {{ ahpAnalytics.topSuppliers[0]?.name || 'No evaluation yet' }}<template v-if="ahpAnalytics.topSuppliers[0]?.ahp_score"> ({{ Number(ahpAnalytics.topSuppliers[0].ahp_score).toFixed(3) }})</template>
+                        {{ ahpAnalytics.topSuppliers[0]?.name || 'No evaluation yet' }}<template v-if="ahpAnalytics.topSuppliers[0]?.complete"> ({{ Number(ahpAnalytics.topSuppliers[0].ahp_score).toFixed(2) }})</template><template v-else-if="ahpAnalytics.topSuppliers[0]"> (insufficient data)</template>
                     </span>
                 </div>
             </div>
@@ -747,7 +802,8 @@ const horizontalBarOptions = {
                         { key: 'sales', label: 'Quotations & Sales', icon: Banknote },
                         { key: 'forecast', label: 'Demand Forecasting', icon: LineChart },
                         { key: 'procurement', label: 'Purchasing & Procurement', icon: ShoppingCart },
-                        { key: 'ahp', label: 'AHP Supplier Prioritization', icon: Award },
+                        { key: 'priority', label: 'AHP Product Prioritization', icon: Package },
+                        { key: 'ahp', label: 'Supplier Evaluation', icon: Award },
                     ]"
                     :key="tab.key"
                     @click="activeTab = tab.key as TabKey"
@@ -780,7 +836,7 @@ const horizontalBarOptions = {
                             </span>
                         </div>
                         <div class="h-64">
-                            <Line :data="salesRevenueTrendData" :options="standardChartOptions" />
+                            <Line :data="salesRevenueTrendData" :options="moneyLineOptions" />
                         </div>
                     </div>
 
@@ -840,7 +896,7 @@ const horizontalBarOptions = {
                             </button>
                         </div>
                         <div class="h-60">
-                            <Bar :data="topValueBarData" :options="horizontalBarOptions" />
+                            <Bar :data="topValueBarData" :options="moneyHorizontalBarOptions" />
                         </div>
                     </div>
                 </div>
@@ -864,7 +920,7 @@ const horizontalBarOptions = {
                         <h4 class="text-sm font-semibold text-gray-900 mb-1">Inventory Valuation by Category</h4>
                         <p class="text-xs text-gray-400 mb-3">Capital value allocated across product lines</p>
                         <div class="h-52">
-                            <Bar :data="topValueBarData" :options="horizontalBarOptions" />
+                            <Bar :data="topValueBarData" :options="moneyHorizontalBarOptions" />
                         </div>
                     </div>
                 </div>
@@ -961,8 +1017,8 @@ const horizontalBarOptions = {
                                     <td class="py-3 px-4 text-gray-600">{{ item.supplier_name }}</td>
                                     <td class="py-3 px-4 text-center font-semibold text-gray-900">{{ item.current_stock }} {{ item.unit }}</td>
                                     <td class="py-3 px-4 text-center text-gray-500">{{ item.reorder_threshold }}</td>
-                                    <td class="py-3 px-4 text-right font-medium text-gray-700">₱{{ Number(item.cost_price || item.price).toFixed(2) }}</td>
-                                    <td class="py-3 px-4 text-right font-semibold text-gray-900">₱{{ Number(item.total_valuation).toFixed(2) }}</td>
+                                    <td class="py-3 px-4 text-right font-medium text-gray-700">{{ formatCurrency(item.cost_price || item.price) }}</td>
+                                    <td class="py-3 px-4 text-right font-semibold text-gray-900">{{ formatCurrency(item.total_valuation) }}</td>
                                     <td class="py-3 px-4 text-center">
                                         <span
                                             :class="[
@@ -1158,7 +1214,7 @@ const horizontalBarOptions = {
                             </span>
                         </div>
                         <div class="h-56">
-                            <Line :data="salesRevenueTrendData" :options="standardChartOptions" />
+                            <Line :data="salesRevenueTrendData" :options="moneyLineOptions" />
                         </div>
                     </div>
 
@@ -1248,9 +1304,9 @@ const horizontalBarOptions = {
                                     <td class="py-3 px-4 font-mono font-semibold text-gray-900">{{ s.invoice_number }}</td>
                                     <td class="py-3 px-4 font-medium text-gray-800">{{ s.client_name }}</td>
                                     <td class="py-3 px-4 text-gray-500">{{ s.sale_date }}</td>
-                                    <td class="py-3 px-4 text-right text-gray-600">₱{{ s.subtotal.toFixed(2) }}</td>
-                                    <td class="py-3 px-4 text-right text-gray-600">₱{{ s.tax_amount.toFixed(2) }}</td>
-                                    <td class="py-3 px-4 text-right font-semibold text-gray-900">₱{{ s.grand_total.toFixed(2) }}</td>
+                                    <td class="py-3 px-4 text-right text-gray-600">{{ formatCurrency(s.subtotal) }}</td>
+                                    <td class="py-3 px-4 text-right text-gray-600">{{ formatCurrency(s.tax_amount) }}</td>
+                                    <td class="py-3 px-4 text-right font-semibold text-gray-900">{{ formatCurrency(s.grand_total) }}</td>
                                     <td class="py-3 px-4 text-gray-600">{{ s.payment_method }}</td>
                                     <td class="py-3 px-4 text-center">
                                         <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800">
@@ -1285,7 +1341,7 @@ const horizontalBarOptions = {
                                     <td class="py-3 px-4 font-medium text-gray-800">{{ q.client_name }}</td>
                                     <td class="py-3 px-4 text-gray-500">{{ q.quotation_date ? q.quotation_date.split('T')[0] : '—' }}</td>
                                     <td class="py-3 px-4 text-gray-500">{{ q.valid_until ? q.valid_until.split('T')[0] : '—' }}</td>
-                                    <td class="py-3 px-4 text-right font-semibold text-gray-900">₱{{ q.grand_total.toFixed(2) }}</td>
+                                    <td class="py-3 px-4 text-right font-semibold text-gray-900">{{ formatCurrency(q.grand_total) }}</td>
                                     <td class="py-3 px-4 text-center">
                                         <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-700">
                                             {{ q.status }}
@@ -1334,14 +1390,20 @@ const horizontalBarOptions = {
                         <div>
                             <h4 class="text-sm font-semibold text-gray-900 mb-2">SMA Calculation Transparent Breakdown</h4>
                             <p class="text-xs text-gray-500 mb-4 leading-relaxed">
-                                MR-PRIDE uses a 3-month Simple Moving Average with an 8% seasonal expansion factor for baseline buffer safety.
+                                {{ forecastAnalytics.window }}-month Simple Moving Average: the plain average of the {{ forecastAnalytics.window }} previous months.
+                                Monthly demand = the larger of outgoing stock movements and units on confirmed, processing or completed Sales Orders.
+                                Months with no records count as 0; nothing is estimated.
                             </p>
                             <div class="p-3 bg-gray-50 border border-gray-100 rounded-xl font-mono text-xs text-gray-700 space-y-1">
-                                <div>SMA(n) = [ D(m-1) + D(m-2) + D(m-3) ] / 3</div>
-                                <div class="text-[#4b5320] font-semibold">Forecast = SMA(n) × 1.08</div>
+                                <div>SMA = (Sum of sales during selected period) / (Number of periods)</div>
+                                <div>SMA-3 = (Sales Month 1 + Sales Month 2 + Sales Month 3) / 3</div>
+                                <div class="text-[#4b5320] font-semibold">Forecast for next month = SMA</div>
                             </div>
-                            <p class="text-[11px] text-gray-400 mt-3">
-                                Transparent formula compliant for capstone audit and panel inspection.
+                            <p v-if="!forecastAnalytics.hasData" class="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-800">
+                                Insufficient data: no sales or outgoing stock records for {{ forecastAnalytics.year }}, so no forecast is shown.
+                            </p>
+                            <p v-else class="text-[11px] text-gray-400 mt-3">
+                                Based on {{ forecastAnalytics.sourceRecordCount }} recorded transactions. Per-product SMA inputs are in the AHP Product Prioritization tab (View Calculation → Demand Forecasting).
                             </p>
                         </div>
 
@@ -1369,7 +1431,7 @@ const horizontalBarOptions = {
                                     <th class="py-3 px-4">Period</th>
                                     <th class="py-3 px-4 text-center">Historical Demand (Units)</th>
                                     <th class="py-3 px-4 text-center">SMA-3 Forecast (Units)</th>
-                                    <th class="py-3 px-4 text-right">Variance / Trend Factor</th>
+                                    <th class="py-3 px-4 text-right">Step-by-step SMA</th>
                                 </tr>
                             </thead>
                             <tbody class="divide-y divide-gray-100">
@@ -1380,7 +1442,11 @@ const horizontalBarOptions = {
                                         {{ forecastAnalytics.forecast[idx] !== null ? `${forecastAnalytics.forecast[idx]} units` : '— (N/A)' }}
                                     </td>
                                     <td class="py-3 px-4 text-right text-gray-500">
-                                        {{ idx >= 3 ? '+8% seasonal buffer' : 'Initialization baseline' }}
+                                        <template v-if="stepByMonth.get(`${mLabel} ${forecastAnalytics.year}`)">
+                                            ({{ stepByMonth.get(`${mLabel} ${forecastAnalytics.year}`)!.inputs.map((i) => i.units).join(' + ') }}) / {{ forecastAnalytics.window }}
+                                            = {{ stepByMonth.get(`${mLabel} ${forecastAnalytics.year}`)!.sum }} / {{ forecastAnalytics.window }}
+                                        </template>
+                                        <template v-else>Needs {{ forecastAnalytics.window }} prior months</template>
                                     </td>
                                 </tr>
                             </tbody>
@@ -1468,7 +1534,7 @@ const horizontalBarOptions = {
                                     <td class="py-3 px-4 text-gray-700">{{ r.supplier_name }}</td>
                                     <td class="py-3 px-4 text-gray-600">{{ r.requested_by }}</td>
                                     <td class="py-3 px-4 text-center font-semibold text-gray-900">{{ r.quantity }}</td>
-                                    <td class="py-3 px-4 text-right font-semibold text-gray-900">₱{{ r.estimated_cost.toFixed(2) }}</td>
+                                    <td class="py-3 px-4 text-right font-semibold text-gray-900">{{ formatCurrency(r.estimated_cost) }}</td>
                                     <td class="py-3 px-4 text-center">
                                         <span
                                             :class="[
@@ -1490,15 +1556,121 @@ const horizontalBarOptions = {
             </div>
 
             <!-- ═════════════════════════════════════════════════════ -->
-            <!-- TAB 7: AHP SUPPLIER PRIORITIZATION                    -->
+            <!-- TAB 7: AHP PRODUCT PRIORITIZATION                     -->
+            <!-- ═════════════════════════════════════════════════════ -->
+            <div v-else-if="activeTab === 'priority'" class="space-y-6">
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div class="bg-white border border-gray-200 rounded-xl p-5">
+                        <h4 class="text-sm font-semibold text-gray-900 mb-2">AHP Methodology and Criteria Weights</h4>
+                        <p class="text-xs text-gray-500 mb-3 leading-relaxed">
+                            Each criterion is normalized to a 0–100 score, multiplied by its fixed weight, and the weighted results are added.
+                            A higher score means a higher replenishment priority. Weights are the approved fixed configuration and cannot be changed in the UI.
+                        </p>
+                        <table class="w-full text-left text-xs">
+                            <thead><tr class="text-gray-500"><th class="py-1">Criterion</th><th class="text-right">Weight</th></tr></thead>
+                            <tbody>
+                                <tr class="border-t border-gray-100"><td class="py-1.5">Demand Forecasting</td><td class="text-right font-mono">{{ pctW(productPriority.weights.demand) }}</td></tr>
+                                <tr class="border-t border-gray-100"><td class="py-1.5">Current Stock</td><td class="text-right font-mono">{{ pctW(productPriority.weights.stock) }}</td></tr>
+                                <tr class="border-t border-gray-100"><td class="py-1.5">Product Movement</td><td class="text-right font-mono">{{ pctW(productPriority.weights.movement) }}</td></tr>
+                                <tr class="border-t border-gray-100"><td class="py-1.5">Supplier Availability</td><td class="text-right font-mono">{{ pctW(productPriority.weights.supplier_availability) }}</td></tr>
+                            </tbody>
+                        </table>
+                        <p class="mt-3 p-2.5 rounded-lg bg-gray-50 border border-gray-100 font-mono text-[11px] text-gray-700">
+                            AHP Score = (Demand × {{ productPriority.weights.demand }}) + (Current Stock × {{ productPriority.weights.stock }}) + (Product Movement × {{ productPriority.weights.movement }}) + (Supplier Availability × {{ productPriority.weights.supplier_availability }})
+                        </p>
+                        <p class="mt-2 text-[11px] text-gray-500">
+                            <span v-for="b in classBands(productPriority.classes)" :key="b.min" class="mr-2">{{ b.label }} ≥ {{ b.min }}</span>
+                        </p>
+                    </div>
+
+                    <div class="bg-white border border-gray-200 rounded-xl p-5">
+                        <h4 class="text-sm font-semibold text-gray-900 mb-2">Criteria Scoring (normalized 0–100)</h4>
+                        <div class="space-y-2 text-xs">
+                            <div class="p-2.5 rounded-lg bg-gray-50 border border-gray-100">
+                                <p class="font-semibold text-gray-800">Demand Forecasting</p>
+                                <p class="font-mono text-[11px] text-gray-600">(SMA-{{ productPriority.smaWindow }} forecast / Highest forecast) × 100</p>
+                                <p class="text-[11px] text-gray-500">Higher forecasted demand → higher priority.</p>
+                            </div>
+                            <div class="p-2.5 rounded-lg bg-gray-50 border border-gray-100">
+                                <p class="font-semibold text-gray-800">Current Stock</p>
+                                <p class="font-mono text-[11px] text-gray-600">(1 − Available stock / Highest available stock) × 100</p>
+                                <p class="text-[11px] text-gray-500">Available = on hand − reserved. Lower stock → higher priority.</p>
+                            </div>
+                            <div class="p-2.5 rounded-lg bg-gray-50 border border-gray-100">
+                                <p class="font-semibold text-gray-800">Product Movement</p>
+                                <p class="font-mono text-[11px] text-gray-600">(Units moved / Highest units moved) × 100</p>
+                                <p class="text-[11px] text-gray-500">Last {{ productPriority.movementMonths }} complete months. Faster-moving → higher priority.</p>
+                            </div>
+                            <div class="p-2.5 rounded-lg bg-gray-50 border border-gray-100">
+                                <p class="font-semibold text-gray-800">Supplier Availability</p>
+                                <p class="font-mono text-[11px] text-gray-600">(1 − Available suppliers / Verified suppliers) × 100</p>
+                                <p class="text-[11px] text-gray-500">Fewer suppliers able to supply → harder sourcing → higher priority.</p>
+                            </div>
+                            <div class="p-2.5 rounded-lg bg-gray-50 border border-gray-100">
+                                <p class="font-semibold text-gray-800">Reorder recommendation</p>
+                                <p class="text-[11px] text-gray-500">Reorder when available stock ≤ reorder level or &lt; SMA forecast. Suggested quantity = max(reorder quantity, forecast − available).</p>
+                            </div>
+                            <p class="text-[11px] text-amber-700">A criterion without data is "insufficient data": it is not counted as 0, its weight is not moved, and the product gets no final score.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white border border-gray-200 rounded-xl overflow-hidden">
+                    <div class="p-4 border-b border-gray-200">
+                        <h3 class="text-base font-semibold text-gray-900">Weighted Contributions per Product</h3>
+                        <p class="text-xs text-gray-500">Score (0–100) → weighted contribution for each criterion. Same results as the Inventory page.</p>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse text-xs">
+                            <thead>
+                                <tr class="bg-gray-50/80 border-b border-gray-200 text-gray-600 font-semibold text-[11px]">
+                                    <th class="py-3 px-4 text-center">Rank</th>
+                                    <th class="py-3 px-4">Product</th>
+                                    <th class="py-3 px-4 text-center">Demand</th>
+                                    <th class="py-3 px-4 text-center">Current Stock</th>
+                                    <th class="py-3 px-4 text-center">Movement</th>
+                                    <th class="py-3 px-4 text-center">Supplier Avail.</th>
+                                    <th class="py-3 px-4 text-center text-[#4b5320]">AHP Score</th>
+                                    <th class="py-3 px-4">Priority</th>
+                                    <th class="py-3 px-4">Reorder</th>
+                                    <th class="py-3 px-4 text-center">Calculation</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-100">
+                                <tr v-if="!productPriority.items.length">
+                                    <td colspan="10" class="py-8 text-center text-gray-400">No active products.</td>
+                                </tr>
+                                <tr v-for="(p, i) in productPriority.items" :key="p.product.id" class="hover:bg-gray-50/70">
+                                    <td class="py-3 px-4 text-center font-semibold text-gray-700">{{ p.complete ? `#${i + 1}` : '—' }}</td>
+                                    <td class="py-3 px-4">
+                                        <div class="font-semibold text-gray-900">{{ p.product.name }}</div>
+                                        <div class="font-mono text-[11px] text-gray-500">{{ p.product.sku }}</div>
+                                    </td>
+                                    <td v-for="k in priorityKeys" :key="k" class="py-3 px-4 text-center font-mono">
+                                        <template v-if="priorityContribution(p, k)?.available">{{ priorityContribution(p, k)!.score!.toFixed(2) }} → {{ priorityContribution(p, k)!.weighted!.toFixed(2) }}</template>
+                                        <span v-else class="font-sans text-amber-700">Insufficient data</span>
+                                    </td>
+                                    <td class="py-3 px-4 text-center font-semibold text-[#4b5320]">{{ p.complete ? p.score!.toFixed(2) : 'Incomplete' }}</td>
+                                    <td class="py-3 px-4 text-gray-700">{{ p.classification ?? 'Not classified' }}</td>
+                                    <td class="py-3 px-4" :class="p.reorder.needed ? 'text-amber-700 font-medium' : 'text-gray-500'">{{ p.reorder.needed ? `Reorder ${p.reorder.suggested_quantity}` : 'No' }}</td>
+                                    <td class="py-3 px-4 text-center"><button type="button" class="text-xs font-medium text-[#4b5320] hover:underline" @click="selectedProductPriority = p">View Calculation</button></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═════════════════════════════════════════════════════ -->
+            <!-- TAB 8: SUPPLIER EVALUATION                    -->
             <!-- ═════════════════════════════════════════════════════ -->
             <div v-else-if="activeTab === 'ahp'" class="space-y-6">
                 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
                     <div class="lg:col-span-2 bg-white border border-gray-200 rounded-xl p-5">
                         <div class="flex justify-between items-start mb-4">
                             <div>
-                                <h4 class="text-sm font-semibold text-gray-900">AHP Supplier Composite Ranking</h4>
-                                <p class="text-xs text-gray-400">Analytic Hierarchy Process multi-criteria prioritization scores</p>
+                                <h4 class="text-sm font-semibold text-gray-900">Supplier Evaluation Ranking</h4>
+                                <p class="text-xs text-gray-400">Weighted scores from delivery, quotation and inspection records</p>
                             </div>
                             <SpecularButton variant="secondary" size="sm" :radius="8" @click="downloadReport('ahp')">
                                 <Download class="w-3.5 h-3.5 mr-1 inline" />
@@ -1512,32 +1684,34 @@ const horizontalBarOptions = {
 
                     <div class="bg-white border border-gray-200 rounded-xl p-5 flex flex-col justify-between">
                         <div>
-                            <h4 class="text-sm font-semibold text-gray-900 mb-2">AHP Criteria Weighting</h4>
-                            <p class="text-xs text-gray-500 mb-4 leading-relaxed">
-                                Suppliers are evaluated across three normalized decision criteria:
+                            <h4 class="text-sm font-semibold text-gray-900 mb-2">Supplier Evaluation Methodology</h4>
+                            <p class="text-xs text-gray-500 mb-3 leading-relaxed">
+                                Calculated only from recorded transactions in the last {{ ahpAnalytics.periodMonths }} months. Nobody can enter or edit a score.
+                                Weights are the approved fixed configuration (config/evaluation.php).
                             </p>
                             <div class="space-y-2 text-xs">
-                                <div class="flex flex-col p-2.5 rounded-lg bg-gray-50 border border-gray-100">
-                                    <div class="flex justify-between items-center mb-0.5">
-                                        <span class="font-semibold text-gray-800">1. Price / Cost</span>
-                                        <span class="text-gray-500 font-mono text-[11px]">Weight (0-10)</span>
-                                    </div>
-                                    <span class="text-[11px] text-gray-500">price competitiveness of the supplier</span>
+                                <div class="p-2.5 rounded-lg bg-gray-50 border border-gray-100">
+                                    <div class="flex justify-between"><span class="font-semibold text-gray-800">1. Inbound Delivery Performance</span><span class="font-mono">{{ pctW(ahpAnalytics.weights.delivery) }}</span></div>
+                                    <p class="mt-1 font-mono text-[11px] text-gray-600">(On-time rate × {{ ahpAnalytics.deliverySplit.on_time }}) + (Quantity fulfillment × {{ ahpAnalytics.deliverySplit.fulfillment }})</p>
+                                    <p class="text-[11px] text-gray-500">Deliveries vs. the purchase order's promised date; accepted vs. ordered quantity.</p>
                                 </div>
-                                <div class="flex flex-col p-2.5 rounded-lg bg-gray-50 border border-gray-100">
-                                    <div class="flex justify-between items-center mb-0.5">
-                                        <span class="font-semibold text-gray-800">2. Quality</span>
-                                        <span class="text-gray-500 font-mono text-[11px]">Weight (0-10)</span>
-                                    </div>
-                                    <span class="text-[11px] text-gray-500">quality of product of the supplier evaluated by the staffs</span>
+                                <div class="p-2.5 rounded-lg bg-gray-50 border border-gray-100">
+                                    <div class="flex justify-between"><span class="font-semibold text-gray-800">2. Price Competitiveness</span><span class="font-mono">{{ pctW(ahpAnalytics.weights.price) }}</span></div>
+                                    <p class="mt-1 font-mono text-[11px] text-gray-600">Average of (Lowest quoted price / Supplier's price) × 100</p>
+                                    <p class="text-[11px] text-gray-500">Verified, unexpired quotes for the same product, unit, currency and tax basis.</p>
                                 </div>
-                                <div class="flex flex-col p-2.5 rounded-lg bg-gray-50 border border-gray-100">
-                                    <div class="flex justify-between items-center mb-0.5">
-                                        <span class="font-semibold text-gray-800">3. Delivery Reliability</span>
-                                        <span class="text-gray-500 font-mono text-[11px]">Weight (0-10)</span>
-                                    </div>
-                                    <span class="text-[11px] text-gray-500">reliability of supplier in terms on delivery to MR Pride</span>
+                                <div class="p-2.5 rounded-lg bg-gray-50 border border-gray-100">
+                                    <div class="flex justify-between"><span class="font-semibold text-gray-800">3. Product Quality</span><span class="font-mono">{{ pctW(ahpAnalytics.weights.quality) }}</span></div>
+                                    <p class="mt-1 font-mono text-[11px] text-gray-600">(Accepted units / Inspected units) × 100</p>
+                                    <p class="text-[11px] text-gray-500">Goods-receipt inspection records.</p>
                                 </div>
+                                <p class="p-2.5 rounded-lg bg-gray-50 border border-gray-100 font-mono text-[11px] text-gray-700">
+                                    Score = (Delivery × {{ ahpAnalytics.weights.delivery }}) + (Price × {{ ahpAnalytics.weights.price }}) + (Quality × {{ ahpAnalytics.weights.quality }})
+                                </p>
+                                <p class="text-[11px] text-gray-500">
+                                    <span v-for="b in classBands(ahpAnalytics.classes)" :key="b.min" class="mr-2">{{ b.label }} ≥ {{ b.min }}</span>
+                                </p>
+                                <p class="text-[11px] text-amber-700">A criterion without records is "insufficient data": it is not counted as 0, and the supplier gets no final score or rank.</p>
                             </div>
                         </div>
 
@@ -1548,7 +1722,7 @@ const horizontalBarOptions = {
                             @click="router.visit(`/${teamSlug}/suppliers`)"
                             class="w-full mt-4"
                         >
-                            Run AHP Evaluation Matrix →
+                            Open Supplier Module →
                         </SpecularButton>
                     </div>
                 </div>
@@ -1566,39 +1740,75 @@ const horizontalBarOptions = {
                                     <th class="py-3 px-4">Supplier Name</th>
                                     <th class="py-3 px-4">Contact Person</th>
                                     <th class="py-3 px-4">Phone / Email</th>
-                                    <th class="py-3 px-4 text-center font-semibold text-[#4b5320]">Composite AHP Score</th>
-                                    <th class="py-3 px-4 text-center">Price</th>
-                                    <th class="py-3 px-4 text-center">Quality</th>
-                                    <th class="py-3 px-4 text-center">Delivery</th>
-                                    <th class="py-3 px-4 text-center">Service</th>
+                                    <th class="py-3 px-4 text-center font-semibold text-[#4b5320]">Evaluation Score</th>
+                                    <th class="py-3 px-4 text-center">Delivery ({{ pctW(ahpAnalytics.weights.delivery) }})</th>
+                                    <th class="py-3 px-4 text-center">Price ({{ pctW(ahpAnalytics.weights.price) }})</th>
+                                    <th class="py-3 px-4 text-center">Quality ({{ pctW(ahpAnalytics.weights.quality) }})</th>
+                                    <th class="py-3 px-4 text-center">Classification</th>
                                     <th class="py-3 px-4 text-center">Status</th>
+                                    <th class="py-3 px-4 text-center">Calculation</th>
                                 </tr>
                             </thead>
                             <tbody class="divide-y divide-gray-100">
                                 <tr v-if="!ahpAnalytics.suppliersList.length">
-                                    <td colspan="10" class="py-8 text-center text-gray-400">No suppliers registered.</td>
+                                    <td colspan="11" class="py-8 text-center text-gray-400">No suppliers registered.</td>
                                 </tr>
                                 <tr v-for="s in ahpAnalytics.suppliersList" :key="s.id" class="hover:bg-gray-50/70">
-                                    <td class="py-3 px-4 text-center font-semibold text-gray-700">#{{ s.rank }}</td>
+                                    <td class="py-3 px-4 text-center font-semibold text-gray-700">{{ s.rank ? `#${s.rank}` : '—' }}</td>
                                     <td class="py-3 px-4 font-semibold text-gray-900">{{ s.name }}</td>
                                     <td class="py-3 px-4 text-gray-700">{{ s.contact_person }}</td>
                                     <td class="py-3 px-4 text-gray-500 font-mono">{{ s.phone }}</td>
                                     <td class="py-3 px-4 text-center font-semibold text-[#4b5320] text-sm">
-                                        {{ Number(s.ahp_score).toFixed(3) }}
+                                        {{ s.complete ? Number(s.ahp_score).toFixed(2) : 'Insufficient data' }}
                                     </td>
-                                    <td class="py-3 px-4 text-center text-gray-600">{{ s.metrics?.price ?? '—' }}/10</td>
-                                    <td class="py-3 px-4 text-center text-gray-600">{{ s.metrics?.quality ?? '—' }}/10</td>
-                                    <td class="py-3 px-4 text-center text-gray-600">{{ s.metrics?.delivery ?? '—' }}/10</td>
-                                    <td class="py-3 px-4 text-center text-gray-600">{{ s.metrics?.service ?? '—' }}/10</td>
+                                    <td v-for="k in (['delivery', 'price', 'quality'] as const)" :key="k" class="py-3 px-4 text-center text-gray-600">{{ s.metrics?.[k] != null ? Number(s.metrics[k]).toFixed(2) : '—' }}</td>
+                                    <td class="py-3 px-4 text-center text-gray-600">{{ s.classification ?? 'Not classified' }}</td>
                                     <td class="py-3 px-4 text-center">
                                         <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800">
                                             {{ s.status }}
                                         </span>
                                     </td>
+                                    <td class="py-3 px-4 text-center"><button type="button" class="text-xs font-medium text-[#4b5320] hover:underline" @click="selectedSupplierEval = s">View Calculation</button></td>
                                 </tr>
                             </tbody>
                         </table>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Calculation breakdown modals (same components as Inventory and Suppliers) -->
+        <div v-if="selectedProductPriority" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 print:hidden" @click.self="selectedProductPriority = null">
+            <div class="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-gray-200 bg-white" role="dialog" aria-modal="true" aria-labelledby="rp-priority-title">
+                <div class="flex items-start justify-between gap-3 border-b border-gray-100 px-6 py-4">
+                    <div>
+                        <h3 id="rp-priority-title" class="text-base font-semibold text-gray-900">{{ selectedProductPriority.product.name }}</h3>
+                        <p class="font-mono text-xs text-gray-500">{{ selectedProductPriority.product.sku }}</p>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-xl font-semibold text-gray-900">{{ selectedProductPriority.complete ? `${selectedProductPriority.score!.toFixed(2)} / 100` : 'Incomplete' }}</div>
+                        <div class="text-xs text-gray-500">{{ selectedProductPriority.classification ?? 'Not classified' }}</div>
+                    </div>
+                </div>
+                <div class="overflow-y-auto px-6 py-4"><ProductPriorityBreakdown :priority="selectedProductPriority" /></div>
+                <div class="flex justify-end border-t border-gray-100 bg-gray-50/50 px-6 py-3">
+                    <button type="button" class="secondary-button" @click="selectedProductPriority = null">Close</button>
+                </div>
+            </div>
+        </div>
+
+        <div v-if="selectedSupplierEval" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 print:hidden" @click.self="selectedSupplierEval = null">
+            <div class="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-gray-200 bg-white" role="dialog" aria-modal="true" aria-labelledby="rp-supplier-title">
+                <div class="flex items-start justify-between gap-3 border-b border-gray-100 px-6 py-4">
+                    <h3 id="rp-supplier-title" class="text-base font-semibold text-gray-900">{{ selectedSupplierEval.name }}</h3>
+                    <div class="text-right">
+                        <div class="text-xl font-semibold text-gray-900">{{ selectedSupplierEval.complete ? `${Number(selectedSupplierEval.ahp_score).toFixed(2)} / 100` : 'Insufficient data' }}</div>
+                        <div class="text-xs text-gray-500">{{ selectedSupplierEval.rank ? `Rank #${selectedSupplierEval.rank} · ` : '' }}{{ selectedSupplierEval.classification ?? 'Not classified' }}</div>
+                    </div>
+                </div>
+                <div class="overflow-y-auto px-6 py-4"><SupplierEvaluationBreakdown :evaluation="selectedSupplierEval.evaluation" :weights="ahpAnalytics.weights" /></div>
+                <div class="flex justify-end border-t border-gray-100 bg-gray-50/50 px-6 py-3">
+                    <button type="button" class="secondary-button" @click="selectedSupplierEval = null">Close</button>
                 </div>
             </div>
         </div>

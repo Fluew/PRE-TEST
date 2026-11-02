@@ -4,7 +4,7 @@ export const brandSheets: Record<
     { src: string; width: number; height: number; regions: string[] }
 > = {
     A: {
-        src: '/PRODUCT_A.png',
+        src: '/PRODUCT_A.webp',
         width: 498,
         height: 501,
         regions: [
@@ -26,7 +26,7 @@ export const brandSheets: Record<
         ],
     },
     B: {
-        src: '/PRODUCT_B.png',
+        src: '/PRODUCT_B.webp',
         width: 629,
         height: 397,
         regions: [
@@ -45,7 +45,7 @@ export const brandSheets: Record<
         ],
     },
     C: {
-        src: '/PRODUCT_C.png',
+        src: '/PRODUCT_C.webp',
         width: 677,
         height: 186,
         regions: [

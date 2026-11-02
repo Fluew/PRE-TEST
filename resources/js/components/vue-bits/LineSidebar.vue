@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, onBeforeUnmount } from 'vue';
 import { Link } from '@inertiajs/vue3';
 import { useCurrentUrl } from '@/composables/useCurrentUrl';
 import { useSidebar } from '@/components/ui/sidebar';
@@ -33,94 +33,79 @@ function closeOnMobile() {
   }
 }
 
-// Proximity interactive tracking
+// Proximity effect: each item gets a --proximity value (0..1) that its CSS turns into a shift and
+// icon scale. It is written straight to the DOM per frame, so Vue never re-renders the list.
 const listContainerRef = ref<HTMLElement | null>(null);
-const itemRefs = ref<HTMLElement[]>([]);
-
-const cursorY = ref<number | null>(null);
-const isHovering = ref(false);
-
-// Proximity scores per item (0 to 1)
-const proximityScores = ref<number[]>(props.items.map(() => 0));
-let targetScores = props.items.map(() => 0);
-let animationFrameId: number | null = null;
+const itemEls: HTMLElement[] = [];
+let centers: number[] = [];
+const current: number[] = [];
+let target: number[] = [];
+let frame: number | null = null;
 
 function setItemRef(el: any, index: number) {
   if (el) {
-    itemRefs.value[index] = el.$el || el;
+    itemEls[index] = (el.$el || el) as HTMLElement;
   }
 }
 
-function handleMouseMove(e: MouseEvent) {
-  if (!listContainerRef.value) return;
-  const containerRect = listContainerRef.value.getBoundingClientRect();
-  cursorY.value = e.clientY - containerRect.top;
-  isHovering.value = true;
-
-  updateTargetScores();
-}
-
-function handleMouseLeave() {
-  isHovering.value = false;
-  cursorY.value = null;
-  targetScores = props.items.map(() => 0);
-}
-
-function updateTargetScores() {
-  if (!isHovering.value || cursorY.value === null || !listContainerRef.value) {
-    targetScores = props.items.map(() => 0);
-    return;
-  }
-
-  const radius = props.proximityRadius;
-  const containerTop = listContainerRef.value.getBoundingClientRect().top;
-
-  targetScores = props.items.map((_, i) => {
-    const el = itemRefs.value[i];
-    if (!el) return 0;
+// Item positions only change on scroll or collapse, so measure once per hover, not per move.
+function measure() {
+  centers = itemEls.map((el) => {
     const rect = el.getBoundingClientRect();
-    const itemCenter = rect.top + rect.height / 2 - containerTop;
-    const distance = Math.abs((cursorY.value as number) - itemCenter);
-
-    if (distance >= radius) return 0;
-    const t = 1 - distance / radius;
-    // Cubic smoothstep easing
-    return t * t * (3 - 2 * t);
+    return rect.top + rect.height / 2;
   });
 }
 
-// Lerp animation loop for organic fluid transitions
-function startAnimationLoop() {
-  const tick = () => {
-    let hasChanged = false;
-    for (let i = 0; i < proximityScores.value.length; i++) {
-      const current = proximityScores.value[i] || 0;
-      const target = targetScores[i] || 0;
-      const diff = target - current;
+function handleMouseMove(e: MouseEvent) {
+  if (isCollapsed.value) return;
+  if (centers.length === 0) measure();
 
-      if (Math.abs(diff) > 0.003) {
-        proximityScores.value[i] = current + diff * 0.18;
-        hasChanged = true;
-      } else if (current !== target) {
-        proximityScores.value[i] = target;
-        hasChanged = true;
-      }
-    }
-
-    animationFrameId = requestAnimationFrame(tick);
-  };
-
-  animationFrameId = requestAnimationFrame(tick);
+  const radius = props.proximityRadius;
+  target = centers.map((center) => {
+    const distance = Math.abs(e.clientY - center);
+    if (distance >= radius) return 0;
+    const t = 1 - distance / radius;
+    return t * t * (3 - 2 * t); // smoothstep
+  });
+  animate();
 }
 
-onMounted(() => {
-  startAnimationLoop();
-});
+function forgetPositions() {
+  centers = [];
+}
+
+function handleMouseLeave() {
+  forgetPositions();
+  target = target.map(() => 0);
+  animate();
+}
+
+function animate() {
+  if (frame === null) frame = requestAnimationFrame(tick);
+}
+
+// Eases each item toward its target and stops as soon as everything has settled.
+function tick() {
+  frame = null;
+  let moving = false;
+
+  itemEls.forEach((el, i) => {
+    const from = current[i] ?? 0;
+    const to = target[i] ?? 0;
+    const next = Math.abs(to - from) > 0.003 ? from + (to - from) * 0.18 : to;
+
+    if (next !== to) moving = true;
+    if (next !== from) {
+      current[i] = next;
+      el.style.setProperty('--proximity', next.toFixed(3));
+    }
+  });
+
+  if (moving) animate();
+}
 
 onBeforeUnmount(() => {
-  if (animationFrameId !== null) {
-    cancelAnimationFrame(animationFrameId);
-  }
+  if (frame !== null) cancelAnimationFrame(frame);
 });
 </script>
 
@@ -139,6 +124,7 @@ onBeforeUnmount(() => {
       ref="listContainerRef"
       @mousemove="handleMouseMove"
       @mouseleave="handleMouseLeave"
+      @wheel.passive="forgetPositions"
       class="relative flex flex-col gap-1 w-full"
       aria-label="Admin Operations"
     >
@@ -160,11 +146,7 @@ onBeforeUnmount(() => {
               ? 'bg-[#F8B803] font-bold text-gray-950 shadow-sm'
               : 'text-white/80 hover:text-white hover:bg-white/10'
           ]"
-          :style="{
-            transform: !isCollapsed && proximityScores[index]
-              ? `translateX(${proximityScores[index] * maxShift}px)`
-              : undefined,
-          }"
+          :style="isCollapsed ? undefined : { transform: `translateX(calc(var(--proximity, 0) * ${maxShift}px))` }"
         >
 
           <!-- Item Index Numbering (e.g. 01, 02) -->
@@ -190,11 +172,7 @@ onBeforeUnmount(() => {
                 ? 'text-gray-950 stroke-[2.2]'
                 : 'text-white/85 group-hover/item:text-white stroke-[1.8]'
             ]"
-            :style="{
-              transform: proximityScores[index] > 0.1 && !isCurrentUrl(item.href)
-                ? `scale(${1 + proximityScores[index] * 0.15})`
-                : undefined,
-            }"
+            :style="isCurrentUrl(item.href) ? undefined : { transform: 'scale(calc(1 + var(--proximity, 0) * 0.15))' }"
           />
 
           <!-- Navigation Label Title -->

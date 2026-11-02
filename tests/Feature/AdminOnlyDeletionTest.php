@@ -47,7 +47,7 @@ dataset('deletable modules', [
         PurchaseRequest::class,
         fn (Team $t) => PurchaseRequest::create([
             'team_id' => $t->id, 'request_number' => 'PR-DEL-1', 'quantity' => 5,
-            'estimated_cost' => 100, 'status' => 'Requested', 'requested_at' => now(),
+            'estimated_cost' => 100, 'status' => 'Pending Approval', 'requested_at' => now(),
         ]),
         fn ($r) => "procurement/{$r->id}",
     ],
@@ -84,7 +84,7 @@ dataset('deletable modules', [
         fn (Team $t) => Sale::create([
             'team_id' => $t->id, 'invoice_number' => 'INV-DEL-1', 'client_name' => 'Someone',
             'sale_date' => now(), 'subtotal' => 100, 'discount' => 0, 'tax_amount' => 0,
-            'grand_total' => 100, 'status' => 'Completed',
+            'grand_total' => 100, 'status' => 'cancelled', // only cancelled orders can be archived
         ]),
         fn ($r) => "sales/{$r->id}",
     ],

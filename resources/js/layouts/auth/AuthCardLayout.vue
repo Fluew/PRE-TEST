@@ -25,7 +25,7 @@ defineProps<{
                 :href="home()"
                 class="flex items-center gap-2 self-center"
             >
-                <img src="/LOGO_MR_PRIDE.png" alt="MR-Pride Logo" class="w-12 h-12 object-contain" />
+                <img src="/LOGO_MR_PRIDE.webp" alt="MR-Pride Logo" class="w-12 h-12 object-contain" />
                 <div class="flex flex-col justify-center leading-none text-left">
                     <span class="text-xl font-bold tracking-tight text-gray-900 dark:text-white">MR-PRIDE</span>
                     <span class="text-[10px] font-bold tracking-widest text-gray-500 uppercase mt-0.5">Electrical Supplies</span>

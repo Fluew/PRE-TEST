@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Enums\SalesOrderStatus;
 use App\Models\Product;
 use App\Models\Quotation;
 use App\Models\Sale;
@@ -9,6 +10,7 @@ use App\Models\StockMovement;
 use App\Models\Supplier;
 use App\Models\Team;
 use App\Models\TeamInvitation;
+use App\Services\Suppliers\SupplierEvaluator;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -60,26 +62,24 @@ class DashboardController extends Controller
         $recentActivity = [];
 
         if ($team) {
-            $stats['totalProducts'] = Product::where('team_id', $team->id)->where('is_active', true)->count();
-            $stats['lowStockCount'] = Product::where('team_id', $team->id)->where('is_active', true)->where('status', 'Low Stock')->count();
-            $stats['todaySales'] = (float) Sale::where('team_id', $team->id)->whereDate('sale_date', today())->sum('grand_total');
+            $productCounts = Product::where('team_id', $team->id)
+                ->where('is_active', true)
+                ->selectRaw("COUNT(*) as total, SUM(CASE WHEN status = 'Low Stock' THEN 1 ELSE 0 END) as low_stock")
+                ->first();
+            $stats['totalProducts'] = (int) ($productCounts->total ?? 0);
+            $stats['lowStockCount'] = (int) ($productCounts->low_stock ?? 0);
+            // Confirmed orders only: unpaid or cancelled orders are not sales yet.
+            $stats['todaySales'] = (float) Sale::where('team_id', $team->id)->whereIn('status', SalesOrderStatus::countedInSales())->whereDate('sale_date', today())->sum('grand_total');
 
-            $topSupplier = Supplier::where('team_id', $team->id)
-                ->where('status', 'Active')
-                ->whereNotNull('ahp_score')
-                ->orderByDesc('ahp_score')
-                ->first(['id', 'name', 'ahp_score']);
-
-            if (! $topSupplier) {
-                $topSupplier = Supplier::where('team_id', $team->id)
-                    ->orderByDesc('ahp_score')
-                    ->first(['id', 'name', 'ahp_score']);
-            }
-
-            if ($topSupplier) {
+            // Highest record-based Supplier Evaluation among active suppliers with complete data.
+            $top = collect(app(SupplierEvaluator::class)->forTeam($team->id))
+                ->filter(fn ($e) => $e['complete'] && $e['supplier']['status'] === 'Active')
+                ->sortByDesc('score')
+                ->first();
+            if ($top) {
                 $stats['topSupplier'] = [
-                    'name' => $topSupplier->name,
-                    'score' => $topSupplier->ahp_score !== null ? number_format((float) $topSupplier->ahp_score, 3) : 'N/A',
+                    'name' => $top['supplier']['name'],
+                    'score' => number_format($top['score'], 2).' / 100 ('.$top['classification'].')',
                 ];
             }
 
@@ -91,7 +91,7 @@ class DashboardController extends Controller
                 ->map(fn ($q) => [
                     'id' => $q->quotation_number,
                     'type' => 'Quotation',
-                    'status' => $q->status instanceof \BackedEnum ? $q->status->value : (string) $q->status,
+                    'status' => $q->status?->label() ?? '',
                     'created_at' => $q->created_at,
                 ]);
 
@@ -100,7 +100,7 @@ class DashboardController extends Controller
                 ->take(5)
                 ->get(['id', 'reference_number', 'type', 'created_at'])
                 ->map(fn ($m) => [
-                    'id' => $m->reference_number ?: ('MOV-' . $m->id),
+                    'id' => $m->reference_number ?: ('MOV-'.$m->id),
                     'type' => $m->type === 'stock_in' ? 'Stock In' : ($m->type === 'stock_out' ? 'Stock Out' : 'Adjustment'),
                     'status' => 'Completed',
                     'created_at' => $m->created_at,
@@ -109,11 +109,11 @@ class DashboardController extends Controller
             $recentSales = Sale::where('team_id', $team->id)
                 ->latest()
                 ->take(5)
-                ->get(['id', 'invoice_number', 'status', 'created_at'])
+                ->get(['id', 'order_number', 'invoice_number', 'status', 'created_at'])
                 ->map(fn ($s) => [
-                    'id' => $s->invoice_number,
-                    'type' => 'Sale',
-                    'status' => (string) $s->status,
+                    'id' => $s->order_number ?: $s->invoice_number,
+                    'type' => 'Sales Order',
+                    'status' => $s->status?->label() ?? '',
                     'created_at' => $s->created_at,
                 ]);
 
@@ -126,10 +126,10 @@ class DashboardController extends Controller
                 ->map(function ($item) {
                     $status = $item['status'];
                     $colorClass = match ($status) {
-                        'Approved', 'Completed', 'In Stock' => 'bg-green-500/10 text-green-500 border-green-500/20',
-                        'Pending' => 'bg-[#F8B803]/10 text-[#F8B803] border-[#F8B803]/20',
-                        'In Review' => 'bg-blue-500/10 text-blue-500 border-blue-500/20',
-                        'Draft' => 'bg-gray-500/10 text-gray-400 border-gray-500/20',
+                        'Approved', 'Accepted', 'Converted to Sales Order', 'Confirmed', 'Completed', 'In Stock' => 'bg-green-500/10 text-green-500 border-green-500/20',
+                        'Pending', 'Pending Review', 'For Approval', 'Pending Payment' => 'bg-[#F8B803]/10 text-[#F8B803] border-[#F8B803]/20',
+                        'In Review', 'Under Review', 'Sent to Customer', 'Processing' => 'bg-blue-500/10 text-blue-500 border-blue-500/20',
+                        'Draft', 'Under Preparation' => 'bg-gray-500/10 text-gray-400 border-gray-500/20',
                         'Rejected', 'Cancelled', 'Expired', 'Out of Stock' => 'bg-red-500/10 text-red-500 border-red-500/20',
                         default => 'bg-gray-500/10 text-gray-500 border-gray-500/20',
                     };

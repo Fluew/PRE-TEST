@@ -18,6 +18,8 @@ class AuditLog extends Model
         'user_email',
         'target_user_id',
         'target_user_email',
+        'subject_type',
+        'subject_id',
         'event',
         'action_type',
         'description',

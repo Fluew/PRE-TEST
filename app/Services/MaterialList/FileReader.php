@@ -30,7 +30,37 @@ class FileReader
 
     public const EXTENSIONS = ['pdf', 'xlsx', 'xls', 'csv', 'jpg', 'jpeg', 'png'];
 
+    /** Limits for this reader. The defaults are the public quotation form's; see forStaffImports(). */
+    private int $maxBytes = self::MAX_BYTES;
+
+    private int $maxPdfPages = self::MAX_PDF_PAGES;
+
+    private ?int $maxRows = self::MAX_ROWS;
+
+    private int $maxSheets = self::MAX_SHEETS;
+
+    /** Return the rows of every sheet (each keeps its own header row) instead of the best one. */
+    private bool $allSheets = false;
+
+    /** Staff document imports: 25 MB per file, no row limit, every sheet. */
+    public const STAFF_MAX_BYTES = 25 * 1024 * 1024;
+
+    /** A technical cap only: each scanned page takes seconds of OCR. */
+    public const STAFF_MAX_PDF_PAGES = 300;
+
     public function __construct(private OcrEngine $ocr) {}
+
+    public function forStaffImports(): static
+    {
+        $copy = clone $this;
+        $copy->maxBytes = self::STAFF_MAX_BYTES;
+        $copy->maxPdfPages = self::STAFF_MAX_PDF_PAGES;
+        $copy->maxRows = null;
+        $copy->maxSheets = 100;
+        $copy->allSheets = true;
+
+        return $copy;
+    }
 
     /**
      * Check the file really is what its extension says. Returns the detected type.
@@ -48,8 +78,8 @@ class FileReader
         if (! $size) {
             throw new ExtractionException('The file is empty.', 'empty');
         }
-        if ($size > self::MAX_BYTES) {
-            throw new ExtractionException('The file is larger than 10 MB. Please upload a smaller file.', 'too_large');
+        if ($size > $this->maxBytes) {
+            throw new ExtractionException('The file is larger than '.intdiv($this->maxBytes, 1048576).' MB. Please upload a smaller file.', 'too_large');
         }
 
         $head = (string) file_get_contents($path, false, null, 0, 8);
@@ -131,6 +161,121 @@ class FileReader
         };
     }
 
+    /**
+     * Check that a file holds written content (words or a numbered list), not just a picture.
+     * Returns false when that cannot be checked because OCR is not installed on the server.
+     *
+     * @throws ExtractionException 'no_text' when nothing readable is found
+     */
+    public function assertHasText(string $path, string $type): bool
+    {
+        $coverage = null;
+        try {
+            if ($type === 'image') {
+                [$lines, $coverage] = self::linesFromTsv($this->ocr->imageToTsv($path));
+            } else {
+                $content = $this->read($path, $type);
+                $lines = isset($content['rows'])
+                    ? array_map(fn ($row) => implode("\t", array_map(fn ($c) => is_scalar($c) ? (string) $c : '', (array) $row)), $content['rows'])
+                    : MaterialParser::cleanLines($content['pages'] ?? []);
+            }
+        } catch (ExtractionException $e) {
+            if ($e->reason === 'ocr_unavailable') {
+                return false;
+            }
+            throw $e;
+        }
+
+        // A photo can show a little text (a sign, a label); a list or document fills more of the picture.
+        $tooLittleText = $coverage !== null && $coverage < self::MIN_IMAGE_TEXT_COVERAGE;
+
+        if ($tooLittleText || ! self::looksLikeWrittenList($lines)) {
+            throw new ExtractionException(
+                "We couldn't find any written text in this file. It looks like a photo. Please upload a document or a picture of a typed or handwritten list of the products you need.",
+                'no_text',
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * Lines of confidently read words from Tesseract TSV, and the share of the picture they cover.
+     *
+     * The share is null when the TSV has no page row (size unknown).
+     *
+     * @return array{0: array<int, string>, 1: ?float}
+     */
+    public static function linesFromTsv(string $tsv): array
+    {
+        $pageArea = 0;
+        $textArea = 0;
+        $lines = [];
+        foreach (explode("\n", $tsv) as $i => $row) {
+            $c = explode("\t", rtrim($row, "\r"));
+            if ($i === 0 || count($c) < 12) {
+                continue;
+            }
+            if ($c[0] === '1') {
+                $pageArea += (int) $c[8] * (int) $c[9];
+
+                continue;
+            }
+            $word = trim($c[11]);
+            if ($c[0] !== '5' || $word === '' || (float) $c[10] < 50) {
+                continue;
+            }
+            $textArea += (int) $c[8] * (int) $c[9];
+            $lines["{$c[1]}-{$c[2]}-{$c[3]}-{$c[4]}"][] = $word;
+        }
+
+        return [array_values(array_map(fn ($words) => implode(' ', $words), $lines)), $pageArea > 0 ? $textArea / $pageArea : null];
+    }
+
+    /** Minimum share of an image covered by readable words for it to count as a list, not a photo. */
+    public const MIN_IMAGE_TEXT_COVERAGE = 0.015;
+
+    /**
+     * True when the lines read like a list or text: at least two numbered/bulleted lines, or a few
+     * real words spread over two or more lines that are not mostly OCR noise.
+     *
+     * @param  array<int, string>  $lines
+     */
+    public static function looksLikeWrittenList(array $lines): bool
+    {
+        $numbered = 0;
+        $wordLines = 0;
+        $words = 0;
+        $tokens = 0;
+
+        foreach ($lines as $line) {
+            if (preg_match('/^\s*(?:\d{1,3}[.)\]]|[-*•])\s*\p{L}{2,}/u', $line)) {
+                $numbered++;
+            }
+            $lineTokens = preg_split('/\s+/u', trim($line), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $tokens += count($lineTokens);
+            $lineWords = 0;
+            foreach ($lineTokens as $token) {
+                // A word: 3+ letters with a vowel (OCR noise from photos is mostly consonant runs and symbols).
+                if (preg_match('/^[^\p{L}\p{N}]*(\p{L}{3,})[^\p{L}\p{N}]*$/u', $token, $m) && preg_match('/[aeiouy]/i', $m[1])) {
+                    $lineWords++;
+                } elseif (preg_match('/^\d+(?:[.,]\d+)?[a-z]{0,4}$/i', $token)) {
+                    $lineWords += 0.5; // quantities and sizes ("10", "2.5mm", "100m")
+                }
+            }
+            $words += $lineWords;
+            if ($lineWords >= 1) {
+                $wordLines++;
+            }
+        }
+
+        if ($numbered >= 2) {
+            return true;
+        }
+
+        return $wordLines >= 2 && $words >= 4 && $tokens > 0 && $words / $tokens >= 0.4;
+    }
+
     /** @return array<int, array<int, string>> */
     private function readCsv(string $path): array
     {
@@ -173,7 +318,7 @@ class FileReader
         fwrite($stream, $bytes);
         rewind($stream);
         $rows = [];
-        while (($row = fgetcsv($stream, null, $best[0], '"', '')) !== false && count($rows) < self::MAX_ROWS) {
+        while (($row = fgetcsv($stream, null, $best[0], '"', '')) !== false && ($this->maxRows === null || count($rows) < $this->maxRows)) {
             $rows[] = array_slice(array_map(fn ($c) => (string) $c, $row), 0, self::MAX_COLS);
         }
         fclose($stream);
@@ -200,9 +345,10 @@ class FileReader
 
         $sheets = [];
         $best = null;
-        foreach (array_slice($book->getAllSheets(), 0, self::MAX_SHEETS) as $sheet) {
+        $all = [];
+        foreach (array_slice($book->getAllSheets(), 0, $this->maxSheets) as $sheet) {
             $rows = [];
-            $maxRow = min($sheet->getHighestDataRow(), self::MAX_ROWS);
+            $maxRow = $this->maxRows === null ? $sheet->getHighestDataRow() : min($sheet->getHighestDataRow(), $this->maxRows);
             $maxCol = min(Coordinate::columnIndexFromString($sheet->getHighestDataColumn()), self::MAX_COLS);
             for ($r = 1; $r <= $maxRow; $r++) {
                 $row = [];
@@ -219,13 +365,16 @@ class FileReader
             $found = HeaderMapper::findHeaderRow($rows);
             $score = count($found['mapping']) + (HeaderMapper::isConfident($found['mapping']) ? 10 : 0);
             $sheets[] = $sheet->getTitle();
+            if ($this->allSheets) {
+                array_push($all, ...$rows);
+            }
             if ($best === null || $score > $best['score']) {
                 $best = ['score' => $score, 'rows' => $rows, 'title' => $sheet->getTitle()];
             }
         }
         $book->disconnectWorksheets();
 
-        return ['method' => 'spreadsheet', 'rows' => $best['rows'] ?? [], 'sheet' => $best['title'] ?? null, 'sheets' => $sheets];
+        return ['method' => 'spreadsheet', 'rows' => $this->allSheets ? $all : ($best['rows'] ?? []), 'sheet' => $best['title'] ?? null, 'sheets' => $sheets];
     }
 
     /**
@@ -285,8 +434,8 @@ class FileReader
         }
 
         $pages = $pdf->getPages();
-        if (count($pages) > self::MAX_PDF_PAGES) {
-            throw new ExtractionException('This PDF has '.count($pages).' pages. Please upload a file with at most '.self::MAX_PDF_PAGES.' pages.', 'too_many_pages');
+        if (count($pages) > $this->maxPdfPages) {
+            throw new ExtractionException('This PDF has '.count($pages).' pages. Please upload a file with at most '.$this->maxPdfPages.' pages.', 'too_many_pages');
         }
         if ($pages === []) {
             throw new ExtractionException('This PDF has no pages.', 'empty');

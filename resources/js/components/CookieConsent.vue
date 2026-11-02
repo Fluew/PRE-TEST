@@ -5,8 +5,11 @@ import { Cookie, X, Check, Shield } from '@lucide/vue';
 const CONSENT_STORAGE_KEY = 'mrpride_cookie_consent';
 
 const isVisible = ref(false);
+// Teleports are not part of the server-rendered HTML, so only mount after hydration.
+const mounted = ref(false);
 
 onMounted(() => {
+    mounted.value = true;
     try {
         const consent = localStorage.getItem(CONSENT_STORAGE_KEY);
         if (!consent) {
@@ -50,7 +53,7 @@ function dismiss() {
 </script>
 
 <template>
-    <Teleport to="body">
+    <Teleport v-if="mounted" to="body">
         <Transition
             enter-active-class="transition duration-400 ease-out"
             enter-from-class="opacity-0 translate-y-8 scale-95"

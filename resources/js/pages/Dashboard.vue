@@ -2,6 +2,7 @@
 import { Head, Link, usePage } from '@inertiajs/vue3';
 import { computed, defineAsyncComponent, shallowRef } from 'vue';
 import PendingInvitationsModal from '@/components/PendingInvitationsModal.vue';
+import { useCurrency } from '@/composables/useCurrency';
 import { dashboard } from '@/routes';
 import { index as quotationsRoute } from '@/routes/admin/quotations';
 import { index as inventoryRoute } from '@/routes/inventory';
@@ -126,13 +127,8 @@ const isFirstTimeLogin = computed(() => {
     return Boolean((page.props as any).auth?.is_first_login);
 });
 
-const formatCurrency = (val?: number) => {
-    return new Intl.NumberFormat('en-PH', {
-        style: 'currency',
-        currency: 'PHP',
-        maximumFractionDigits: 0,
-    }).format(val ?? 0);
-};
+const { formatMoney } = useCurrency();
+const formatCurrency = (val?: number) => formatMoney(val, { decimals: 0 });
 
 const displayActivities = computed(() => {
     if (props.recentActivity && props.recentActivity.length > 0) {

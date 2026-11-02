@@ -1,10 +1,15 @@
 <?php
 
+use App\Enums\DeliveryStatus;
 use App\Enums\TeamRole;
 use App\Models\OrderFulfillment;
+use App\Models\Product;
+use App\Models\Quotation;
 use App\Models\Sale;
 use App\Models\Team;
 use App\Models\User;
+use App\Services\Delivery\FulfillmentService;
+use App\Services\Sales\SalesOrderService;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Storage;
 
@@ -39,7 +44,7 @@ it('allows administrator to view all deliveries and assign delivery to delivery 
         'discount' => 0.00,
         'tax_amount' => 0.00,
         'grand_total' => 15000.00,
-        'status' => 'Completed',
+        'status' => 'completed',
         'processed_by_id' => $admin->id,
     ]);
 
@@ -47,11 +52,11 @@ it('allows administrator to view all deliveries and assign delivery to delivery 
         'team_id' => $this->team->id,
         'sale_id' => $sale->id,
         'fulfillment_number' => 'FUL-TEST-001',
-        'fulfillment_type' => 'Delivery',
+        'fulfillment_type' => 'delivery',
         'recipient_name' => 'Engr. Manuel Roxas',
         'contact_number' => '09175554433',
         'delivery_address' => 'Phase 2 Industrial Park, Calamba, Laguna',
-        'status' => 'Pending',
+        'status' => 'order_confirmed',
         'handled_by_id' => null,
     ]);
 
@@ -81,7 +86,7 @@ it('scopes dashboard so delivery staff views only their assigned deliveries whil
         'discount' => 0.00,
         'tax_amount' => 0.00,
         'grand_total' => 5000.00,
-        'status' => 'Completed',
+        'status' => 'completed',
         'processed_by_id' => $admin->id,
     ]);
 
@@ -90,10 +95,10 @@ it('scopes dashboard so delivery staff views only their assigned deliveries whil
         'team_id' => $this->team->id,
         'sale_id' => $sale->id,
         'fulfillment_number' => 'FUL-DRIVER1-01',
-        'fulfillment_type' => 'Delivery',
+        'fulfillment_type' => 'delivery',
         'recipient_name' => 'Customer A',
         'contact_number' => '09171111111',
-        'status' => 'Pending',
+        'status' => 'order_confirmed',
         'handled_by_id' => $driver1->id,
     ]);
 
@@ -102,10 +107,10 @@ it('scopes dashboard so delivery staff views only their assigned deliveries whil
         'team_id' => $this->team->id,
         'sale_id' => $sale->id,
         'fulfillment_number' => 'FUL-DRIVER2-02',
-        'fulfillment_type' => 'Delivery',
+        'fulfillment_type' => 'delivery',
         'recipient_name' => 'Customer B',
         'contact_number' => '09172222222',
-        'status' => 'Pending',
+        'status' => 'order_confirmed',
         'handled_by_id' => $driver2->id,
     ]);
 
@@ -140,7 +145,7 @@ function createTestSale(Team $team, User $user, string $invoicePrefix = 'INV-TES
         'discount' => 0.00,
         'tax_amount' => 0.00,
         'grand_total' => 1000.00,
-        'status' => 'Completed',
+        'status' => 'completed',
         'processed_by_id' => $user->id,
     ]);
 }
@@ -155,10 +160,10 @@ it('prevents delivery staff from updating another staff members delivery', funct
         'team_id' => $this->team->id,
         'sale_id' => $sale->id,
         'fulfillment_number' => 'FUL-SEC-01',
-        'fulfillment_type' => 'Delivery',
+        'fulfillment_type' => 'delivery',
         'recipient_name' => 'Secret Client',
         'contact_number' => '09173333333',
-        'status' => 'Pending',
+        'status' => 'order_confirmed',
         'handled_by_id' => $driver1->id,
     ]);
 
@@ -167,169 +172,128 @@ it('prevents delivery staff from updating another staff members delivery', funct
     $response->assertForbidden();
 });
 
+/** A confirmed order (approved credit terms) whose release is out for delivery with the driver. */
+function dispatchedDelivery(Team $team, User $driver): OrderFulfillment
+{
+    $admin = User::factory()->create(['role' => 'admin', 'current_team_id' => $team->id, 'password_changed_at' => now()]);
+    $product = Product::create(['team_id' => $team->id, 'sku' => 'DLV-'.uniqid(), 'name' => 'Panel Board', 'price' => 1000, 'stock' => 10, 'is_active' => true]);
+    $quotation = Quotation::create([
+        'team_id' => $team->id, 'quotation_number' => 'Q-'.uniqid(), 'client_name' => 'Warehouse Recipient', 'email' => 'site@example.com',
+        'address' => 'Bldg 5 Cyberzone, Ortigas', 'quotation_date' => now()->toDateString(), 'valid_until' => now()->addDays(10)->toDateString(),
+        'subtotal' => 1000, 'discount' => 0, 'tax_rate' => 0, 'tax_amount' => 0, 'grand_total' => 1000, 'status' => 'accepted',
+    ]);
+    $quotation->items()->create(['product_id' => $product->id, 'sku' => $product->sku, 'product_name' => $product->name, 'quantity' => 1, 'unit_price' => 1000, 'subtotal' => 1000]);
+
+    $orders = app(SalesOrderService::class);
+    [$sale] = $orders->createFromQuotation($quotation, $admin);
+    $orders->setTerms($sale, Sale::TERMS_CREDIT, null, 30, $admin);
+    $fulfillment = $sale->fresh()->fulfillment;
+    $fulfillment->update(['handled_by_id' => $driver->id]);
+
+    $service = app(FulfillmentService::class);
+    $release = $service->prepareRelease($fulfillment, [$sale->items()->sole()->id => 1], $admin);
+    $service->markReady($release, $admin);
+    $service->dispatch($release, $driver);
+
+    return $fulfillment->fresh();
+}
+
 it('enforces strict three-attempt limit and disables further attempts after 3/3', function () {
     [$driver, $driverCookies] = createDeliveryActor('staff_deliveries', $this->team);
+    $fulfillment = dispatchedDelivery($this->team, $driver);
+    $base = "/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}";
+    expect($fulfillment->status)->toBe(DeliveryStatus::OutForDelivery);
 
-    $sale = createTestSale($this->team, $driver, 'INV-ATTEMPT');
+    foreach ([1 => 'Customer unavailable', 2 => 'Customer unreachable', 3 => 'Customer refused delivery'] as $n => $reason) {
+        if ($n > 1) {
+            $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/start")->assertSessionHasNoErrors();
+        }
+        $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/attempt", ['reason' => $reason, 'remarks' => "Attempt {$n} did not work."])
+            ->assertSessionHasNoErrors();
 
-    $fulfillment = OrderFulfillment::create([
-        'team_id' => $this->team->id,
-        'sale_id' => $sale->id,
-        'fulfillment_number' => 'FUL-ATTEMPT-3X',
-        'fulfillment_type' => 'Delivery',
-        'recipient_name' => 'Warehouse Recipient',
-        'contact_number' => '09180009988',
-        'delivery_address' => 'Bldg 5 Cyberzone, Ortigas',
-        'status' => 'Pending',
-        'attempt_count' => 0,
-        'handled_by_id' => $driver->id,
-    ]);
+        $fulfillment->refresh();
+        expect($fulfillment->attempt_count)->toBe($n)
+            ->and($fulfillment->status)->toBe(DeliveryStatus::DeliveryAttemptFailed)
+            ->and($fulfillment->remaining_attempts)->toBe(3 - $n);
+    }
 
-    // 1. Start delivery -> Out for Delivery
-    $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/start")
-        ->assertSessionHasNoErrors();
-    expect($fulfillment->fresh()->status)->toBe('Out for Delivery');
-
-    // 2. Failed attempt 1
-    $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/attempt", [
-        'reason' => 'Customer unavailable',
-        'remarks' => 'Gate closed, security said office is closed today.',
-    ])->assertSessionHasNoErrors();
+    // No fourth try: neither dispatching again nor recording another attempt.
+    $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/start")->assertSessionHasErrors('error');
+    $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/attempt", ['reason' => 'Other reason', 'remarks' => 'Trying a fourth time anyway.'])
+        ->assertSessionHasErrors('error');
 
     $fulfillment->refresh();
-    expect($fulfillment->attempt_count)->toBe(1);
-    expect($fulfillment->status)->toBe('Delivery Attempt Failed');
-    expect($fulfillment->remaining_attempts)->toBe(2);
-
-    // 3. Retry delivery -> Out for Delivery -> Failed attempt 2
-    $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/start");
-    $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/attempt", [
-        'reason' => 'Customer unreachable',
-        'remarks' => 'Called 4 times, phone kept ringing with no answer.',
-    ])->assertSessionHasNoErrors();
-
-    $fulfillment->refresh();
-    expect($fulfillment->attempt_count)->toBe(2);
-    expect($fulfillment->status)->toBe('Delivery Attempt Failed');
-    expect($fulfillment->remaining_attempts)->toBe(1);
-
-    // 4. Retry delivery -> Out for Delivery -> Failed attempt 3
-    $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/start");
-    $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/attempt", [
-        'reason' => 'Customer refused delivery',
-        'remarks' => 'Customer refused to accept package citing site renovation delay.',
-    ])->assertSessionHasNoErrors();
-
-    $fulfillment->refresh();
-    expect($fulfillment->attempt_count)->toBe(3);
-    expect($fulfillment->status)->toBe('Maximum Attempts Reached');
-    expect($fulfillment->remaining_attempts)->toBe(0);
-
-    // 5. Attempt 4 must be strictly blocked by the system
-    $responseAttempt4 = $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/attempt", [
-        'reason' => 'Other reason',
-        'remarks' => 'Trying a fourth time anyway.',
-    ]);
-
-    $fulfillment->refresh();
-    expect($fulfillment->attempt_count)->toBe(3); // count must remain 3
-    expect($fulfillment->attemptLogs)->toHaveCount(6); // 3 start logs + 3 attempt logs
+    expect($fulfillment->attempt_count)->toBe(3)
+        ->and($fulfillment->attemptLogs()->where('attempt_number', '>', 0)->count())->toBe(3);
 });
 
 it('requires valid photo proof to mark delivery as Delivered and stops further attempts', function () {
     [$driver, $driverCookies] = createDeliveryActor('staff_deliveries', $this->team);
-
-    $sale = createTestSale($this->team, $driver, 'INV-PROOF');
-
-    $fulfillment = OrderFulfillment::create([
-        'team_id' => $this->team->id,
-        'sale_id' => $sale->id,
-        'fulfillment_number' => 'FUL-PROOF-TEST',
-        'fulfillment_type' => 'Delivery',
-        'recipient_name' => 'Engr. Santos',
-        'contact_number' => '09178887766',
-        'delivery_address' => 'Unit 102 Metro Tech Center',
-        'status' => 'Out for Delivery',
-        'attempt_count' => 1,
-        'handled_by_id' => $driver->id,
-    ]);
+    $fulfillment = dispatchedDelivery($this->team, $driver);
+    $base = "/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}";
 
     // 1. Missing proof photo -> fails validation
-    $responseNoProof = $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/deliver", [
-        'recipient_name' => 'Engr. Santos',
-    ]);
-    $responseNoProof->assertSessionHasErrors('proof_of_delivery');
+    $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/deliver", ['recipient_name' => 'Engr. Santos'])
+        ->assertSessionHasErrors('proof_of_delivery');
 
-    // 2. Invalid file type (e.g. text/pdf instead of jpg/png) -> fails validation
-    $fakePdf = UploadedFile::fake()->create('contract.pdf', 500, 'application/pdf');
-    $responsePdf = $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/deliver", [
-        'proof_of_delivery' => $fakePdf,
-    ]);
-    $responsePdf->assertSessionHasErrors('proof_of_delivery');
+    // 2. Invalid file type -> fails validation
+    $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/deliver", ['proof_of_delivery' => UploadedFile::fake()->create('contract.pdf', 500, 'application/pdf')])
+        ->assertSessionHasErrors('proof_of_delivery');
 
-    // 3. Valid JPG photo proof -> successfully marks Delivered
-    $proofPhoto = UploadedFile::fake()->image('delivery_receipt.jpg', 600, 600);
-    $responseSuccess = $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/deliver", [
-        'proof_of_delivery' => $proofPhoto,
+    // 3. Valid JPG photo proof -> delivered
+    $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/deliver", [
+        'proof_of_delivery' => UploadedFile::fake()->image('delivery_receipt.jpg', 600, 600),
         'recipient_name' => 'Engr. Santos (Signed)',
         'remarks' => 'Received in good physical condition with 2 boxes.',
-    ]);
-    $responseSuccess->assertSessionHasNoErrors();
+    ])->assertSessionHasNoErrors();
 
     $fulfillment->refresh();
-    expect($fulfillment->status)->toBe('Delivered');
-    expect($fulfillment->proof_of_delivery)->not->toBeNull();
-    expect($fulfillment->delivered_at)->not->toBeNull();
+    expect($fulfillment->status)->toBe(DeliveryStatus::Delivered)
+        ->and($fulfillment->proof_of_delivery)->not->toBeNull()
+        ->and($fulfillment->delivered_at)->not->toBeNull();
     Storage::disk('local')->assertExists($fulfillment->proof_of_delivery);
 
-    // Verify authenticated proof viewing
-    $this->actingAs($driver)->withCookies($driverCookies)->get("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/proof")
-        ->assertOk();
+    $this->actingAs($driver)->withCookies($driverCookies)->get("{$base}/proof")->assertOk();
 
-    // Delivered order stops further attempts
-    $responsePostDelivered = $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/attempt", [
-        'reason' => 'Other reason',
-        'remarks' => 'Should be blocked.',
-    ]);
-    expect($fulfillment->fresh()->status)->toBe('Delivered');
+    // A delivered order takes no more attempts.
+    $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/attempt", ['reason' => 'Other reason', 'remarks' => 'Should be blocked.'])
+        ->assertSessionHasErrors('error');
+    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::Delivered);
 });
 
 it('allows administrator to reschedule delivery and reset attempts after limit is reached', function () {
     [$admin, $adminCookies] = createDeliveryActor('admin', $this->team);
     [$driver, $driverCookies] = createDeliveryActor('staff_deliveries', $this->team);
-
-    $sale = createTestSale($this->team, $admin, 'INV-LIMIT');
-
-    $fulfillment = OrderFulfillment::create([
-        'team_id' => $this->team->id,
-        'sale_id' => $sale->id,
-        'fulfillment_number' => 'FUL-LIMIT-REACHED',
-        'fulfillment_type' => 'Delivery',
-        'recipient_name' => 'Alpha Plant',
-        'contact_number' => '09191234567',
-        'status' => 'Maximum Attempts Reached',
-        'attempt_count' => 3,
-        'handled_by_id' => $driver->id,
-    ]);
+    $fulfillment = dispatchedDelivery($this->team, $driver);
+    $service = app(FulfillmentService::class);
+    foreach (range(1, 3) as $n) {
+        $service->recordFailedAttempt($fulfillment->fresh(), 'Customer unavailable', 'Closed', null, $driver);
+        if ($n < 3) {
+            $service->retryDispatch($fulfillment->fresh(), $driver);
+        }
+    }
+    $base = "/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}";
 
     // Driver cannot reschedule
-    $this->actingAs($driver)->withCookies($driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/reschedule", [
+    $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/reschedule", [
         'delivery_schedule' => now()->addDays(2)->toDateTimeString(),
         'reset_attempts' => true,
     ])->assertForbidden();
 
     // Admin authorizes rescheduling with fresh attempts
     $newSchedule = now()->addDays(3)->toDateTimeString();
-    $this->actingAs($admin)->withCookies($adminCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/reschedule", [
+    $this->actingAs($admin)->withCookies($adminCookies)->post("{$base}/reschedule", [
         'delivery_schedule' => $newSchedule,
         'reset_attempts' => true,
         'notes' => 'Customer confirmed site is now open and ready for handover.',
     ])->assertSessionHasNoErrors();
 
     $fulfillment->refresh();
-    expect($fulfillment->status)->toBe('Pending');
-    expect($fulfillment->attempt_count)->toBe(0);
-    expect($fulfillment->remaining_attempts)->toBe(3);
-    expect($fulfillment->rescheduled_at)->not->toBeNull();
-    expect($fulfillment->rescheduled_by_id)->toBe($admin->id);
+    expect($fulfillment->status)->toBe(DeliveryStatus::ReadyForDelivery)
+        ->and($fulfillment->attempt_count)->toBe(0)
+        ->and($fulfillment->rescheduled_by_id)->toBe($admin->id);
+
+    // The driver can go again.
+    $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/start")->assertSessionHasNoErrors();
+    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::OutForDelivery);
 });

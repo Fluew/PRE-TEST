@@ -3,13 +3,16 @@
 use App\Http\Controllers\Auth\ChangePasswordController;
 use App\Http\Controllers\Auth\DeviceVerificationController;
 use App\Http\Controllers\Auth\ForgotPasswordController;
+use App\Http\Controllers\HealthController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\DeliveryController;
 use App\Http\Controllers\ForecastController;
 use App\Http\Controllers\InventoryController;
-use App\Http\Controllers\MaterialListController;
 use App\Http\Controllers\PublicQuotationController;
 use App\Http\Controllers\PurchaseRequestController;
+use App\Http\Controllers\ProcurementWorkflowController;
+use App\Http\Controllers\NotificationController;
+use App\Http\Controllers\ImportController;
 use App\Http\Controllers\QuotationController;
 use App\Http\Controllers\RecycleBinController;
 use App\Http\Controllers\ReportController;
@@ -27,11 +30,9 @@ Route::inertia('/', 'Welcome')->name('home');
 Route::inertia('/products', 'Products/Index')->name('products.index');
 Route::inertia('/company', 'Company/Index')->name('company.index');
 Route::inertia('/contact-us', 'Contact/Index')->name('contact.index');
+Route::get('/health', HealthController::class)->name('health');
 Route::get('/quotation', [PublicQuotationController::class, 'create'])->name('quotations.create');
 Route::post('/quotation', [PublicQuotationController::class, 'store'])->middleware('throttle:10,1')->name('quotations.store');
-// Material list upload on the quotation form: read the file and return the lines for review.
-Route::post('/quotation/materials/extract', [MaterialListController::class, 'extract'])->middleware('throttle:10,1')->name('quotations.materials.extract');
-Route::post('/quotation/materials/remap', [MaterialListController::class, 'remap'])->middleware('throttle:30,1')->name('quotations.materials.remap');
 
 // Password change flow (authenticated)
 Route::middleware(['auth', 'no_cache'])->group(function () {
@@ -71,6 +72,8 @@ Route::get('/device/enroll', [DeviceVerificationController::class, 'showEnroll']
 Route::post('/device/enroll', [DeviceVerificationController::class, 'processEnroll'])->middleware('throttle:10,1')->name('device.enroll-submit');
 Route::get('/device/access/{token}', [DeviceVerificationController::class, 'authorizeDevice'])->name('device.access');
 Route::get('/device/enroll/{token}', [DeviceVerificationController::class, 'showEnrollWithToken'])->name('device.enroll-token');
+Route::get('/device/recover', [DeviceVerificationController::class, 'showRecover'])->name('device.recover');
+Route::post('/device/recover', [DeviceVerificationController::class, 'processRecover'])->middleware('throttle:5,15')->name('device.recover.submit');
 
 // Admin role route convention
 Route::prefix('admin')->middleware(['device_verified'])->group(function () {
@@ -200,7 +203,6 @@ Route::prefix('{current_team}')
             Route::post('inventory/stock-out', [InventoryController::class, 'stockOut'])->name('inventory.stock-out');
             Route::post('inventory/adjust', [InventoryController::class, 'adjustStock'])->name('inventory.adjust');
             Route::get('inventory/history', [InventoryController::class, 'history'])->name('inventory.history');
-            Route::post('inventory/import-csv', [InventoryController::class, 'importCsv'])->name('inventory.import-csv');
             Route::get('inventory/export-csv', [InventoryController::class, 'exportCsv'])->name('inventory.export-csv');
             Route::get('inventory/export', [InventoryController::class, 'export'])->name('inventory.export');
         });
@@ -211,7 +213,13 @@ Route::prefix('{current_team}')
             Route::post('suppliers', [SupplierController::class, 'store'])->name('suppliers.store');
             Route::put('suppliers/{supplier}', [SupplierController::class, 'update'])->name('suppliers.update');
             Route::delete('suppliers/{supplier}', [SupplierController::class, 'destroy'])->middleware('admin_delete')->name('suppliers.destroy');
-            Route::post('suppliers/ahp', [SupplierController::class, 'runAhp'])->name('suppliers.ahp');
+            Route::get('suppliers/{supplier}/records', [SupplierController::class, 'records'])->name('suppliers.records');
+            Route::post('suppliers/{supplier}/quotes', [SupplierController::class, 'storeQuote'])->name('suppliers.quotes.store');
+            Route::post('supplier-quotes/{quote}/verify', [SupplierController::class, 'verifyQuote'])->name('suppliers.quotes.verify');
+            Route::delete('supplier-quotes/{quote}', [SupplierController::class, 'destroyQuote'])->name('suppliers.quotes.destroy');
+            Route::post('suppliers/{supplier}/availability', [SupplierController::class, 'storeAvailability'])->name('suppliers.availability.store');
+            Route::post('supplier-availability/{availability}/verify', [SupplierController::class, 'verifyAvailability'])->name('suppliers.availability.verify');
+            Route::delete('supplier-availability/{availability}', [SupplierController::class, 'destroyAvailability'])->name('suppliers.availability.destroy');
         });
 
         // Quotation Management Module (Admin and Quotations Staff)
@@ -221,39 +229,90 @@ Route::prefix('{current_team}')
             Route::post('quotations/import-csv', [QuotationController::class, 'importCsv'])->name('admin.quotations.importCsv');
             Route::put('quotations/{quotation}', [QuotationController::class, 'update'])->name('admin.quotations.update');
             Route::patch('quotations/{quotation}/status', [QuotationController::class, 'updateStatus'])->name('admin.quotations.updateStatus');
-            Route::post('quotations/{quotation}/convert-to-sale', [QuotationController::class, 'convertToSale'])->name('admin.quotations.convertToSale');
+            Route::post('quotations/{quotation}/approve', [QuotationController::class, 'approve'])->middleware('throttle:30,1')->name('admin.quotations.approve');
+            Route::post('quotations/{quotation}/send', [QuotationController::class, 'send'])->middleware('throttle:20,1')->name('admin.quotations.send');
+            Route::post('quotations/{quotation}/decision', [QuotationController::class, 'recordDecision'])->middleware('throttle:30,1')->name('admin.quotations.decision');
+            Route::post('quotations/{quotation}/convert-to-sale', [QuotationController::class, 'convertToSale'])->middleware('throttle:20,1')->name('admin.quotations.convertToSale');
+            Route::get('quotations/{quotation}/pdf', [QuotationController::class, 'pdf'])->name('admin.quotations.pdf');
             Route::get('quotations/{quotation}/attachment', [QuotationController::class, 'downloadAttachment'])->name('quotations.attachment');
             Route::get('quotations/{quotation}/files/{file}', [QuotationController::class, 'downloadFile'])->name('quotations.files.show');
             Route::post('quotations/import-materials', [QuotationController::class, 'importMaterials'])->name('admin.quotations.importMaterials');
             Route::delete('quotations/{quotation}', [QuotationController::class, 'destroy'])->middleware('admin_delete')->name('admin.quotations.destroy');
         });
 
+        // Purchase Requests from the AHP reorder recommendations (Inventory or Procurement staff)
+        Route::middleware('role:admin,staff_procurement,staff_inventory')->group(function () {
+            Route::post('procurement', [ProcurementWorkflowController::class, 'submitRequests'])->name('procurement.store');
+            Route::post('procurement/requests', [ProcurementWorkflowController::class, 'submitRequests'])->name('procurement.requests.store');
+        });
+
+        // Document imports: inventory products (Inventory module) and supplier quotations (Quotations module).
+        // The controller checks the module of each batch.
+        Route::middleware('role:admin,staff_inventory,staff_quotations')->group(function () {
+            Route::get('imports/batches/{batch}', [ImportController::class, 'show'])->whereNumber('batch')->name('imports.show');
+            Route::patch('imports/batches/{batch}/rows/{row}', [ImportController::class, 'updateRow'])->whereNumber(['batch', 'row'])->name('imports.rows.update');
+            Route::post('imports/batches/{batch}/bulk', [ImportController::class, 'bulk'])->whereNumber('batch')->name('imports.bulk');
+            Route::post('imports/batches/{batch}/confirm', [ImportController::class, 'confirm'])->whereNumber('batch')->name('imports.confirm');
+            Route::post('imports/batches/{batch}/cancel', [ImportController::class, 'cancel'])->whereNumber('batch')->name('imports.cancel');
+            Route::get('imports/batches/{batch}/file', [ImportController::class, 'file'])->whereNumber('batch')->name('imports.file');
+            Route::get('imports/batches/{batch}/products', [ImportController::class, 'products'])->whereNumber('batch')->name('imports.products');
+            Route::get('imports/{module}', [ImportController::class, 'index'])->whereIn('module', ['inventory', 'supplier_quotation'])->name('imports.index');
+            Route::post('imports/{module}', [ImportController::class, 'upload'])->whereIn('module', ['inventory', 'supplier_quotation'])->middleware('throttle:30,1')->name('imports.upload');
+        });
+
+        // In-app notifications for the signed-in user
+        Route::get('notifications', [NotificationController::class, 'index'])->name('notifications.index');
+        Route::post('notifications/read', [NotificationController::class, 'markRead'])->name('notifications.read');
+
         // Procurement Module (Admin and Procurement Staff)
         Route::middleware('role:admin,staff_procurement')->group(function () {
             Route::get('procurement', [PurchaseRequestController::class, 'index'])->name('procurement.index');
-            Route::post('procurement', [PurchaseRequestController::class, 'store'])->name('procurement.store');
-            Route::patch('procurement/{purchaseRequest}/status', [PurchaseRequestController::class, 'updateStatus'])->name('procurement.updateStatus');
-            Route::delete('procurement/{purchaseRequest}', [PurchaseRequestController::class, 'destroy'])->middleware('admin_delete')->name('procurement.destroy');
+            Route::delete('procurement/{purchaseRequest}', [PurchaseRequestController::class, 'destroy'])->middleware('admin_delete')->whereNumber('purchaseRequest')->name('procurement.destroy');
+
+            // Inventory-to-Procurement workflow (rules in Services/Procurement/ProcurementWorkflow)
+            Route::post('procurement/requests/{purchaseRequest}/submit', [ProcurementWorkflowController::class, 'submitDraft'])->name('procurement.requests.submit');
+            Route::post('procurement/requests/{purchaseRequest}/review', [ProcurementWorkflowController::class, 'review'])->middleware('throttle:60,1')->name('procurement.requests.review');
+            // Approval creates the draft purchase order automatically; staff confirm it here.
+            Route::patch('procurement/purchase-orders/{purchaseOrder}/draft', [ProcurementWorkflowController::class, 'updateDraftPurchaseOrder'])->name('procurement.purchaseOrders.draft');
+            Route::post('procurement/purchase-orders/{purchaseOrder}/send', [ProcurementWorkflowController::class, 'sendPurchaseOrder'])->name('procurement.purchaseOrders.send');
+            Route::post('procurement/purchase-orders/{purchaseOrder}/cancel', [ProcurementWorkflowController::class, 'cancelPurchaseOrder'])->name('procurement.purchaseOrders.cancel');
+            Route::post('procurement/purchase-orders/{purchaseOrder}/close', [ProcurementWorkflowController::class, 'closePurchaseOrder'])->name('procurement.purchaseOrders.close');
+            Route::post('procurement/invoices', [ProcurementWorkflowController::class, 'recordInvoice'])->name('procurement.invoices.store');
+            Route::patch('procurement/invoices/{commercialInvoice}', [ProcurementWorkflowController::class, 'correctInvoice'])->name('procurement.invoices.correct');
+            Route::post('procurement/invoices/{commercialInvoice}/verify', [ProcurementWorkflowController::class, 'verifyInvoice'])->name('procurement.invoices.verify');
+            Route::post('procurement/invoices/{commercialInvoice}/flag', [ProcurementWorkflowController::class, 'flagInvoice'])->name('procurement.invoices.flag');
+            Route::get('procurement/invoices/{commercialInvoice}/attachment', [ProcurementWorkflowController::class, 'invoiceAttachment'])->name('procurement.invoices.attachment');
 
             // Commercial Invoices
-            Route::post('procurement/commercial-invoices', [PurchaseRequestController::class, 'storeCommercialInvoice'])->name('procurement.commercialInvoices.store');
+            Route::post('procurement/commercial-invoices', [ProcurementWorkflowController::class, 'recordInvoice'])->name('procurement.commercialInvoices.store');
             Route::post('procurement/commercial-invoices/import-csv', [PurchaseRequestController::class, 'importCommercialInvoicesCsv'])->name('procurement.commercialInvoices.importCsv');
             Route::delete('procurement/commercial-invoices/{commercialInvoice}', [PurchaseRequestController::class, 'destroyCommercialInvoice'])->middleware('admin_delete')->name('procurement.commercialInvoices.destroy');
 
-            // Purchase Orders
-            Route::post('procurement/purchase-orders', [PurchaseRequestController::class, 'storePurchaseOrder'])->name('procurement.purchaseOrders.store');
+            // Purchase Orders (created automatically when a purchase request is approved)
             Route::post('procurement/purchase-orders/import-csv', [PurchaseRequestController::class, 'importPurchaseOrdersCsv'])->name('procurement.purchaseOrders.importCsv');
+            Route::patch('procurement/purchase-orders/{purchaseOrder}/schedule', [PurchaseRequestController::class, 'updatePurchaseOrderSchedule'])->name('procurement.purchaseOrders.schedule');
             Route::delete('procurement/purchase-orders/{purchaseOrder}', [PurchaseRequestController::class, 'destroyPurchaseOrder'])->middleware('admin_delete')->name('procurement.purchaseOrders.destroy');
         });
 
         // Delivery Module (Admin, Procurement, and Inventory Staff)
         Route::middleware('role:admin,staff_procurement,staff_inventory,staff_deliveries')->group(function () {
             Route::get('deliveries', [DeliveryController::class, 'index'])->name('deliveries.index');
-            Route::post('deliveries', [DeliveryController::class, 'store'])->name('deliveries.store');
+            Route::post('deliveries/purchase-orders/{purchaseOrder}/receive', [ProcurementWorkflowController::class, 'recordDelivery'])->name('deliveries.receive');
+            // Read-only order workspace; invoice actions inside it stay procurement-only.
+            Route::get('procurement/purchase-orders/{purchaseOrder}/workspace', [ProcurementWorkflowController::class, 'workspace'])->name('procurement.purchaseOrders.workspace');
             Route::post('deliveries/import-csv', [DeliveryController::class, 'importCsv'])->name('deliveries.importCsv');
+            Route::post('deliveries/{delivery}/inspection', [ProcurementWorkflowController::class, 'inspect'])->name('deliveries.inspection');
+            Route::post('deliveries/{delivery}/resolution', [ProcurementWorkflowController::class, 'resolveRejection'])->name('deliveries.resolution');
+            Route::post('deliveries/{delivery}/post-inventory', [ProcurementWorkflowController::class, 'postToInventory'])->middleware('throttle:30,1')->name('deliveries.postInventory');
             Route::delete('deliveries/{delivery}', [DeliveryController::class, 'destroy'])->middleware('admin_delete')->name('deliveries.destroy');
 
             // Outbound Customer Delivery Staff Actions
+            Route::post('deliveries/fulfillments/{fulfillment}/releases', [DeliveryController::class, 'prepareRelease'])->name('deliveries.fulfillments.releases.store');
+            Route::post('deliveries/releases/{release}/ready', [DeliveryController::class, 'markReady'])->name('deliveries.releases.ready');
+            Route::post('deliveries/releases/{release}/cancel', [DeliveryController::class, 'cancelRelease'])->name('deliveries.releases.cancel');
+            Route::get('deliveries/releases/{release}/proof', [DeliveryController::class, 'releaseProof'])->name('deliveries.releases.proof');
+            Route::get('deliveries/releases/{release}/pdf', [DeliveryController::class, 'releasePdf'])->name('deliveries.releases.pdf');
+            Route::post('deliveries/fulfillments/{fulfillment}/status', [DeliveryController::class, 'updateStatus'])->middleware('throttle:60,1')->name('deliveries.fulfillments.status');
             Route::post('deliveries/fulfillments/{fulfillment}/start', [DeliveryController::class, 'startDelivery'])->name('deliveries.fulfillments.start');
             Route::post('deliveries/fulfillments/{fulfillment}/attempt', [DeliveryController::class, 'recordAttempt'])->name('deliveries.fulfillments.attempt');
             Route::post('deliveries/fulfillments/{fulfillment}/deliver', [DeliveryController::class, 'markDelivered'])->name('deliveries.fulfillments.deliver');
@@ -270,10 +329,24 @@ Route::prefix('{current_team}')
             Route::post('sales', [SaleController::class, 'store'])->name('sales.store');
             Route::get('sales/{sale}/proof', [SaleController::class, 'proof'])->name('sales.proof');
             Route::get('sales/{sale}', [SaleController::class, 'show'])->name('sales.show');
-            Route::post('sales/{sale}/verify-payment', [SaleController::class, 'verifyPayment'])->name('sales.verifyPayment');
-            Route::post('sales/{sale}/fulfillment', [SaleController::class, 'storeFulfillment'])->name('sales.fulfillment.store');
-            Route::patch('fulfillments/{fulfillment}/status', [SaleController::class, 'updateFulfillmentStatus'])->name('fulfillments.updateStatus');
-            Route::get('fulfillments/{fulfillment}/proof', [SaleController::class, 'fulfillmentProof'])->name('fulfillments.proof');
+            Route::get('sales/{sale}/pdf', [SaleController::class, 'orderPdf'])->name('sales.pdf');
+            Route::post('sales/{sale}/payments', [SaleController::class, 'storePayment'])->middleware('throttle:30,1')->name('sales.payments.store');
+            Route::post('sales/{sale}/payments/{payment}/review', [SaleController::class, 'startVerification'])->name('sales.payments.review');
+            Route::post('sales/{sale}/payments/{payment}/verify', [SaleController::class, 'verifyPayment'])->middleware('throttle:30,1')->name('sales.payments.verify');
+            Route::post('sales/{sale}/payments/{payment}/reject', [SaleController::class, 'rejectPayment'])->name('sales.payments.reject');
+            Route::post('sales/{sale}/payments/{payment}/refund', [SaleController::class, 'refundPayment'])->name('sales.payments.refund');
+            Route::get('sales/{sale}/payments/{payment}/proof', [SaleController::class, 'paymentProof'])->name('sales.payments.proof');
+            Route::get('sales/{sale}/receipts/{receipt}/pdf', [SaleController::class, 'receiptPdf'])->name('sales.receipts.pdf');
+            Route::get('sales/{sale}/invoices/{invoice}/pdf', [SaleController::class, 'invoicePdf'])->name('sales.invoices.pdf');
+            Route::post('sales/{sale}/invoices/{invoice}/cancel', [SaleController::class, 'cancelInvoice'])->name('sales.invoices.cancel');
+            Route::post('sales/{sale}/terms', [SaleController::class, 'setTerms'])->name('sales.terms');
+            Route::post('sales/{sale}/hold', [SaleController::class, 'hold'])->name('sales.hold');
+            Route::post('sales/{sale}/resume', [SaleController::class, 'resume'])->name('sales.resume');
+            Route::post('sales/{sale}/cancel', [SaleController::class, 'cancel'])->name('sales.cancel');
+            Route::post('sales/{sale}/cancel-remaining', [SaleController::class, 'cancelRemaining'])->name('sales.cancelRemaining');
+            Route::post('sales/{sale}/reserve', [SaleController::class, 'reserve'])->name('sales.reserve');
+            Route::post('sales/{sale}/complete', [SaleController::class, 'complete'])->name('sales.complete');
+            Route::post('sales/{sale}/notifications/{notification}/retry', [SaleController::class, 'retryNotification'])->middleware('throttle:20,1')->name('sales.notifications.retry');
             Route::delete('sales/{sale}', [SaleController::class, 'destroy'])->middleware('admin_delete')->name('sales.destroy');
         });
 

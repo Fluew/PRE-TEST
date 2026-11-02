@@ -8,10 +8,12 @@ use App\Models\PurchaseOrder;
 use App\Models\PurchaseRequest;
 use App\Models\Supplier;
 use App\Models\Team;
+use App\Services\AuditLogger;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use Inertia\Inertia;
@@ -41,6 +43,8 @@ class PurchaseRequestController extends Controller
                 'product:id,name,sku',
                 'supplier:id,name',
                 'requestedBy:id,name',
+                'reviewedBy:id,name',
+                'purchaseOrder:id,purchase_request_id,po_number,status',
             ]);
 
         if ($search) {
@@ -70,7 +74,7 @@ class PurchaseRequestController extends Controller
         $requests = $query->latest('requested_at')->latest('id')->paginate(15, ['*'], 'requests_page')->withQueryString();
 
         // 2. Commercial Invoices
-        $ciQuery = CommercialInvoice::where('team_id', $team->id)->with('supplier:id,name');
+        $ciQuery = CommercialInvoice::where('team_id', $team->id)->with(['supplier:id,name', 'purchaseOrder:id,po_number', 'delivery:id,delivery_number', 'verifiedBy:id,name']);
         if ($search) {
             $ciQuery->where(function ($q) use ($search) {
                 $q->where('invoice_number', 'like', "%{$search}%")
@@ -93,7 +97,7 @@ class PurchaseRequestController extends Controller
         $commercialInvoices = $ciQuery->latest('invoice_date')->latest('id')->paginate(15, ['*'], 'ci_page')->withQueryString();
 
         // 3. Purchase Orders
-        $poQuery = PurchaseOrder::where('team_id', $team->id)->with('supplier:id,name');
+        $poQuery = PurchaseOrder::where('team_id', $team->id)->with(['supplier:id,name', 'product:id,name,sku', 'purchaseRequest:id,request_number'])->withCount('deliveries');
         if ($search) {
             $poQuery->where(function ($q) use ($search) {
                 $q->where('po_number', 'like', "%{$search}%")
@@ -119,20 +123,33 @@ class PurchaseRequestController extends Controller
         }
         $purchaseOrders = $poQuery->latest('po_date')->latest('id')->paginate(15, ['*'], 'po_page')->withQueryString();
 
-        // Summary metrics
-        $basePrQuery = fn () => PurchaseRequest::where('team_id', $team->id);
-        $baseCiQuery = fn () => CommercialInvoice::where('team_id', $team->id);
-        $basePoQuery = fn () => PurchaseOrder::where('team_id', $team->id);
+        // Summary metrics - 3 fast aggregate queries instead of 8
+        $prRow = PurchaseRequest::where('team_id', $team->id)
+            ->selectRaw("
+                COUNT(*) as total_requests,
+                SUM(CASE WHEN status = 'Pending Approval' THEN 1 ELSE 0 END) as requested_count,
+                SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END) as ordered_count,
+                SUM(CASE WHEN status = 'Converted to Purchase Order' THEN 1 ELSE 0 END) as delivered_count
+            ")
+            ->first();
+
+        $ciRow = CommercialInvoice::where('team_id', $team->id)
+            ->selectRaw('COUNT(*) as total_count, COALESCE(SUM(total_cost), 0) as total_amount')
+            ->first();
+
+        $poRow = PurchaseOrder::where('team_id', $team->id)
+            ->selectRaw('COUNT(*) as total_count, COALESCE(SUM(total_cost), 0) as total_amount')
+            ->first();
 
         $metrics = [
-            'totalRequests' => $basePrQuery()->count(),
-            'requestedCount' => $basePrQuery()->where('status', 'Requested')->count(),
-            'orderedCount' => $basePrQuery()->where('status', 'Ordered')->count(),
-            'deliveredCount' => $basePrQuery()->where('status', 'Delivered')->count(),
-            'totalCommercialInvoices' => $baseCiQuery()->count(),
-            'totalCommercialInvoiceAmount' => (float) $baseCiQuery()->sum('total_cost'),
-            'totalPurchaseOrders' => $basePoQuery()->count(),
-            'totalPurchaseOrderAmount' => (float) $basePoQuery()->sum('total_cost'),
+            'totalRequests' => (int) ($prRow->total_requests ?? 0),
+            'requestedCount' => (int) ($prRow->requested_count ?? 0),
+            'orderedCount' => (int) ($prRow->ordered_count ?? 0),
+            'deliveredCount' => (int) ($prRow->delivered_count ?? 0),
+            'totalCommercialInvoices' => (int) ($ciRow->total_count ?? 0),
+            'totalCommercialInvoiceAmount' => (float) ($ciRow->total_amount ?? 0),
+            'totalPurchaseOrders' => (int) ($poRow->total_count ?? 0),
+            'totalPurchaseOrderAmount' => (float) ($poRow->total_amount ?? 0),
         ];
 
         // Available products and suppliers for forms
@@ -141,10 +158,14 @@ class PurchaseRequestController extends Controller
             ->orderBy('name')
             ->get(['id', 'name', 'sku', 'cost_price', 'stock', 'reorder_level']);
 
-        $suppliers = Supplier::where('team_id', $team->id)
-            ->where('status', 'Active')
-            ->orderBy('name')
-            ->get(['id', 'name']);
+        // Plain arrays: cached objects come back as __PHP_Incomplete_Class (cache.serializable_classes).
+        $suppliers = Cache::remember("team:{$team->id}:procurement_suppliers_v2", 300, function () use ($team) {
+            return Supplier::where('team_id', $team->id)
+                ->where('status', 'Active')
+                ->orderBy('name')
+                ->get(['id', 'name'])
+                ->toArray();
+        });
 
         return Inertia::render('Procurement/Index', [
             'requests' => $requests,
@@ -163,68 +184,13 @@ class PurchaseRequestController extends Controller
             'metrics' => $metrics,
             'products' => $products,
             'suppliers' => $suppliers,
+            'isAdmin' => $request->user()->isAdmin(),
+            'statusOptions' => [
+                'requests' => PurchaseRequest::STATUSES,
+                'purchase_orders' => PurchaseOrder::STATUSES,
+                'commercial_invoices' => [CommercialInvoice::PENDING, CommercialInvoice::FLAGGED, CommercialInvoice::VERIFIED, CommercialInvoice::CANCELLED],
+            ],
         ]);
-    }
-
-    /**
-     * Store a new purchase request.
-     */
-    public function store(Request $request): RedirectResponse
-    {
-        $team = $this->getTeam($request);
-        abort_if(! $team, 403, 'No active team selected.');
-
-        $validated = $request->validate([
-            'product_id' => ['required', 'integer', Rule::exists('products', 'id')->where('team_id', $team->id)],
-            'supplier_id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where('team_id', $team->id)],
-            'quantity' => ['required', 'integer', 'min:1'],
-            'notes' => ['nullable', 'string', 'max:1000'],
-        ]);
-
-        $product = Product::findOrFail($validated['product_id']);
-
-        PurchaseRequest::create([
-            'team_id' => $team->id,
-            'request_number' => PurchaseRequest::generateRequestNumber($team->id),
-            'product_id' => $validated['product_id'],
-            'supplier_id' => $validated['supplier_id'],
-            'requested_by_id' => $request->user()->id,
-            'quantity' => $validated['quantity'],
-            'estimated_cost' => ($product->cost_price ?? $product->price) * $validated['quantity'],
-            'status' => 'Requested',
-            'notes' => $validated['notes'] ?? null,
-            'requested_at' => now(),
-        ]);
-
-        return back()->with('success', 'Purchase request submitted successfully.');
-    }
-
-    /**
-     * Update the status of a purchase request.
-     */
-    public function updateStatus(Request $request, mixed $current_team = null, mixed $purchaseRequest = null): RedirectResponse
-    {
-        $purchaseRequest = $this->resolvePurchaseRequest($purchaseRequest, $current_team);
-        $team = $this->getTeam($request, $current_team);
-        abort_if(! $team || $purchaseRequest->team_id !== $team->id, 403);
-
-        $validated = $request->validate([
-            'status' => ['required', Rule::in(['Requested', 'Ordered', 'Delivered', 'Cancelled'])],
-        ]);
-
-        $updates = ['status' => $validated['status']];
-
-        if ($validated['status'] === 'Ordered' && ! $purchaseRequest->ordered_at) {
-            $updates['ordered_at'] = now();
-        }
-
-        if ($validated['status'] === 'Delivered' && ! $purchaseRequest->delivered_at) {
-            $updates['delivered_at'] = now();
-        }
-
-        $purchaseRequest->update($updates);
-
-        return back()->with('success', "Purchase request status updated to {$validated['status']}.");
     }
 
     /**
@@ -236,56 +202,13 @@ class PurchaseRequestController extends Controller
         $team = $this->getTeam($request, $current_team);
         abort_if(! $team || $purchaseRequest->team_id !== $team->id, 403);
 
-        if ($purchaseRequest->status !== 'Requested') {
-            return back()->withErrors(['status' => 'Only requests in "Requested" status can be deleted.']);
+        if (! in_array($purchaseRequest->status, [PurchaseRequest::DRAFT, PurchaseRequest::PENDING, PurchaseRequest::REJECTED], true)) {
+            return back()->withErrors(['status' => 'Only draft, pending or rejected requests can be deleted; approved and converted requests are kept for the audit trail.']);
         }
 
         $purchaseRequest->delete();
 
         return back()->with('success', 'Purchase request deleted.');
-    }
-
-    /**
-     * Store a new commercial invoice.
-     */
-    public function storeCommercialInvoice(Request $request): RedirectResponse
-    {
-        $team = $this->getTeam($request);
-        abort_if(! $team, 403, 'No active team selected.');
-
-        $validated = $request->validate([
-            'invoice_date' => ['required', 'date'],
-            'invoice_number' => ['nullable', 'string', 'max:100'],
-            'quantity' => ['required', 'integer', 'min:1'],
-            'description' => ['required', 'string', 'max:1000'],
-            'unit_cost' => ['required', 'numeric', 'min:0'],
-            'supplier_id' => ['nullable', 'integer', Rule::exists('suppliers', 'id')->where('team_id', $team->id)],
-            'status' => ['nullable', 'string', 'max:50'],
-            'notes' => ['nullable', 'string', 'max:1000'],
-        ]);
-
-        $invoiceNumber = ! empty($validated['invoice_number'])
-            ? trim($validated['invoice_number'])
-            : CommercialInvoice::generateInvoiceNumber($team->id, $validated['invoice_date']);
-
-        $quantity = (int) $validated['quantity'];
-        $unitCost = (float) $validated['unit_cost'];
-        $totalCost = round($quantity * $unitCost, 2);
-
-        CommercialInvoice::create([
-            'team_id' => $team->id,
-            'invoice_date' => $validated['invoice_date'],
-            'invoice_number' => $invoiceNumber,
-            'quantity' => $quantity,
-            'description' => $validated['description'],
-            'unit_cost' => $unitCost,
-            'total_cost' => $totalCost,
-            'supplier_id' => $validated['supplier_id'] ?? null,
-            'status' => $validated['status'] ?? 'Received',
-            'notes' => $validated['notes'] ?? null,
-        ]);
-
-        return back()->with('success', 'Commercial invoice recorded successfully.');
     }
 
     /**
@@ -361,6 +284,7 @@ class PurchaseRequestController extends Controller
         $rawHeaders = $lines[0];
         $headers = array_map(function ($h) {
             $cleaned = preg_replace('/^\xEF\xBB\xBF/', '', (string) $h);
+
             return preg_replace('/[^a-z0-9]/', '', strtolower($cleaned));
         }, $rawHeaders);
 
@@ -486,7 +410,9 @@ class PurchaseRequestController extends Controller
                         'description' => $r['description'],
                         'unit_cost' => $r['unit_cost'],
                         'total_cost' => $r['total_cost'],
-                        'status' => 'Received',
+                        'status' => CommercialInvoice::PENDING,
+                        'recorded_by_id' => auth()->id(),
+                        'notes' => 'Imported from CSV: link it to a purchase order and delivery by recording it through the workflow before it can be verified.',
                     ]);
                 }
             });
@@ -494,13 +420,13 @@ class PurchaseRequestController extends Controller
             if ($request->wantsJson()) {
                 return response()->json([
                     'success' => true,
-                    'message' => 'Successfully imported ' . count($validRows) . ' commercial invoice(s).',
+                    'message' => 'Successfully imported '.count($validRows).' commercial invoice(s).',
                     'count' => count($validRows),
                     'invalid_count' => count($invalidRows),
                 ]);
             }
 
-            return back()->with('success', 'Successfully imported ' . count($validRows) . ' commercial invoice(s).');
+            return back()->with('success', 'Successfully imported '.count($validRows).' commercial invoice(s).');
         }
 
         return response()->json([
@@ -516,50 +442,35 @@ class PurchaseRequestController extends Controller
     }
 
     /**
-     * Store a new purchase order.
+     * Set the product and promised delivery date of a purchase order (used by Supplier Evaluation).
+     * Once a delivery has been received against it, only an administrator may change the promised date.
      */
-    public function storePurchaseOrder(Request $request): RedirectResponse
+    public function updatePurchaseOrderSchedule(Request $request, mixed $current_team = null, mixed $purchaseOrder = null): RedirectResponse
     {
+        $purchaseOrder = $this->resolvePurchaseOrder($purchaseOrder, $current_team);
         $team = $this->getTeam($request);
-        abort_if(! $team, 403, 'No active team selected.');
+        abort_if(! $team || $purchaseOrder->team_id !== $team->id, 403);
 
         $validated = $request->validate([
-            'po_date' => ['required', 'date'],
-            'po_number' => ['nullable', 'string', 'max:100'],
-            'quantity' => ['required', 'integer', 'min:1'],
-            'item_sku' => ['nullable', 'string', 'max:100'],
-            'description' => ['required', 'string', 'max:1000'],
-            'unit_of_measure' => ['nullable', 'string', 'max:50'],
-            'unit_cost' => ['required', 'numeric', 'min:0'],
-            'supplier_id' => ['nullable', 'integer', Rule::exists('suppliers', 'id')->where('team_id', $team->id)],
-            'status' => ['nullable', 'string', 'max:50'],
-            'notes' => ['nullable', 'string', 'max:1000'],
+            'product_id' => ['nullable', 'integer', Rule::exists('products', 'id')->where('team_id', $team->id)],
+            'promised_delivery_date' => ['nullable', 'date', 'after_or_equal:'.$purchaseOrder->po_date->toDateString()],
         ]);
 
-        $poNumber = ! empty($validated['po_number'])
-            ? trim($validated['po_number'])
-            : PurchaseOrder::generatePoNumber($team->id);
+        $newDate = $validated['promised_delivery_date'] ?? null;
+        $oldDate = $purchaseOrder->promised_delivery_date?->toDateString();
+        if ($newDate !== $oldDate && $purchaseOrder->deliveries()->exists() && ! $request->user()->isAdmin()) {
+            return back()->withErrors(['promised_delivery_date' => 'Goods were already received against this purchase order, so only an administrator can change its promised date.']);
+        }
 
-        $quantity = (int) $validated['quantity'];
-        $unitCost = (float) $validated['unit_cost'];
-        $totalCost = round($quantity * $unitCost, 2);
+        $purchaseOrder->update(['product_id' => $validated['product_id'] ?? null, 'promised_delivery_date' => $newDate]);
+        AuditLogger::record('purchase_order.schedule_updated', "Purchase order {$purchaseOrder->po_number}: product and promised delivery date updated.", $purchaseOrder, ['promised_delivery_date' => [$oldDate, $newDate], 'product_id' => $purchaseOrder->product_id], $request->user());
 
-        PurchaseOrder::create([
-            'team_id' => $team->id,
-            'po_date' => $validated['po_date'],
-            'po_number' => $poNumber,
-            'quantity' => $quantity,
-            'item_sku' => $validated['item_sku'] ?? null,
-            'description' => $validated['description'],
-            'unit_of_measure' => $validated['unit_of_measure'] ?? 'PCS',
-            'unit_cost' => $unitCost,
-            'total_cost' => $totalCost,
-            'supplier_id' => $validated['supplier_id'] ?? null,
-            'status' => $validated['status'] ?? 'Issued',
-            'notes' => $validated['notes'] ?? null,
-        ]);
+        return back()->with('success', "Purchase order {$purchaseOrder->po_number} updated.");
+    }
 
-        return back()->with('success', 'Purchase order created successfully.');
+    private function productIdForSku(int $teamId, ?string $sku): ?int
+    {
+        return $sku ? Product::where('team_id', $teamId)->where('sku', trim($sku))->value('id') : null;
     }
 
     /**
@@ -635,6 +546,7 @@ class PurchaseRequestController extends Controller
         $rawHeaders = $lines[0];
         $headers = array_map(function ($h) {
             $cleaned = preg_replace('/^\xEF\xBB\xBF/', '', (string) $h);
+
             return preg_replace('/[^a-z0-9]/', '', strtolower($cleaned));
         }, $rawHeaders);
 
@@ -774,7 +686,9 @@ class PurchaseRequestController extends Controller
                         'unit_of_measure' => $r['unit_of_measure'] ?: 'PCS',
                         'unit_cost' => $r['unit_cost'],
                         'total_cost' => $r['total_cost'],
-                        'status' => 'Issued',
+                        // Imported POs have no approved purchase request, so they are historical records only.
+                        'status' => PurchaseOrder::CLOSED,
+                        'notes' => 'Imported historical record (no approved purchase request). Goods cannot be received against it.',
                     ]);
                 }
             });
@@ -782,13 +696,13 @@ class PurchaseRequestController extends Controller
             if ($request->wantsJson()) {
                 return response()->json([
                     'success' => true,
-                    'message' => 'Successfully imported ' . count($validRows) . ' purchase order(s).',
+                    'message' => 'Successfully imported '.count($validRows).' purchase order(s).',
                     'count' => count($validRows),
                     'invalid_count' => count($invalidRows),
                 ]);
             }
 
-            return back()->with('success', 'Successfully imported ' . count($validRows) . ' purchase order(s).');
+            return back()->with('success', 'Successfully imported '.count($validRows).' purchase order(s).');
         }
 
         return response()->json([
@@ -815,6 +729,7 @@ class PurchaseRequestController extends Controller
                 }
             }
         }
+
         return -1;
     }
 
@@ -844,6 +759,7 @@ class PurchaseRequestController extends Controller
         if ($team instanceof Team) {
             return $team;
         }
+
         return $request->user()?->currentTeam;
     }
 

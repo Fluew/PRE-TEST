@@ -16,9 +16,44 @@ return [
     */
 
     'ssr' => [
-        'enabled' => true,
+        'enabled' => (bool) env('INERTIA_SSR_ENABLED', true),
         'url' => 'http://127.0.0.1:13714',
         // 'bundle' => base_path('bootstrap/ssr/ssr.mjs'),
+
+        // Pages fall back to client rendering if SSR doesn't answer in time, so never wait long.
+        'timeout' => 3,
+
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | DevTools
+    |--------------------------------------------------------------------------
+    |
+    | Records every request (props, queries, response) to disk for the Inertia
+    | DevTools browser extension. The package turns it on in local, where it
+    | makes pages 3-4x slower, so it is opt-in: set INERTIA_DEVTOOLS_ENABLED
+    | to true while debugging with the extension.
+    |
+    */
+
+    'devtools' => [
+
+        'enabled' => (bool) env('INERTIA_DEVTOOLS_ENABLED', false),
+
+        'except' => ['telescope*', 'horizon*', '_inertia/devtools*'],
+
+        'storage' => [
+
+            'path' => storage_path('inertia-devtools'),
+
+            'ttl' => (int) env('INERTIA_DEVTOOLS_TTL_HOURS', 24),
+
+            'prune_interval' => (int) env('INERTIA_DEVTOOLS_PRUNE_INTERVAL_SECONDS', 300),
+
+            'limit' => (int) env('INERTIA_DEVTOOLS_LIMIT', 100),
+
+        ],
 
     ],
 

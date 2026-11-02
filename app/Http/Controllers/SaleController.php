@@ -2,78 +2,134 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\OrderFulfillment;
+use App\Enums\DeliveryStatus;
+use App\Enums\PaymentStatus;
+use App\Enums\SalesOrderStatus;
+use App\Exceptions\WorkflowException;
+use App\Models\AuditLog;
+use App\Models\NotificationLog;
+use App\Models\Payment;
+use App\Models\PaymentReceipt;
 use App\Models\Product;
 use App\Models\Sale;
-use App\Models\SaleItem;
-use App\Models\StockMovement;
+use App\Models\SalesInvoice;
+use App\Services\Documents\DocumentPdf;
+use App\Services\Inventory\StockLedger;
+use App\Services\Notifications\CustomerNotifier;
+use App\Services\Sales\CounterSaleService;
+use App\Services\Sales\InvoiceService;
+use App\Services\Sales\PaymentService;
+use App\Services\Sales\SalesOrderService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
+use Illuminate\Http\Response as HttpResponse;
+use Illuminate\Support\Facades\DB;z
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
 use Inertia\Inertia;
 use Inertia\Response;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
+/**
+ * Sales Orders: the list (with the sales counter), the order page, payments and their
+ * verification, receipts, invoices and the order actions (terms, hold, cancel, complete).
+ * Routes: Admin and Sales staff only (role:admin,staff_sales).
+ */
 class SaleController extends Controller
 {
-    /**
-     * Display the sales management page with transaction history.
-     */
     public function index(Request $request): Response
     {
         $team = $request->user()->currentTeam;
         abort_if(! $team, 403, 'No active team selected.');
 
-        $search = $request->input('search');
-        $status = $request->input('status', 'All');
-
-        $query = Sale::where('team_id', $team->id)->with(['items', 'fulfillment', 'verifiedBy:id,name', 'processedBy:id,name']);
-
-        if ($search) {
-            $query->where(function ($q) use ($search) {
-                $q->where('invoice_number', 'like', "%{$search}%")
-                    ->orWhere('client_name', 'like', "%{$search}%");
-            });
-        }
-
-        if ($status && $status !== 'All') {
-            $query->where('status', $status);
-        }
-
-        $sales = $query->latest('sale_date')->latest('id')->paginate(15)->withQueryString();
-
-        // Summary metrics
-        $baseSalesQuery = fn () => Sale::where('team_id', $team->id);
-        $metrics = [
-            'totalSales' => $baseSalesQuery()->count(),
-            'todaySales' => (float) $baseSalesQuery()->whereDate('sale_date', today())->sum('grand_total'),
-            'monthSales' => (float) $baseSalesQuery()->whereMonth('sale_date', now()->month)->whereYear('sale_date', now()->year)->sum('grand_total'),
-            'pendingPayments' => $baseSalesQuery()->where('status', 'Pending Payment')->count(),
+        $filters = [
+            'search' => trim((string) $request->input('search', '')),
+            'status' => $request->input('status', 'All'),
+            'payment_status' => $request->input('payment_status', 'All'),
+            'delivery_status' => $request->input('delivery_status', 'All'),
+            'date_from' => $request->input('date_from'),
+            'date_to' => $request->input('date_to'),
+            'sort' => in_array($request->input('sort'), ['oldest', 'total_desc', 'balance_desc'], true) ? $request->input('sort') : 'newest',
         ];
 
-        // Available products for POS
-        $products = Product::where('team_id', $team->id)
+        $query = Sale::where('team_id', $team->id)
+            ->with(['items', 'fulfillment:id,sale_id,status,fulfillment_type,fulfillment_number', 'quotation:id,quotation_number', 'processedBy:id,name']);
+
+        if ($filters['search'] !== '') {
+            $search = $filters['search'];
+            $query->where(function ($q) use ($search) {
+                $q->where('order_number', 'like', "%{$search}%")
+                    ->orWhere('invoice_number', 'like', "%{$search}%")
+                    ->orWhere('client_name', 'like', "%{$search}%")
+                    ->orWhereHas('quotation', fn ($qq) => $qq->where('quotation_number', 'like', "%{$search}%"));
+            });
+        }
+        if ($filters['status'] !== 'All' && SalesOrderStatus::tryFrom($filters['status'])) {
+            $query->where('status', $filters['status']);
+        }
+        if ($filters['payment_status'] !== 'All' && PaymentStatus::tryFrom($filters['payment_status'])) {
+            $query->where('payment_status', $filters['payment_status']);
+        }
+        if ($filters['delivery_status'] !== 'All' && DeliveryStatus::tryFrom($filters['delivery_status'])) {
+            $query->whereHas('fulfillment', fn ($q) => $q->where('status', $filters['delivery_status']));
+        }
+        if ($filters['date_from']) {
+            $query->whereDate('sale_date', '>=', $filters['date_from']);
+        }
+        if ($filters['date_to']) {
+            $query->whereDate('sale_date', '<=', $filters['date_to']);
+        }
+
+        match ($filters['sort']) {
+            'oldest' => $query->oldest('sale_date')->oldest('id'),
+            'total_desc' => $query->orderByDesc('grand_total'),
+            'balance_desc' => $query->orderByDesc('outstanding_balance'),
+            default => $query->latest('sale_date')->latest('id'),
+        };
+
+        $sales = $query->paginate(15)->withQueryString();
+        $sales->getCollection()->each(fn (Sale $s) => $s->setAttribute('delivery_status_label', $s->fulfillment?->status_label));
+
+        $counted = fn () => Sale::where('team_id', $team->id)->whereIn('status', SalesOrderStatus::countedInSales());
+        $metrics = [
+            'totalSales' => Sale::where('team_id', $team->id)->count(),
+            'todaySales' => (float) $counted()->whereDate('sale_date', today())->sum('grand_total'),
+            'monthSales' => (float) $counted()->whereMonth('sale_date', now()->month)->whereYear('sale_date', now()->year)->sum('grand_total'),
+            'pendingPayments' => Sale::where('team_id', $team->id)->where('status', SalesOrderStatus::Pending->value)->count(),
+            'toVerify' => Payment::where('team_id', $team->id)->whereIn('status', ['submitted', 'under_verification'])->count(),
+            'outstanding' => (float) Sale::where('team_id', $team->id)->whereNotIn('status', [SalesOrderStatus::Cancelled->value])->sum('outstanding_balance'),
+        ];
+
+        // Products for the sales counter (stock not reserved for other orders - batch resolved).
+        $rawProducts = Product::where('team_id', $team->id)
             ->where('is_active', true)
             ->where('stock', '>', 0)
             ->orderBy('name')
             ->get(['id', 'sku', 'name', 'price', 'stock', 'category']);
 
+        $reservedMap = Product::batchReservedQuantities($rawProducts->pluck('id')->all());
+
+        $products = $rawProducts
+            ->map(function (Product $p) use ($reservedMap) {
+                $reserved = $reservedMap[$p->id] ?? 0;
+                $p->setAttribute('precomputed_reserved_quantity', $reserved);
+                $available = max(0, (int) $p->stock - $reserved);
+
+                return ['id' => $p->id, 'sku' => $p->sku, 'name' => $p->name, 'price' => $p->price, 'category' => $p->category, 'stock' => $available];
+            })
+            ->filter(fn ($p) => $p['stock'] > 0)
+            ->values();
+
         return Inertia::render('Sales/Index', [
             'sales' => $sales,
-            'filters' => [
-                'search' => $search,
-                'status' => $status,
-            ],
+            'filters' => $filters,
             'metrics' => $metrics,
             'products' => $products,
+            'options' => $this->statusOptions(),
         ]);
     }
 
-    /**
-     * Record a new sale / POS transaction.
-     */
+    /** Sales counter: a walk-in customer pays and takes the goods. */
     public function store(Request $request): RedirectResponse
     {
         $team = $request->user()->currentTeam;
@@ -88,7 +144,7 @@ class SaleController extends Controller
 
         $validated = $request->validate([
             'customer' => ['required', 'string', 'max:255'],
-            'payment_method' => ['required', 'string', Rule::in(['Bank Transfer', 'GCash'])],
+            'payment_method' => ['required', 'string', Rule::in(Payment::METHODS)],
             'payment_reference' => ['required', 'string', 'max:100'],
             'amount_paid' => ['required', 'numeric', 'min:0.01'],
             'payment_date' => ['required', 'date'],
@@ -99,333 +155,298 @@ class SaleController extends Controller
             'items.*.qty' => ['required', 'integer', 'min:1'],
         ]);
 
-        return DB::transaction(function () use ($validated, $team, $request) {
-            $subtotal = 0;
-            $saleItems = [];
+        return $this->runWorkflow(function () use ($team, $validated, $request) {
+            $sale = app(CounterSaleService::class)->record($team->id, $validated, $request->file('proof_of_payment'), $request->user());
 
-            // Validate stock and build items
-            foreach ($validated['items'] as $item) {
-                $product = Product::where('id', $item['product_id'])
-                    ->where('team_id', $team->id)
-                    ->lockForUpdate()
-                    ->firstOrFail();
-
-                if ($product->stock < $item['qty']) {
-                    return back()->withErrors([
-                        'items' => "Insufficient stock for {$product->name}. Available: {$product->stock}, requested: {$item['qty']}.",
-                    ]);
-                }
-
-                $lineTotal = $product->price * $item['qty'];
-                $subtotal += $lineTotal;
-
-                $saleItems[] = [
-                    'product' => $product,
-                    'qty' => $item['qty'],
-                    'unit_price' => $product->price,
-                    'subtotal' => $lineTotal,
-                ];
-            }
-
-            $amountPaid = (float) $validated['amount_paid'];
-            if ($amountPaid < $subtotal) {
-                return back()->withErrors([
-                    'amount_paid' => 'The amount paid cannot be less than the total amount.',
-                ]);
-            }
-
-            $outstanding = max(0, round($subtotal - $amountPaid, 2));
-            $isFullyPaid = $outstanding <= 0.001;
-
-            // Proofs hold customer payment details, so keep them on the private disk and serve
-            // them only through the authenticated proof() route.
-            $proofPath = null;
-            if ($request->hasFile('proof_of_payment')) {
-                $proofPath = $request->file('proof_of_payment')->store('proofs/sales', 'local');
-            }
-
-            // Newly submitted proof requires staff verification. Otherwise if staff enters cash/direct fully paid, mark Verified.
-            $paymentStatus = $proofPath ? 'Pending Verification' : ($isFullyPaid ? 'Verified' : 'Pending Verification');
-            $saleStatus = ($isFullyPaid && $paymentStatus === 'Verified') ? 'Completed' : 'Pending Payment';
-
-            // Create the sale
-            $sale = Sale::create([
-                'team_id' => $team->id,
-                'invoice_number' => Sale::generateInvoiceNumber($team->id),
-                'client_name' => $validated['customer'],
-                'sale_date' => now(),
-                'subtotal' => $subtotal,
-                'discount' => 0,
-                'tax_amount' => 0,
-                'grand_total' => $subtotal,
-                'status' => $saleStatus,
-                'payment_method' => $validated['payment_method'],
-                'payment_reference' => $validated['payment_reference'],
-                'amount_paid' => $amountPaid,
-                'outstanding_balance' => $outstanding,
-                'payment_date' => $validated['payment_date'],
-                'payment_status' => $paymentStatus,
-                'proof_of_payment' => $proofPath,
-                'verified_by_id' => $paymentStatus === 'Verified' ? $request->user()->id : null,
-                'verified_at' => $paymentStatus === 'Verified' ? now() : null,
-                'notes' => $validated['notes'] ?? null,
-                'processed_by_id' => $request->user()->id,
-            ]);
-
-            // Initialize Order Fulfillment
-            OrderFulfillment::create([
-                'team_id' => $team->id,
-                'sale_id' => $sale->id,
-                'fulfillment_number' => OrderFulfillment::generateFulfillmentNumber($team->id),
-                'fulfillment_type' => $request->input('fulfillment_type', 'Delivery'),
-                'recipient_name' => $request->input('recipient_name') ?: $validated['customer'],
-                'contact_number' => $request->input('contact_number') ?: 'N/A',
-                'delivery_address' => $request->input('delivery_address'),
-                'delivery_schedule' => $request->input('delivery_schedule'),
-                'instructions' => $request->input('delivery_instructions') ?: ($validated['notes'] ?? null),
-                'status' => 'Preparing',
-                'handled_by_id' => $request->user()->id,
-            ]);
-
-            // Create sale items and deduct stock
-            foreach ($saleItems as $sItem) {
-                $product = $sItem['product'];
-
-                SaleItem::create([
-                    'sale_id' => $sale->id,
-                    'product_id' => $product->id,
-                    'sku' => $product->sku,
-                    'product_name' => $product->name,
-                    'quantity' => $sItem['qty'],
-                    'unit_price' => $sItem['unit_price'],
-                    'subtotal' => $sItem['subtotal'],
-                ]);
-
-                $previousStock = $product->stock;
-                $product->decrement('stock', $sItem['qty']);
-
-                // Record stock movement
-                StockMovement::create([
-                    'team_id' => $team->id,
-                    'product_id' => $product->id,
-                    'user_id' => $request->user()->id,
-                    'type' => 'sale',
-                    'quantity' => -$sItem['qty'],
-                    'previous_stock' => $previousStock,
-                    'new_stock' => $previousStock - $sItem['qty'],
-                    'reference_number' => $sale->invoice_number,
-                    'reason' => "Sale to {$validated['customer']}",
-                    'movement_date' => now(),
-                ]);
-
-                $product->refresh();
-                $product->updateCalculatedStatus();
-            }
-
-            return back()->with('success', "Transaction {$sale->invoice_number} completed successfully.");
+            return $sale->status === SalesOrderStatus::Completed
+                ? "Counter sale {$sale->order_number} completed. Invoice {$sale->invoice_number}."
+                : "Counter sale {$sale->order_number} recorded. The attached payment proof must be verified before the sale is completed.";
         });
     }
 
-    /**
-     * Show a single sale with all its items (for invoice view/print).
-     */
+    /** The Sales Order page: lines with quantities, payments, receipts, invoices, deliveries, history. */
     public function show(Request $request, mixed $current_team = null, mixed $sale = null): Response
     {
-        $sale = $this->resolveSale($sale, $current_team, $request);
-        $team = $request->user()->currentTeam;
-        abort_if(! $team || $sale->team_id !== $team->id, 403);
-
+        $sale = $this->authorizedSale($request, $sale, $current_team);
         $sale->load([
-            'items.product:id,name,sku',
+            'items.product:id,name,sku,stock',
+            'quotation:id,quotation_number,status,valid_until,sent_at',
             'processedBy:id,name',
-            'verifiedBy:id,name',
+            'confirmedBy:id,name',
+            'termsApprovedBy:id,name',
+            'payments.recordedBy:id,name',
+            'payments.verifiedBy:id,name',
+            'payments.rejectedBy:id,name',
+            'payments.receipt',
+            'receipts',
+            'invoices.issuedBy:id,name',
+            'invoices.cancelledBy:id,name',
             'fulfillment.handledBy:id,name',
+            'fulfillment.attemptLogs.staff:id,name',
+            'releases.items.saleItem:id,sku,product_name',
+            'releases.preparedBy:id,name',
+            'releases.acknowledgedBy:id,name',
         ]);
+
+        $paymentIds = $sale->payments->pluck('id');
+        $notifications = NotificationLog::where(function ($q) use ($sale, $paymentIds) {
+            $q->where(fn ($qq) => $qq->where('notifiable_type', 'Sale')->where('notifiable_id', $sale->id))
+                ->orWhere(fn ($qq) => $qq->where('notifiable_type', 'Payment')->whereIn('notifiable_id', $paymentIds))
+                ->orWhere(fn ($qq) => $qq->where('notifiable_type', 'SalesInvoice')->whereIn('notifiable_id', $sale->invoices->pluck('id')))
+                ->when($sale->fulfillment, fn ($qq) => $qq->orWhere(fn ($q3) => $q3->where('notifiable_type', 'OrderFulfillment')->where('notifiable_id', $sale->fulfillment->id)));
+        })->latest('id')->get(['id', 'category', 'type', 'recipient', 'subject', 'status', 'attempts', 'error', 'last_attempt_at', 'sent_at', 'created_at']);
+
+        $activity = AuditLog::where('subject_type', 'Sale')->where('subject_id', $sale->id)
+            ->latest('id')->limit(200)
+            ->get(['id', 'event', 'description', 'user_email', 'outcome', 'created_at']);
+
+        $user = $request->user();
 
         return Inertia::render('Sales/Show', [
             'sale' => $sale,
+            'deliveryStatusLabel' => $sale->fulfillment?->status_label,
+            'notifications' => $notifications,
+            'activity' => $activity,
+            'paymentMethods' => Payment::METHODS,
+            'can' => [
+                'verify' => $user->isAdmin() || $user->hasModule('sales'),
+                'admin' => $user->isAdmin(),
+            ],
+            'company' => ['bir_registered' => (bool) config('company.bir_registered')],
         ]);
     }
 
-    /**
-     * Verify or reject submitted proof of payment.
-     */
-    public function verifyPayment(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
-    {
-        $sale = $this->resolveSale($sale, $current_team, $request);
-        $team = $request->user()->currentTeam;
-        abort_if(! $team || $sale->team_id !== $team->id, 403, 'Unauthorized sale access.');
+    // ------------------------------------------------------------------------------ payments
 
+    public function storePayment(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
         $validated = $request->validate([
-            'status' => ['required', Rule::in(['Verified', 'Rejected'])],
-            'amount_paid' => ['nullable', 'numeric', 'min:0'],
-            'notes' => ['nullable', 'string', 'max:500'],
+            'method' => ['required', Rule::in(Payment::METHODS)],
+            'amount' => ['required', 'numeric', 'min:0.01', 'max:99999999'],
+            'reference' => ['nullable', 'string', 'max:100'],
+            'payment_date' => ['required', 'date', 'before_or_equal:today'],
+            'remarks' => ['nullable', 'string', 'max:1000'],
+            'proof' => ['nullable', 'file', 'mimes:jpg,jpeg,png,webp,pdf', 'max:5120'],
+            'idempotency_key' => ['nullable', 'string', 'max:64'],
         ]);
 
-        if (isset($validated['amount_paid'])) {
-            $sale->amount_paid = (float) $validated['amount_paid'];
-            $sale->outstanding_balance = max(0, round($sale->grand_total - $sale->amount_paid, 2));
-        }
+        return $this->runWorkflow(function () use ($sale, $validated, $request) {
+            app(PaymentService::class)->record($sale, $validated, $request->file('proof'), $request->user(), $validated['idempotency_key'] ?? null);
 
-        $sale->payment_status = $validated['status'];
-        $sale->verified_by_id = $request->user()->id;
-        $sale->verified_at = now();
-
-        if ($validated['status'] === 'Verified' && $sale->outstanding_balance <= 0.001) {
-            $sale->status = 'Completed';
-        } elseif ($validated['status'] === 'Rejected') {
-            $sale->status = 'Pending Payment';
-        }
-
-        if (! empty($validated['notes'])) {
-            $sale->notes = trim(($sale->notes ?? '')."\n[Payment Audit]: ".$validated['notes']);
-        }
-
-        $sale->save();
-
-        return back()->with('success', "Payment {$validated['status']} successfully.");
+            return 'Payment recorded. It counts towards the order only after it is verified against the actual transaction.';
+        });
     }
 
-    /**
-     * Store or update order fulfillment delivery details.
-     */
-    public function storeFulfillment(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
+    public function startVerification(Request $request, mixed $current_team = null, mixed $sale = null, mixed $payment = null): RedirectResponse
     {
-        $sale = $this->resolveSale($sale, $current_team, $request);
-        $team = $request->user()->currentTeam;
-        abort_if(! $team || $sale->team_id !== $team->id, 403, 'Unauthorized sale access.');
+        [, $payment] = $this->authorizedPayment($request, $sale, $payment, $current_team);
 
+        return $this->runWorkflow(function () use ($payment, $request) {
+            app(PaymentService::class)->startVerification($payment, $request->user());
+
+            return 'Marked as under verification.';
+        });
+    }
+
+    public function verifyPayment(Request $request, mixed $current_team = null, mixed $sale = null, mixed $payment = null): RedirectResponse
+    {
+        [$sale, $payment] = $this->authorizedPayment($request, $sale, $payment, $current_team);
         $validated = $request->validate([
-            'fulfillment_type' => ['required', Rule::in(['Delivery', 'Store Pickup'])],
-            'recipient_name' => ['required', 'string', 'max:255'],
-            'contact_number' => ['required', 'string', 'max:50'],
-            'delivery_address' => ['nullable', 'string', 'max:1000'],
-            'delivery_schedule' => ['nullable', 'date'],
-            'instructions' => ['nullable', 'string', 'max:1000'],
+            'reference' => ['required', 'string', 'max:100'],
+            'amount' => ['required', 'numeric', 'min:0.01'],
+            'payment_date' => ['required', 'date', 'before_or_equal:today'],
+            'remarks' => ['nullable', 'string', 'max:1000'],
         ]);
 
-        $fulfillment = $sale->fulfillment ?: new OrderFulfillment;
-        $fulfillment->fill([
-            'team_id' => $team->id,
-            'sale_id' => $sale->id,
-            'fulfillment_number' => $fulfillment->fulfillment_number ?: OrderFulfillment::generateFulfillmentNumber($team->id),
-            'fulfillment_type' => $validated['fulfillment_type'],
-            'recipient_name' => $validated['recipient_name'],
-            'contact_number' => $validated['contact_number'],
-            'delivery_address' => $validated['delivery_address'] ?? null,
-            'delivery_schedule' => $validated['delivery_schedule'] ?? null,
-            'instructions' => $validated['instructions'] ?? null,
-            'status' => $fulfillment->status ?: 'Preparing',
-            'handled_by_id' => $request->user()->id,
-        ]);
-        $fulfillment->save();
+        return $this->runWorkflow(function () use ($payment, $validated, $request, $sale) {
+            $receipt = app(PaymentService::class)->verify($payment, $validated, $request->user());
+            $sale->refresh();
 
-        return back()->with('success', 'Fulfillment details updated.');
+            return "Payment verified. Receipt {$receipt->receipt_number} generated."
+                .($sale->status === SalesOrderStatus::Confirmed || $sale->status === SalesOrderStatus::Completed ? " Order {$sale->order_number} is confirmed." : ' Balance: $'.number_format((float) $sale->outstanding_balance, 2).'.');
+        });
     }
 
-    /**
-     * Update order fulfillment status (e.g. Preparing -> Dispatched -> Delivered).
-     */
-    public function updateFulfillmentStatus(Request $request, mixed $current_team = null, mixed $fulfillment = null): RedirectResponse
+    public function rejectPayment(Request $request, mixed $current_team = null, mixed $sale = null, mixed $payment = null): RedirectResponse
     {
-        $fulfillment = $this->resolveFulfillment($fulfillment, $current_team, $request);
-        $team = $request->user()->currentTeam;
-        abort_if(! $team || $fulfillment->team_id !== $team->id, 403, 'Unauthorized fulfillment access.');
+        [, $payment] = $this->authorizedPayment($request, $sale, $payment, $current_team);
+        $reason = $request->validate(['reason' => ['required', 'string', 'max:500']])['reason'];
 
-        $validated = $request->validate([
-            'status' => ['required', Rule::in(['Preparing', 'Ready for Pickup', 'Dispatched', 'Delivered', 'Cancelled'])],
-            'proof_of_delivery' => ['nullable', 'file', 'mimes:jpg,jpeg,png,webp,pdf', 'max:5120'],
-            'notes' => ['nullable', 'string', 'max:1000'],
-        ]);
+        return $this->runWorkflow(function () use ($payment, $reason, $request) {
+            app(PaymentService::class)->reject($payment, $reason, $request->user());
 
-        $fulfillment->status = $validated['status'];
-        $fulfillment->handled_by_id = $request->user()->id;
-
-        if ($validated['status'] === 'Dispatched' && ! $fulfillment->dispatched_at) {
-            $fulfillment->dispatched_at = now();
-        } elseif ($validated['status'] === 'Delivered') {
-            if (! $fulfillment->dispatched_at) {
-                $fulfillment->dispatched_at = now();
-            }
-            $fulfillment->delivered_at = now();
-        }
-
-        if ($request->hasFile('proof_of_delivery')) {
-            $fulfillment->proof_of_delivery = $request->file('proof_of_delivery')->store('proofs/deliveries', 'local');
-        }
-
-        if (! empty($validated['notes'])) {
-            $fulfillment->notes = trim(($fulfillment->notes ?? '')."\n".$validated['notes']);
-        }
-
-        $fulfillment->save();
-
-        return back()->with('success', "Fulfillment status updated to {$validated['status']}.");
+            return 'Payment rejected. The customer is being notified.';
+        });
     }
 
-    /**
-     * Stream fulfillment proof of delivery file securely.
-     */
-    public function fulfillmentProof(Request $request, mixed $current_team = null, mixed $fulfillment = null): StreamedResponse
+    public function refundPayment(Request $request, mixed $current_team = null, mixed $sale = null, mixed $payment = null): RedirectResponse
     {
-        $fulfillment = $this->resolveFulfillment($fulfillment, $current_team, $request);
-        $team = $request->user()->currentTeam;
-        abort_if(! $team || $fulfillment->team_id !== $team->id, 403, 'Unauthorized fulfillment access.');
-        abort_if(! $fulfillment->proof_of_delivery, 404, 'No proof of delivery uploaded.');
+        [, $payment] = $this->authorizedPayment($request, $sale, $payment, $current_team);
+        abort_unless($request->user()->isAdmin(), 403);
+        $reason = $request->validate(['reason' => ['required', 'string', 'max:500']])['reason'];
+
+        return $this->runWorkflow(function () use ($payment, $reason, $request) {
+            app(PaymentService::class)->refund($payment, $reason, $request->user());
+
+            return 'Refund recorded.';
+        });
+    }
+
+    public function paymentProof(Request $request, mixed $current_team = null, mixed $sale = null, mixed $payment = null): StreamedResponse
+    {
+        [, $payment] = $this->authorizedPayment($request, $sale, $payment, $current_team);
+        abort_if(! $payment->proof_path, 404);
 
         foreach (['local', 'public'] as $disk) {
-            if (Storage::disk($disk)->exists($fulfillment->proof_of_delivery)) {
-                return Storage::disk($disk)->response($fulfillment->proof_of_delivery, null, [
-                    'Cache-Control' => 'private, no-store',
-                    'X-Content-Type-Options' => 'nosniff',
-                ]);
+            if (Storage::disk($disk)->exists($payment->proof_path)) {
+                return Storage::disk($disk)->response($payment->proof_path, null, ['Cache-Control' => 'private, no-store', 'X-Content-Type-Options' => 'nosniff']);
             }
         }
-
-        abort(404, 'Proof of delivery file missing.');
+        abort(404);
     }
 
-    /**
-     * Resolve order fulfillment from route parameters.
-     */
-    protected function resolveFulfillment(mixed $fulfillment, mixed $fallback = null, ?Request $request = null): OrderFulfillment
+    // -------------------------------------------------------------------------- order actions
+
+    public function setTerms(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
     {
-        if ($fulfillment instanceof OrderFulfillment) {
-            return $fulfillment;
-        }
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        abort_unless($request->user()->isAdmin(), 403, 'Only administrators can approve payment terms.');
+        $validated = $request->validate([
+            'payment_terms' => ['required', Rule::in([Sale::TERMS_FULL, Sale::TERMS_DOWN_PAYMENT, Sale::TERMS_CREDIT])],
+            'required_down_payment' => ['nullable', 'numeric', 'min:0.01'],
+            'credit_days' => ['nullable', 'integer', 'min:1', 'max:365'],
+        ]);
 
-        $candidates = array_filter([
-            $fulfillment,
-            $fallback,
-            $request?->route('fulfillment'),
-        ], fn ($val) => $val !== null && $val !== '');
+        return $this->runWorkflow(function () use ($sale, $validated, $request) {
+            $sale = app(SalesOrderService::class)->setTerms($sale, $validated['payment_terms'], isset($validated['required_down_payment']) ? (float) $validated['required_down_payment'] : null, $validated['credit_days'] ?? null, $request->user());
 
-        foreach ($candidates as $cand) {
-            if ($cand instanceof OrderFulfillment) {
-                return $cand;
-            }
-            if (is_numeric($cand)) {
-                $found = OrderFulfillment::find((int) $cand);
-                if ($found) {
-                    return $found;
-                }
-            }
-        }
-
-        abort(404, 'Order fulfillment record not found.');
+            return 'Payment terms saved.'.($sale->status === SalesOrderStatus::Confirmed ? " Order {$sale->order_number} is confirmed." : '');
+        });
     }
 
-    /**
-     * Stream a sale's proof of payment to an authorised user of the same team.
-     */
+    public function hold(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        $reason = $request->validate(['reason' => ['required', 'string', 'max:500']])['reason'];
+
+        return $this->runWorkflow(fn () => tap('Order put on hold.', fn () => app(SalesOrderService::class)->hold($sale, $reason, $request->user())));
+    }
+
+    public function resume(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+
+        return $this->runWorkflow(fn () => tap('Order resumed.', fn () => app(SalesOrderService::class)->resume($sale, $request->user())));
+    }
+
+    public function cancel(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        $reason = $request->validate(['reason' => ['required', 'string', 'max:500']])['reason'];
+
+        return $this->runWorkflow(fn () => tap("Order {$sale->order_number} cancelled. Reserved stock was released.", fn () => app(SalesOrderService::class)->cancel($sale, $reason, $request->user())));
+    }
+
+    public function cancelRemaining(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        $validated = $request->validate([
+            'reason' => ['required', 'string', 'max:500'],
+            'quantities' => ['nullable', 'array'],
+            'quantities.*' => ['integer', 'min:0'],
+        ]);
+
+        return $this->runWorkflow(fn () => tap('Remaining quantities cancelled.', fn () => app(SalesOrderService::class)->cancelRemaining($sale, $validated['quantities'] ?? null, $validated['reason'], $request->user())));
+    }
+
+    /** Reserve stock that arrived since the order was confirmed. */
+    public function reserve(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+
+        return $this->runWorkflow(function () use ($sale, $request) {
+            if (! in_array($sale->status, [SalesOrderStatus::Confirmed, SalesOrderStatus::Processing], true)) {
+                throw new WorkflowException('Stock is reserved only for confirmed orders.');
+            }
+            $shortages = DB::transaction(fn () => app(StockLedger::class)->reserve(Sale::whereKey($sale->id)->lockForUpdate()->first(), $request->user()));
+
+            return $shortages ? 'Reserved what is available. Still waiting for: '.collect($shortages)->map(fn ($s) => $s['product'].' ('.($s['needed'] - $s['reserved']).')')->implode(', ').'.' : 'All needed stock is reserved.';
+        });
+    }
+
+    public function complete(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+
+        return $this->runWorkflow(fn () => tap("Order {$sale->order_number} completed.", fn () => app(SalesOrderService::class)->complete($sale, $request->user())));
+    }
+
+    // ------------------------------------------------------------------------------ documents
+
+    public function orderPdf(Request $request, mixed $current_team = null, mixed $sale = null): HttpResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+
+        return $this->pdfResponse(app(DocumentPdf::class)->salesOrder($sale), "Sales-Order-{$sale->order_number}.pdf");
+    }
+
+    public function receiptPdf(Request $request, mixed $current_team = null, mixed $sale = null, mixed $receipt = null): HttpResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        $receipt = PaymentReceipt::where('sale_id', $sale->id)->findOrFail((int) ($receipt ?? $request->route('receipt')));
+        $content = $receipt->pdf_path && Storage::disk('local')->exists($receipt->pdf_path)
+            ? Storage::disk('local')->get($receipt->pdf_path)
+            : app(DocumentPdf::class)->receipt($receipt);
+
+        return $this->pdfResponse($content, "Receipt-{$receipt->receipt_number}.pdf");
+    }
+
+    public function invoicePdf(Request $request, mixed $current_team = null, mixed $sale = null, mixed $invoice = null): HttpResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        $invoice = SalesInvoice::where('sale_id', $sale->id)->findOrFail((int) ($invoice ?? $request->route('invoice')));
+        // An issued invoice is served exactly as issued; a cancelled one shows the cancellation.
+        $content = $invoice->status === SalesInvoice::ISSUED && $invoice->pdf_path && Storage::disk('local')->exists($invoice->pdf_path)
+            ? Storage::disk('local')->get($invoice->pdf_path)
+            : app(DocumentPdf::class)->invoice($invoice);
+
+        return $this->pdfResponse($content, "Invoice-{$invoice->invoice_number}.pdf");
+    }
+
+    public function cancelInvoice(Request $request, mixed $current_team = null, mixed $sale = null, mixed $invoice = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        abort_unless($request->user()->isAdmin(), 403);
+        $invoice = SalesInvoice::where('sale_id', $sale->id)->findOrFail((int) ($invoice ?? $request->route('invoice')));
+        $validated = $request->validate(['reason' => ['required', 'string', 'max:500'], 'reissue' => ['boolean']]);
+
+        return $this->runWorkflow(function () use ($invoice, $validated, $request) {
+            $new = app(InvoiceService::class)->cancel($invoice, $validated['reason'], $request->user(), (bool) ($validated['reissue'] ?? false));
+
+            return $new ? "Invoice {$invoice->invoice_number} cancelled and replaced by {$new->invoice_number}." : "Invoice {$invoice->invoice_number} cancelled.";
+        });
+    }
+
+    /** Try a failed customer email again (same event; never a duplicate of a sent one). */
+    public function retryNotification(Request $request, mixed $current_team = null, mixed $sale = null, mixed $notification = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        $log = NotificationLog::where('team_id', $sale->team_id)->findOrFail((int) ($notification ?? $request->route('notification')));
+
+        return $this->runWorkflow(function () use ($log) {
+            app(CustomerNotifier::class)->retry($log);
+
+            return 'The email is being sent again.';
+        });
+    }
+
+    /** Legacy: proof attached to sales recorded before payments were kept separately. */
     public function proof(Request $request, mixed $current_team = null, mixed $sale = null): StreamedResponse
     {
-        $sale = $this->resolveSale($sale, $current_team, $request);
-        $team = $request->user()->currentTeam;
-        abort_if(! $team || $sale->team_id !== $team->id, 403);
+        $sale = $this->authorizedSale($request, $sale, $current_team);
         abort_if(! $sale->proof_of_payment, 404);
 
-        // Older uploads may still sit on the public disk; serve them from there too.
         foreach (['local', 'public'] as $disk) {
             if (Storage::disk($disk)->exists($sale->proof_of_payment)) {
                 return Storage::disk($disk)->response($sale->proof_of_payment, null, [
@@ -439,71 +460,74 @@ class SaleController extends Controller
     }
 
     /**
-     * Delete / void a sale transaction and restore inventory stock.
+     * Archive an order. Only cancelled orders can be archived: cancelling is what releases the
+     * stock, so archiving never changes inventory and transaction history is kept.
      */
     public function destroy(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        if ($sale->status !== SalesOrderStatus::Cancelled) {
+            return back()->withErrors(['error' => "Cancel order {$sale->order_number} first. Only cancelled orders can be archived."]);
+        }
+
+        $sale->delete();
+
+        return back()->with('success', "Order {$sale->order_number} archived.");
+    }
+
+    // -------------------------------------------------------------------------------- helpers
+
+    /** @return array<string, list<array{value: string, label: string}>> */
+    private function statusOptions(): array
+    {
+        $map = fn (array $cases) => collect($cases)->map(fn ($c) => ['value' => $c->value, 'label' => $c->label()])->values()->all();
+
+        return [
+            'status' => $map(SalesOrderStatus::cases()),
+            'payment_status' => $map(PaymentStatus::cases()),
+            'delivery_status' => $map(DeliveryStatus::cases()),
+        ];
+    }
+
+    private function pdfResponse(string $content, string $filename): HttpResponse
+    {
+        return response($content, 200, [
+            'Content-Type' => 'application/pdf',
+            'Content-Disposition' => 'inline; filename="'.$filename.'"',
+            'Cache-Control' => 'private, no-store',
+        ]);
+    }
+
+    private function authorizedSale(Request $request, mixed $sale, mixed $current_team): Sale
     {
         $sale = $this->resolveSale($sale, $current_team, $request);
         $team = $request->user()->currentTeam;
         abort_if(! $team || $sale->team_id !== $team->id, 403, 'Unauthorized sale access.');
 
-        DB::transaction(function () use ($sale, $team, $request) {
-            $sale->load('items.product');
-
-            // Restore product stock and record stock movement for cancellation
-            foreach ($sale->items as $item) {
-                if ($item->product) {
-                    $previousStock = $item->product->stock;
-                    $item->product->increment('stock', $item->quantity);
-
-                    StockMovement::create([
-                        'team_id' => $team->id,
-                        'product_id' => $item->product->id,
-                        'user_id' => $request->user()->id,
-                        'type' => 'adjustment',
-                        'quantity' => $item->quantity,
-                        'previous_stock' => $previousStock,
-                        'new_stock' => $previousStock + $item->quantity,
-                        'reference_number' => $sale->invoice_number,
-                        'reason' => "Sale {$sale->invoice_number} voided / deleted",
-                        'movement_date' => now(),
-                    ]);
-
-                    $item->product->refresh();
-                    $item->product->updateCalculatedStatus();
-                }
-            }
-
-            $sale->delete();
-        });
-
-        return back()->with('success', "Sale {$sale->invoice_number} deleted successfully.");
+        return $sale;
     }
 
-    /**
-     * Resolve sale from route parameters.
-     */
+    /** @return array{0: Sale, 1: Payment} */
+    private function authorizedPayment(Request $request, mixed $sale, mixed $payment, mixed $current_team): array
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        $payment = Payment::where('sale_id', $sale->id)->findOrFail((int) ($payment ?? $request->route('payment')));
+
+        return [$sale, $payment];
+    }
+
     protected function resolveSale(mixed $sale, mixed $fallback = null, ?Request $request = null): Sale
     {
         if ($sale instanceof Sale) {
             return $sale;
         }
 
-        $candidates = array_filter([
-            $sale,
-            $fallback,
-            $request?->route('sale'),
-        ], fn ($val) => $val !== null && $val !== '');
-
-        foreach ($candidates as $cand) {
+        foreach (array_filter([$sale, $request?->route('sale'), $fallback], fn ($v) => $v !== null && $v !== '') as $cand) {
             if ($cand instanceof Sale) {
                 return $cand;
             }
-            if (is_numeric($cand)) {
-                $found = Sale::find((int) $cand);
-                if ($found) {
-                    return $found;
-                }
+            if (is_numeric($cand) && ($found = Sale::find((int) $cand))) {
+                return $found;
             }
         }
 

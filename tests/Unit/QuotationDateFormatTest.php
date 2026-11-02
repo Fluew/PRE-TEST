@@ -1,8 +1,11 @@
 <?php
 
 use App\Models\Quotation;
+use App\Models\Team;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
 
-uses(Tests\TestCase::class, Illuminate\Foundation\Testing\RefreshDatabase::class);
+uses(TestCase::class, RefreshDatabase::class);
 
 test('quotation date and valid until are serialized as date only without iso time part', function () {
     $quotation = new Quotation([
@@ -30,12 +33,17 @@ test('quotation date and valid until are serialized as date only without iso tim
 });
 
 test('generateNumber generates Q<MONTH><DAY><YEAR>-<PRODUCT_UNIQUE_ID> format correctly', function () {
+    $teamId = Team::factory()->create()->id;
+
     // Exact user example: Jan 04 2023 with SKU 068SSCR2 -> Q010423-068SSCR2
-    $quoteNumber = Quotation::generateNumber(9999, '068SSCR2', '2023-01-04');
+    $quoteNumber = Quotation::generateNumber($teamId, '068SSCR2', '2023-01-04');
     expect($quoteNumber)->toBe('Q010423-068SSCR2');
 
     // Current date format: 10-25-2026 with SKU 068SSCR2 -> Q102526-068SSCR2
-    $quoteNumber2 = Quotation::generateNumber(9999, '068SSCR2', '2026-10-25');
+    $quoteNumber2 = Quotation::generateNumber($teamId, '068SSCR2', '2026-10-25');
     expect($quoteNumber2)->toBe('Q102526-068SSCR2');
-});
 
+    // The same day and SKU again: the suffix starts at -01. Without a SKU: PROD.
+    expect(Quotation::generateNumber($teamId, '068SSCR2', '2026-10-25'))->toBe('Q102526-068SSCR2-01')
+        ->and(Quotation::generateNumber($teamId, null, '2026-10-30'))->toBe('Q103026-PROD');
+});

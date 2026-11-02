@@ -20,6 +20,7 @@ use Illuminate\Support\Str;
  * @property string $name
  * @property string $email
  * @property string $role
+ * @property string|null $preferred_currency USD or PHP, display only (App\Support\Currency)
  * @property Carbon|null $email_verified_at
  * @property string $password
  * @property bool $must_change_password

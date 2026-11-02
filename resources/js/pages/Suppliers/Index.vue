@@ -4,14 +4,9 @@ import { useCanDelete } from '@/composables/useCanDelete';
 import { ref, computed, watch } from 'vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
 import StatusBadge from '@/components/ui/StatusBadge.vue';
-import { Search, Plus, SlidersHorizontal, Trash2, Pencil, X, Check, CheckCircle2, Building2, Phone, Mail, Award } from '@lucide/vue';
-
-interface SupplierMetrics {
-    price?: number;
-    quality?: number;
-    delivery?: number;
-    service?: number;
-}
+import { type Evaluation } from '@/components/evaluation/ScoreBreakdown.vue';
+import SupplierEvaluationBreakdown from '@/components/evaluation/SupplierEvaluationBreakdown.vue';
+import { Search, Plus, Phone, Mail, Building2, CheckCircle2, Check } from '@lucide/vue';
 
 interface Supplier {
     id: number;
@@ -21,8 +16,35 @@ interface Supplier {
     email?: string | null;
     address?: string | null;
     status: 'Active' | 'Inactive';
-    ahp_score?: number | null;
-    metrics?: SupplierMetrics | null;
+    evaluation: SupplierEvaluation | null;
+}
+
+interface SupplierEvaluation extends Evaluation {
+    period: { from: string; to: string };
+}
+
+interface QuoteRecord {
+    id: number;
+    product: { id: number; name: string; sku: string } | null;
+    reference: string | null;
+    unit_price: number;
+    currency: 'USD' | 'PHP';
+    unit: string;
+    tax_inclusive: boolean;
+    quoted_on: string;
+    valid_until: string | null;
+    expired: boolean;
+    verified_at: string | null;
+    verified_by: { name: string } | null;
+}
+
+interface AvailabilityRecord {
+    id: number;
+    product: { id: number; name: string; sku: string } | null;
+    is_available: boolean;
+    notes: string | null;
+    verified_at: string | null;
+    verified_by: { name: string } | null;
 }
 
 const props = defineProps<{
@@ -38,6 +60,10 @@ const props = defineProps<{
         status?: string;
         sort?: string;
     };
+    weights: { delivery: number; price: number; quality: number };
+    periodMonths: number;
+    products: { id: number; name: string; sku: string; unit: string | null }[];
+    canVerify: boolean;
 }>();
 
 const page = usePage();
@@ -47,7 +73,7 @@ const teamSlug = computed(() => (page.props as any).currentTeam?.slug || (page.p
 // Search & Filter
 const search = ref(props.filters?.search || '');
 const selectedStatus = ref(props.filters?.status || 'All');
-const selectedSort = ref(props.filters?.sort || 'ahp_desc');
+const selectedSort = ref(props.filters?.sort || 'score_desc');
 let searchTimeout: ReturnType<typeof setTimeout> | null = null;
 
 const triggerNavigation = () => {
@@ -57,7 +83,7 @@ const triggerNavigation = () => {
         {
             search: search.value || undefined,
             status: selectedStatus.value !== 'All' ? selectedStatus.value : undefined,
-            sort: selectedSort.value !== 'ahp_desc' ? selectedSort.value : undefined,
+            sort: selectedSort.value !== 'score_desc' ? selectedSort.value : undefined,
         },
         { preserveState: true, preserveScroll: true, replace: true }
     );
@@ -76,7 +102,7 @@ watch(() => props.filters, (newFilters) => {
     if (newFilters) {
         if (newFilters.search !== undefined) search.value = newFilters.search || '';
         if (newFilters.status !== undefined) selectedStatus.value = newFilters.status || 'All';
-        if (newFilters.sort !== undefined) selectedSort.value = newFilters.sort || 'ahp_desc';
+        if (newFilters.sort !== undefined) selectedSort.value = newFilters.sort || 'score_desc';
     }
 }, { deep: true });
 
@@ -85,7 +111,6 @@ const showAddModal = ref(false);
 const showEditModal = ref(false);
 const showDeleteModal = ref(false);
 const deleteConfirmInput = ref('');
-const showAhpModal = ref(false);
 const selectedSupplier = ref<Supplier | null>(null);
 
 // Form
@@ -220,86 +245,99 @@ const confirmDelete = () => {
     });
 };
 
-// AHP Evaluation State
-const ahpWeights = ref({
-    price: 50,
-    quality: 30,
-    delivery: 20,
-});
+// ---- Supplier Evaluation (calculated by the backend from transactions; read-only here)
+const evalSupplier = ref<Supplier | null>(null);
+const evalTab = ref<'evaluation' | 'quotes' | 'availability'>('evaluation');
+const quotes = ref<QuoteRecord[]>([]);
+const availability = ref<AvailabilityRecord[]>([]);
+const recordsLoading = ref(false);
+const recordsError = ref<string | null>(null);
 
-const ahpSupplierScores = ref<Array<{
-    id: number;
-    name: string;
-    price: number;
-    quality: number;
-    delivery: number;
-}>>([]);
-
-const initAhp = () => {
-    ahpSupplierScores.value = props.suppliers.data.map(s => ({
-        id: s.id,
-        name: s.name,
-        price: s.metrics?.price ?? 8,
-        quality: s.metrics?.quality ?? 8,
-        delivery: s.metrics?.delivery ?? 7,
-    }));
-    showAhpModal.value = true;
+const scoreLabel = (e: SupplierEvaluation | null) => (e?.complete ? e.score!.toFixed(2) : null);
+const classBadge = (e: SupplierEvaluation | null) => {
+    switch (e?.classification) {
+        case 'Excellent':
+        case 'Very Good': return 'success';
+        case 'Good': return 'info';
+        case 'Fair': return 'warning';
+        case 'Needs Improvement': return 'danger';
+        default: return 'neutral';
+    }
 };
 
-const calculatedRankings = computed(() => {
-    const totalWeight = ahpWeights.value.price + ahpWeights.value.quality + ahpWeights.value.delivery;
-    if (totalWeight <= 0) return [];
+const loadRecords = async () => {
+    if (!evalSupplier.value) return;
+    recordsLoading.value = true;
+    recordsError.value = null;
+    try {
+        const res = await fetch(`/${teamSlug.value}/suppliers/${evalSupplier.value.id}/records`, {
+            headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+            credentials: 'same-origin',
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        quotes.value = data.quotes;
+        availability.value = data.availability;
+    } catch {
+        recordsError.value = 'The supplier records could not be loaded. Please try again.';
+    } finally {
+        recordsLoading.value = false;
+    }
+};
 
-    const normW = {
-        price: ahpWeights.value.price / totalWeight,
-        quality: ahpWeights.value.quality / totalWeight,
-        delivery: ahpWeights.value.delivery / totalWeight,
-    };
+const openEvaluation = (supplier: Supplier, tab: 'evaluation' | 'quotes' | 'availability' = 'evaluation') => {
+    evalSupplier.value = supplier;
+    evalTab.value = tab;
+    quotes.value = [];
+    availability.value = [];
+    void loadRecords();
+};
 
-    return ahpSupplierScores.value.map(s => {
-        const score = (s.price / 10) * normW.price +
-                      (s.quality / 10) * normW.quality +
-                      (s.delivery / 10) * normW.delivery;
-        return {
-            ...s,
-            calculatedScore: Number(score.toFixed(3)),
-        };
-    }).sort((a, b) => b.calculatedScore - a.calculatedScore);
+// Keep the open supplier in step with the reloaded page (scores change when records change).
+watch(() => props.suppliers.data, (rows) => {
+    if (evalSupplier.value) {
+        evalSupplier.value = rows.find((r) => r.id === evalSupplier.value!.id) ?? evalSupplier.value;
+    }
 });
 
-const savingAhp = ref(false);
-const promptSaveAhp = () => {
-    openConfirmModal({
-        title: 'Confirm AHP Criteria & Rankings',
-        description: 'Are you sure you want to save and apply the analytical hierarchy process (AHP) criteria weights and supplier performance evaluations?',
-        details: [
-            { label: 'Price / Cost Weight', value: `${ahpWeights.value.price}%` },
-            { label: 'Quality Weight', value: `${ahpWeights.value.quality}%` },
-            { label: 'Delivery Reliability Weight', value: `${ahpWeights.value.delivery}%` },
-        ],
-        confirmText: 'Save Rankings',
-        action: saveAhp,
+const today = new Date().toISOString().slice(0, 10);
+const quoteForm = useForm({ product_id: '' as number | '', reference: '', unit_price: '' as number | '', currency: 'USD', unit: 'pcs', tax_inclusive: false, quoted_on: today, valid_until: '', notes: '' });
+const availabilityForm = useForm({ product_id: '' as number | '', is_available: true, notes: '' });
+
+const afterRecordChange = { preserveScroll: true, preserveState: true, onSuccess: () => void loadRecords() };
+
+const submitQuote = () => {
+    if (!evalSupplier.value) return;
+    quoteForm.transform((d) => ({ ...d, valid_until: d.valid_until || null, reference: d.reference || null, notes: d.notes || null }))
+        .post(`/${teamSlug.value}/suppliers/${evalSupplier.value.id}/quotes`, {
+            ...afterRecordChange,
+            onSuccess: () => {
+                quoteForm.reset();
+                void loadRecords();
+            },
+        });
+};
+const submitAvailability = () => {
+    if (!evalSupplier.value) return;
+    availabilityForm.post(`/${teamSlug.value}/suppliers/${evalSupplier.value.id}/availability`, {
+        ...afterRecordChange,
+        onSuccess: () => {
+            availabilityForm.reset();
+            void loadRecords();
+        },
     });
 };
-
-const saveAhp = () => {
-    savingAhp.value = true;
-    router.post(
-        `/${teamSlug.value}/suppliers/ahp`,
-        {
-            criteria_weights: ahpWeights.value,
-            supplier_scores: ahpSupplierScores.value,
-        },
-        {
-            preserveScroll: true,
-            onFinish: () => {
-                savingAhp.value = false;
-                showAhpModal.value = false;
-            },
-        }
-    );
-};
-</script>
+const verifyRecord = (kind: 'quotes' | 'availability', id: number) =>
+    router.post(`/${teamSlug.value}/${kind === 'quotes' ? 'supplier-quotes' : 'supplier-availability'}/${id}/verify`, {}, afterRecordChange);
+const removeRecord = (kind: 'quotes' | 'availability', id: number) =>
+    openConfirmModal({
+        title: kind === 'quotes' ? 'Remove quote' : 'Remove availability record',
+        description: 'The record is removed and the evaluation is recalculated without it. This is logged.',
+        confirmText: 'Remove',
+        action: () => router.delete(`/${teamSlug.value}/${kind === 'quotes' ? 'supplier-quotes' : 'supplier-availability'}/${id}`, afterRecordChange),
+    });
+const money = (amount: number, currency: string) =>
+    new Intl.NumberFormat(currency === 'PHP' ? 'en-PH' : 'en-US', { style: 'currency', currency }).format(amount);</script>
 
 <template>
     <Head title="Supplier Management" />
@@ -309,18 +347,9 @@ const saveAhp = () => {
         <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-4">
             <div>
                 <h1 class="page-title">Supplier Management</h1>
-                <p class="page-subtitle">Supplier contacts, contracts and AHP evaluations.</p>
+                <p class="page-subtitle">Supplier contacts and record-based performance evaluations.</p>
             </div>
             <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
-                <SpecularButton
-                    variant="secondary"
-                    size="md"
-                    :radius="12"
-                    @click="initAhp"
-                >
-                    <SlidersHorizontal class="w-4 h-4 mr-1.5 inline" />
-                    Run AHP Evaluation
-                </SpecularButton>
                 <SpecularButton
                     variant="brand"
                     size="md"
@@ -364,7 +393,7 @@ const saveAhp = () => {
                     @change="applyFilter"
                     class="w-full py-2 px-3 bg-white border border-gray-200 rounded-xl text-sm font-medium text-gray-900 focus:outline-none focus:border-[#F8B803] cursor-pointer"
                 >
-                    <option value="ahp_desc">Highest AHP Score</option>
+                    <option value="score_desc">Highest evaluation score</option>
                     <option value="name_asc">Name (A-Z)</option>
                     <option value="name_desc">Name (Z-A)</option>
                 </select>
@@ -380,7 +409,7 @@ const saveAhp = () => {
                             <th class="pb-3 font-medium">Company Name</th>
                             <th class="pb-3 font-medium">Contact Person</th>
                             <th class="pb-3 font-medium">Phone & Email</th>
-                            <th class="pb-3 font-medium">AHP Score</th>
+                            <th class="pb-3 font-medium">Evaluation</th>
                             <th class="pb-3 font-medium">Status</th>
                             <th class="pb-3 font-medium text-right">Actions</th>
                         </tr>
@@ -408,17 +437,30 @@ const saveAhp = () => {
                                 </div>
                             </td>
                             <td class="py-4">
-                                <span v-if="supplier.ahp_score !== null && supplier.ahp_score !== undefined" class="text-[#F8B803] font-semibold text-base flex items-center gap-1">
-                                    <Award class="w-4 h-4 text-[#F8B803]" />
-                                    {{ Number(supplier.ahp_score).toFixed(3) }}
-                                </span>
-                                <span v-else class="text-gray-400 text-xs">Unranked</span>
+                                <button type="button" class="text-left" @click="openEvaluation(supplier)">
+                                    <template v-if="supplier.evaluation?.complete">
+                                        <span class="block font-mono text-base font-semibold text-gray-900">{{ scoreLabel(supplier.evaluation) }}</span>
+                                        <StatusBadge :status="supplier.evaluation.classification!" :variant="classBadge(supplier.evaluation)" size="sm" />
+                                    </template>
+                                    <template v-else>
+                                        <span class="block text-xs font-medium text-amber-700">Insufficient data</span>
+                                        <span class="text-[11px] text-gray-500 underline">View details</span>
+                                    </template>
+                                </button>
                             </td>
                             <td class="py-4">
                                 <StatusBadge :status="supplier.status" size="sm" />
                             </td>
                             <td class="py-4 text-right">
                                 <div class="inline-flex items-center justify-end gap-1.5">
+                                    <SpecularButton
+                                        variant="secondary"
+                                        size="sm"
+                                        :radius="8"
+                                        @click="openEvaluation(supplier)"
+                                    >
+                                        Evaluation
+                                    </SpecularButton>
                                     <SpecularButton
                                         variant="secondary"
                                         size="sm"
@@ -645,111 +687,163 @@ const saveAhp = () => {
         </div>
     </div>
 
-    <!-- AHP Evaluation Modal -->
-    <div v-if="showAhpModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-        <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-4xl max-h-[90vh] overflow-y-auto shadow-xl">
-            <div class="flex justify-between items-center mb-6">
+    <!-- Supplier Evaluation -->
+    <div v-if="evalSupplier" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" @click.self="evalSupplier = null">
+        <div class="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-gray-200 bg-white" role="dialog" aria-modal="true" aria-labelledby="eval-title">
+            <div class="flex items-start justify-between gap-3 border-b border-gray-100 px-6 py-4">
                 <div>
-                    <h3 class="text-2xl font-semibold text-gray-900 tracking-tight">Analytic Hierarchy Process (AHP)</h3>
-                    <p class="text-gray-500 text-sm">Tune criteria weights and evaluate supplier metrics to calculate optimal vendor rankings across the 3 decision criteria.</p>
+                    <h3 id="eval-title" class="text-lg font-semibold text-gray-900">{{ evalSupplier.name }}</h3>
+                    <p v-if="evalSupplier.evaluation" class="text-xs text-gray-500">
+                        Evaluation period {{ evalSupplier.evaluation.period.from }} to {{ evalSupplier.evaluation.period.to }} ({{ periodMonths }} months)
+                    </p>
                 </div>
-                <button @click="showAhpModal = false" class="text-gray-400 hover:text-gray-600 text-xl">&times;</button>
-            </div>
-
-            <!-- Criteria Weights -->
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                <div class="bg-gray-50 p-5 rounded-xl border border-gray-200">
-                    <h4 class="text-gray-900 font-semibold mb-3 border-b border-gray-200 pb-2 text-sm">Criteria Relative Weights (%)</h4>
-                    <div class="space-y-4">
-                        <div>
-                            <div class="flex justify-between text-xs mb-1">
-                                <span class="font-semibold text-gray-800">Price / Cost ({{ ahpWeights.price }}%)</span>
-                            </div>
-                            <p class="text-[11px] text-gray-500 mb-1.5">(price competitiveness of the supplier)</p>
-                            <input v-model.number="ahpWeights.price" type="range" min="1" max="100" class="w-full accent-[#F8B803]" />
-                        </div>
-                        <div>
-                            <div class="flex justify-between text-xs mb-1">
-                                <span class="font-semibold text-gray-800">Quality ({{ ahpWeights.quality }}%)</span>
-                            </div>
-                            <p class="text-[11px] text-gray-500 mb-1.5">(quality of product of the supplier evaluated by the staffs)</p>
-                            <input v-model.number="ahpWeights.quality" type="range" min="1" max="100" class="w-full accent-[#F8B803]" />
-                        </div>
-                        <div>
-                            <div class="flex justify-between text-xs mb-1">
-                                <span class="font-semibold text-gray-800">Delivery Reliability ({{ ahpWeights.delivery }}%)</span>
-                            </div>
-                            <p class="text-[11px] text-gray-500 mb-1.5">(reliability of supplier in terms on delivery to MR Pride)</p>
-                            <input v-model.number="ahpWeights.delivery" type="range" min="1" max="100" class="w-full accent-[#F8B803]" />
-                        </div>
+                <div class="flex items-start gap-3">
+                    <div v-if="evalSupplier.evaluation" class="text-right">
+                        <div class="text-xl font-semibold text-gray-900">{{ evalSupplier.evaluation.complete ? `${scoreLabel(evalSupplier.evaluation)} / 100` : 'Insufficient data' }}</div>
+                        <div class="text-xs text-gray-500">{{ evalSupplier.evaluation.classification ?? 'Not classified' }}</div>
                     </div>
-                </div>
-
-                <!-- Calculated Rankings -->
-                <div class="bg-gray-50 p-5 rounded-xl border border-gray-200">
-                    <h4 class="text-gray-900 font-semibold mb-3 border-b border-gray-200 pb-2 text-sm">Calculated Rankings</h4>
-                    <div class="space-y-2.5 max-h-[220px] overflow-y-auto pr-1">
-                        <div v-for="(sup, idx) in calculatedRankings" :key="sup.id" class="flex items-center justify-between p-2 rounded-lg bg-white border border-gray-200 text-sm">
-                            <div class="flex items-center gap-2.5">
-                                <span class="w-6 h-6 rounded-full bg-[#F8B803]/20 text-[#92400e] flex items-center justify-center text-xs font-semibold">{{ idx + 1 }}</span>
-                                <span class="font-medium text-gray-900">{{ sup.name }}</span>
-                            </div>
-                            <span class="font-semibold text-[#F8B803]">{{ sup.calculatedScore.toFixed(3) }}</span>
-                        </div>
-                    </div>
+                    <button type="button" class="text-xl text-gray-400 hover:text-gray-600" aria-label="Close" @click="evalSupplier = null">&times;</button>
                 </div>
             </div>
 
-            <!-- Detailed Performance Matrix -->
-            <div class="bg-gray-50 rounded-xl border border-gray-200 p-5 mb-6">
-                <h4 class="text-gray-900 font-semibold mb-3 text-sm">Rate Supplier Performance (1 = Poor, 10 = Excellent)</h4>
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left text-sm text-gray-600">
-                        <thead class="text-xs text-gray-500 border-b border-gray-200">
-                            <tr>
-                                <th class="pb-2">Supplier</th>
-                                <th class="pb-2 text-center">Price / Cost (1-10)</th>
-                                <th class="pb-2 text-center">Quality (1-10)</th>
-                                <th class="pb-2 text-center">Delivery Reliability (1-10)</th>
-                            </tr>
-                        </thead>
-                        <tbody class="divide-y divide-gray-200">
-                            <tr v-for="sup in ahpSupplierScores" :key="sup.id">
-                                <td class="py-3 text-gray-900 font-semibold">{{ sup.name }}</td>
-                                <td class="py-3 text-center">
-                                    <input v-model.number="sup.price" type="number" min="1" max="10" class="w-16 text-center bg-white border border-gray-200 rounded-lg py-1 text-sm text-gray-900 focus:outline-none focus:border-[#F8B803]" />
+            <div class="flex gap-1 border-b border-gray-100 px-6 text-sm" role="tablist">
+                <button v-for="t in [{ k: 'evaluation', l: 'Evaluation' }, { k: 'quotes', l: 'Price quotes' }, { k: 'availability', l: 'Product availability' }]" :key="t.k"
+                        type="button" role="tab" :aria-selected="evalTab === t.k"
+                        :class="evalTab === t.k ? 'border-[#4b5320] font-semibold text-[#4b5320]' : 'border-transparent text-gray-500'"
+                        class="border-b-2 px-3 py-2" @click="evalTab = t.k as any">{{ t.l }}</button>
+            </div>
+
+            <div class="overflow-y-auto px-6 py-4">
+                <!-- Evaluation -->
+                <template v-if="evalTab === 'evaluation' && evalSupplier.evaluation">
+                    <SupplierEvaluationBreakdown :evaluation="evalSupplier.evaluation" :weights="weights" />
+                    <p class="mt-3 text-xs text-gray-500">
+                        Scores cannot be entered or edited. Record purchase orders with a promised date (Procurement), inspect inbound deliveries (Deliveries), and record quotes here; an administrator verifies quotes.
+                    </p>
+                </template>
+
+                <p v-if="evalTab !== 'evaluation' && recordsLoading" class="text-sm text-gray-500">Loading records…</p>
+                <p v-if="evalTab !== 'evaluation' && recordsError" class="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{{ recordsError }}</p>
+
+                <!-- Price quotes -->
+                <template v-if="evalTab === 'quotes'">
+                    <form class="grid grid-cols-1 gap-3 rounded-xl border border-gray-200 p-4 sm:grid-cols-2" @submit.prevent="submitQuote">
+                        <div class="sm:col-span-2">
+                            <label class="field-label" for="q-product">Product</label>
+                            <select id="q-product" v-model="quoteForm.product_id" class="field-control" required>
+                                <option value="" disabled>Choose a product</option>
+                                <option v-for="p in products" :key="p.id" :value="p.id">{{ p.name }} ({{ p.sku }})</option>
+                            </select>
+                            <p v-if="quoteForm.errors.product_id" class="mt-1 text-xs text-rose-600">{{ quoteForm.errors.product_id }}</p>
+                        </div>
+                        <div>
+                            <label class="field-label" for="q-price">Unit price</label>
+                            <input id="q-price" v-model="quoteForm.unit_price" type="number" min="0.01" step="0.01" class="field-control" required />
+                            <p v-if="quoteForm.errors.unit_price" class="mt-1 text-xs text-rose-600">{{ quoteForm.errors.unit_price }}</p>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="field-label" for="q-currency">Currency</label>
+                                <select id="q-currency" v-model="quoteForm.currency" class="field-control"><option>USD</option><option>PHP</option></select>
+                            </div>
+                            <div>
+                                <label class="field-label" for="q-unit">Unit</label>
+                                <input id="q-unit" v-model="quoteForm.unit" type="text" maxlength="50" class="field-control" required />
+                            </div>
+                        </div>
+                        <div>
+                            <label class="field-label" for="q-quoted">Quote date</label>
+                            <input id="q-quoted" v-model="quoteForm.quoted_on" type="date" :max="today" class="field-control" required />
+                            <p v-if="quoteForm.errors.quoted_on" class="mt-1 text-xs text-rose-600">{{ quoteForm.errors.quoted_on }}</p>
+                        </div>
+                        <div>
+                            <label class="field-label" for="q-valid">Valid until (optional)</label>
+                            <input id="q-valid" v-model="quoteForm.valid_until" type="date" :min="quoteForm.quoted_on" class="field-control" />
+                            <p v-if="quoteForm.errors.valid_until" class="mt-1 text-xs text-rose-600">{{ quoteForm.errors.valid_until }}</p>
+                        </div>
+                        <div>
+                            <label class="field-label" for="q-ref">Quote reference (optional)</label>
+                            <input id="q-ref" v-model="quoteForm.reference" type="text" maxlength="100" class="field-control" />
+                        </div>
+                        <label class="flex items-center gap-2 self-end pb-2 text-sm text-gray-700">
+                            <input v-model="quoteForm.tax_inclusive" type="checkbox" class="accent-[#4b5320]" /> Price includes tax
+                        </label>
+                        <div class="flex justify-end sm:col-span-2">
+                            <button type="submit" class="brand-button" :disabled="quoteForm.processing">Record quote</button>
+                        </div>
+                    </form>
+                    <p class="mt-2 text-xs text-gray-500">Quotes are compared only with other suppliers' quotes for the same product, unit, currency and tax basis. Expired and unverified quotes are not counted.</p>
+
+                    <table v-if="quotes.length" class="mt-4 w-full text-left text-sm">
+                        <thead><tr class="text-xs text-gray-500"><th class="py-1">Product</th><th class="text-right">Price</th><th>Terms</th><th>Dates</th><th>Status</th><th></th></tr></thead>
+                        <tbody>
+                            <tr v-for="q in quotes" :key="q.id" class="border-t border-gray-100">
+                                <td class="py-2">{{ q.product?.name }}<div class="text-xs text-gray-500">{{ q.reference || 'No reference' }}</div></td>
+                                <td class="text-right font-mono">{{ money(q.unit_price, q.currency) }}</td>
+                                <td class="text-xs">per {{ q.unit }}, {{ q.tax_inclusive ? 'tax incl.' : 'tax excl.' }}</td>
+                                <td class="text-xs">{{ q.quoted_on }}<span v-if="q.valid_until"> → {{ q.valid_until }}</span></td>
+                                <td class="text-xs">
+                                    <StatusBadge v-if="q.expired" status="Expired" size="sm" />
+                                    <StatusBadge v-else-if="q.verified_at" status="Verified" size="sm" />
+                                    <StatusBadge v-else status="Pending review" size="sm" />
+                                    <div v-if="q.verified_by" class="text-gray-500">by {{ q.verified_by.name }}</div>
                                 </td>
-                                <td class="py-3 text-center">
-                                    <input v-model.number="sup.quality" type="number" min="1" max="10" class="w-16 text-center bg-white border border-gray-200 rounded-lg py-1 text-sm text-gray-900 focus:outline-none focus:border-[#F8B803]" />
-                                </td>
-                                <td class="py-3 text-center">
-                                    <input v-model.number="sup.delivery" type="number" min="1" max="10" class="w-16 text-center bg-white border border-gray-200 rounded-lg py-1 text-sm text-gray-900 focus:outline-none focus:border-[#F8B803]" />
+                                <td class="whitespace-nowrap text-right">
+                                    <button v-if="canVerify && !q.verified_at" type="button" class="text-xs font-medium text-[#4b5320] underline" @click="verifyRecord('quotes', q.id)">Verify</button>
+                                    <button v-if="canVerify || !q.verified_at" type="button" class="ml-2 text-xs text-rose-600 underline" @click="removeRecord('quotes', q.id)">Remove</button>
                                 </td>
                             </tr>
                         </tbody>
                     </table>
-                </div>
-            </div>
+                    <p v-else-if="!recordsLoading" class="mt-4 text-sm text-gray-500">No quotes recorded for this supplier.</p>
+                </template>
 
-            <!-- Footer -->
-            <div class="flex justify-end gap-3 pt-2 border-t border-gray-100">
-                <SpecularButton
-                    variant="secondary"
-                    size="md"
-                    :radius="10"
-                    @click="showAhpModal = false"
-                >
-                    Cancel
-                </SpecularButton>
-                <SpecularButton
-                    variant="brand"
-                    size="md"
-                    :radius="10"
-                    :disabled="savingAhp"
-                    @click="promptSaveAhp"
-                >
-                    {{ savingAhp ? 'Saving...' : 'Apply & Save Rankings' }}
-                </SpecularButton>
+                <!-- Product availability -->
+                <template v-if="evalTab === 'availability'">
+                    <form class="grid grid-cols-1 gap-3 rounded-xl border border-gray-200 p-4 sm:grid-cols-3" @submit.prevent="submitAvailability">
+                        <div class="sm:col-span-2">
+                            <label class="field-label" for="a-product">Product</label>
+                            <select id="a-product" v-model="availabilityForm.product_id" class="field-control" required>
+                                <option value="" disabled>Choose a product</option>
+                                <option v-for="p in products" :key="p.id" :value="p.id">{{ p.name }} ({{ p.sku }})</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="field-label" for="a-available">Can supply now?</label>
+                            <select id="a-available" v-model="availabilityForm.is_available" class="field-control">
+                                <option :value="true">Yes, available</option>
+                                <option :value="false">No, not available</option>
+                            </select>
+                        </div>
+                        <div class="sm:col-span-3">
+                            <label class="field-label" for="a-notes">Notes (optional)</label>
+                            <input id="a-notes" v-model="availabilityForm.notes" type="text" maxlength="1000" placeholder="e.g. confirmed by phone with sales rep" class="field-control" />
+                        </div>
+                        <div class="flex justify-end sm:col-span-3">
+                            <button type="submit" class="brand-button" :disabled="availabilityForm.processing">Save availability</button>
+                        </div>
+                    </form>
+                    <p class="mt-2 text-xs text-gray-500">Used by AHP Product Prioritization (Supplier Availability) once an administrator verifies it. Changing a record needs verifying again.</p>
+
+                    <table v-if="availability.length" class="mt-4 w-full text-left text-sm">
+                        <thead><tr class="text-xs text-gray-500"><th class="py-1">Product</th><th>Can supply</th><th>Status</th><th></th></tr></thead>
+                        <tbody>
+                            <tr v-for="a in availability" :key="a.id" class="border-t border-gray-100">
+                                <td class="py-2">{{ a.product?.name }}<div v-if="a.notes" class="text-xs text-gray-500">{{ a.notes }}</div></td>
+                                <td>{{ a.is_available ? 'Yes' : 'No' }}</td>
+                                <td class="text-xs">
+                                    <StatusBadge :status="a.verified_at ? 'Verified' : 'Pending review'" size="sm" />
+                                    <div v-if="a.verified_by" class="text-gray-500">by {{ a.verified_by.name }}</div>
+                                </td>
+                                <td class="whitespace-nowrap text-right">
+                                    <button v-if="canVerify && !a.verified_at" type="button" class="text-xs font-medium text-[#4b5320] underline" @click="verifyRecord('availability', a.id)">Verify</button>
+                                    <button v-if="canVerify || !a.verified_at" type="button" class="ml-2 text-xs text-rose-600 underline" @click="removeRecord('availability', a.id)">Remove</button>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <p v-else-if="!recordsLoading" class="mt-4 text-sm text-gray-500">No availability recorded for this supplier.</p>
+                </template>
             </div>
         </div>
     </div>

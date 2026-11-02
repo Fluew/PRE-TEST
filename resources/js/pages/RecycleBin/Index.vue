@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { Head, router, usePage } from '@inertiajs/vue3';
+import { showToast } from '@/composables/useFlashToast';
 import { ref, computed, watch } from 'vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
+import { useCurrency } from '@/composables/useCurrency';
 import {
     Archive,
     Trash2,
@@ -37,6 +39,8 @@ interface TrashedRecord {
     title: string;
     identifier: string;
     summary: string;
+    /** The record's main amount (stored USD), or null. */
+    amount?: number | null;
     deleted_at_raw: string;
     deleted_at: string;
     deleted_at_human: string;
@@ -81,6 +85,8 @@ const props = defineProps<{
 
 const page = usePage();
 const teamSlug = computed(() => (page.props as any).currentTeam?.slug || '');
+// Record amounts are stored USD; shown in the user's display currency (header switch).
+const { formatMoney } = useCurrency();
 
 // Local filter state
 const searchQuery = ref(props.filters.search || '');
@@ -114,28 +120,7 @@ watch(searchQuery, () => {
     applyFilters();
 });
 
-// Toast Notifications
-const notificationMessage = ref('');
-const notificationType = ref<'success' | 'error' | 'info'>('success');
-
-const showNotification = (msg: string, type: 'success' | 'error' | 'info' = 'success') => {
-    notificationMessage.value = msg;
-    notificationType.value = type;
-    setTimeout(() => {
-        notificationMessage.value = '';
-    }, 4500);
-};
-
-// Check flash messages on mount / updates
-watch(
-    () => page.props.flash,
-    (flash: any) => {
-        if (flash?.success) showNotification(flash.success, 'success');
-        if (flash?.error) showNotification(flash.error, 'error');
-        if (flash?.info) showNotification(flash.info, 'info');
-    },
-    { immediate: true, deep: true }
-);
+// Flash toasts are handled globally by useFlashToast in AppSidebarLayout
 
 // Selection state for bulk actions
 const selectedIds = ref<Array<{ type: string; id: number | string }>>([]);
@@ -214,7 +199,7 @@ const confirmRestore = () => {
             },
             onError: () => {
                 isProcessing.value = false;
-                showNotification('Failed to restore record.', 'error');
+                showToast('Failed to restore record.', 'error');
             },
             onFinish: () => {
                 isProcessing.value = false;
@@ -268,7 +253,7 @@ const confirmForceDelete = () => {
             },
             onError: () => {
                 isProcessing.value = false;
-                showNotification('Failed to permanently delete record.', 'error');
+                showToast('Failed to permanently delete record.', 'error');
             },
             onFinish: () => {
                 isProcessing.value = false;
@@ -296,7 +281,7 @@ const confirmBulkRestore = () => {
             },
             onError: () => {
                 isProcessing.value = false;
-                showNotification('Failed to perform bulk restore.', 'error');
+                showToast('Failed to perform bulk restore.', 'error');
             },
             onFinish: () => {
                 isProcessing.value = false;
@@ -324,7 +309,7 @@ const confirmBulkForceDelete = () => {
             },
             onError: () => {
                 isProcessing.value = false;
-                showNotification('Failed to permanently purge records.', 'error');
+                showToast('Failed to permanently purge records.', 'error');
             },
             onFinish: () => {
                 isProcessing.value = false;
@@ -351,7 +336,7 @@ const confirmEmptyBin = () => {
             },
             onError: () => {
                 isProcessing.value = false;
-                showNotification('Failed to empty recycle bin.', 'error');
+                showToast('Failed to empty recycle bin.', 'error');
             },
             onFinish: () => {
                 isProcessing.value = false;
@@ -419,23 +404,6 @@ const getTypeBadgeClasses = (type: string) => {
 
 <template>
     <Head title="Archive / Recycle Bin | Admin" />
-
-    <!-- Toast Notification -->
-    <div
-        v-if="notificationMessage"
-        class="fixed top-5 right-5 z-[100] max-w-md px-4 py-3 rounded-xl shadow-xl border text-sm flex items-center gap-3 animate-in fade-in duration-200"
-        :class="[
-            notificationType === 'success' ? 'bg-emerald-50 text-emerald-900 border-emerald-200 dark:bg-emerald-950 dark:text-emerald-100 dark:border-emerald-800' :
-            notificationType === 'error' ? 'bg-rose-50 text-rose-900 border-rose-200 dark:bg-rose-950 dark:text-rose-100 dark:border-rose-800' :
-            'bg-blue-50 text-blue-900 border-blue-200 dark:bg-blue-950 dark:text-blue-100 dark:border-blue-800'
-        ]"
-    >
-        <CheckCircle2 v-if="notificationType === 'success'" class="w-5 h-5 text-emerald-600 shrink-0" />
-        <AlertCircle v-else-if="notificationType === 'error'" class="w-5 h-5 text-rose-600 shrink-0" />
-        <Clock v-else class="w-5 h-5 text-blue-600 shrink-0" />
-        <span class="font-medium text-xs sm:text-sm">{{ notificationMessage }}</span>
-        <button @click="notificationMessage = ''" class="ml-auto text-gray-400 hover:text-gray-700 dark:hover:text-gray-200">&times;</button>
-    </div>
 
     <div class="workspace-page">
         <!-- Page Header -->
@@ -640,7 +608,7 @@ const getTypeBadgeClasses = (type: string) => {
                             <!-- Summary / Details -->
                             <td class="p-3.5 max-w-sm">
                                 <span class="text-xs text-gray-700 dark:text-gray-300 font-medium leading-relaxed">
-                                    {{ record.summary || '—' }}
+                                    <template v-if="record.amount !== null && record.amount !== undefined">{{ formatMoney(record.amount) }}<template v-if="record.summary"> • </template></template>{{ record.summary || (record.amount === null || record.amount === undefined ? '—' : '') }}
                                 </span>
                             </td>
 

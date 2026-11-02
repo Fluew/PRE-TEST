@@ -4,7 +4,8 @@ import { ref, computed, watch } from 'vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
 import StatusBadge from '@/components/ui/StatusBadge.vue';
 import { useCanDelete } from '@/composables/useCanDelete';
-import { 
+import { useCurrency } from '@/composables/useCurrency';
+import {
     Search, 
     Plus, 
     Printer, 
@@ -37,42 +38,30 @@ interface SaleItem {
     subtotal: number;
 }
 
-interface OrderFulfillment {
-    id: number;
-    fulfillment_number: string;
-    fulfillment_type: string;
-    recipient_name: string;
-    contact_number: string;
-    delivery_address?: string | null;
-    delivery_schedule?: string | null;
-    status: string;
-    proof_url?: string | null;
-}
-
 interface Sale {
     id: number;
-    invoice_number: string;
+    order_number: string;
+    channel: 'quotation' | 'counter';
+    fulfillment_type: 'delivery' | 'pickup';
+    invoice_number?: string | null;
     client_name: string;
     sale_date: string;
-    subtotal: number;
-    discount: number;
-    tax_amount: number;
     grand_total: number;
-    status: string;
-    payment_method?: string;
-    payment_reference?: string;
     amount_paid?: number;
     outstanding_balance?: number;
-    payment_date?: string;
+    status: string;
+    status_label?: string;
     payment_status?: string;
-    proof_of_payment?: string;
-    proof_url?: string;
-    notes?: string;
-    verified_by?: { name: string } | null;
+    payment_status_label?: string;
+    payment_terms?: string;
+    is_on_hold?: boolean;
+    delivery_status_label?: string | null;
+    quotation?: { id: number; quotation_number: string } | null;
+    fulfillment?: { id: number; status: string; fulfillment_number: string } | null;
     items?: SaleItem[];
-    fulfillment?: OrderFulfillment | null;
 }
 
+type Option = { value: string; label: string };
 interface ProductItem {
     id: number;
     sku: string;
@@ -93,27 +82,39 @@ const props = defineProps<{
     filters?: {
         search?: string;
         status?: string;
+        payment_status?: string;
+        delivery_status?: string;
+        date_from?: string | null;
+        date_to?: string | null;
+        sort?: string;
     };
     metrics: {
         totalSales: number;
         todaySales: number;
         monthSales: number;
         pendingPayments: number;
+        toVerify: number;
+        outstanding: number;
     };
     products: ProductItem[];
+    options: { status: Option[]; payment_status: Option[]; delivery_status: Option[] };
 }>();
 
 const page = usePage();
 const canDelete = useCanDelete();
 const teamSlug = computed(() => (page.props as any).currentTeam?.slug || (page.props as any).team?.slug || '');
 
-const formatCurrency = (amount: number) => {
-    return new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' }).format(amount);
-};
+// Stored amounts are USD; shown in the user's display currency (header switch).
+const { formatMoney: formatCurrency, conversionNote } = useCurrency();
 
 // Search & Filter
 const search = ref(props.filters?.search || '');
 const selectedStatus = ref(props.filters?.status || 'All');
+const selectedPayment = ref(props.filters?.payment_status || 'All');
+const selectedDelivery = ref(props.filters?.delivery_status || 'All');
+const dateFrom = ref(props.filters?.date_from || '');
+const dateTo = ref(props.filters?.date_to || '');
+const sort = ref(props.filters?.sort || 'newest');
 
 let searchTimeout: ReturnType<typeof setTimeout> | null = null;
 const applyFilter = () => {
@@ -124,12 +125,27 @@ const applyFilter = () => {
             {
                 search: search.value || undefined,
                 status: selectedStatus.value !== 'All' ? selectedStatus.value : undefined,
+                payment_status: selectedPayment.value !== 'All' ? selectedPayment.value : undefined,
+                delivery_status: selectedDelivery.value !== 'All' ? selectedDelivery.value : undefined,
+                date_from: dateFrom.value || undefined,
+                date_to: dateTo.value || undefined,
+                sort: sort.value !== 'newest' ? sort.value : undefined,
             },
             { preserveState: true, preserveScroll: true, replace: true }
         );
     }, 300);
 };
-
+const hasFilters = computed(() => !!search.value || selectedStatus.value !== 'All' || selectedPayment.value !== 'All' || selectedDelivery.value !== 'All' || !!dateFrom.value || !!dateTo.value);
+const resetFilters = () => {
+    search.value = '';
+    selectedStatus.value = 'All';
+    selectedPayment.value = 'All';
+    selectedDelivery.value = 'All';
+    dateFrom.value = '';
+    dateTo.value = '';
+    sort.value = 'newest';
+    applyFilter();
+};
 // POS State
 const posModalOpen = ref(false);
 const productSearch = ref('');
@@ -294,7 +310,7 @@ const promptCompleteTransaction = () => {
     const itemCount = cart.value.reduce((s, i) => s + i.qty, 0);
 
     openConfirmModal({
-        title: 'Confirm Sale Transaction',
+        title: 'Confirm Counter Sale',
         description: `Are you sure you want to finalize and record this sale for "${currentCustomer.value.trim()}"?`,
         details: [
             { label: 'Customer Name', value: currentCustomer.value.trim() },
@@ -345,33 +361,19 @@ const completeTransaction = () => {
     );
 };
 
-// Invoice Modal State
-const selectedInvoice = ref<Sale | null>(null);
-const invoiceModalOpen = ref(false);
-
-const viewInvoice = (sale: Sale) => {
-    selectedInvoice.value = sale;
-    invoiceModalOpen.value = true;
-};
-
-const printSheet = () => {
-    window.print();
-};
-
 const saleToDelete = ref<Sale | null>(null);
 
 const promptDeleteSale = (sale: Sale) => {
     saleToDelete.value = sale;
     openConfirmModal({
-        title: 'Delete Sale Record',
-        description: `Are you sure you want to delete invoice "${sale.invoice_number}" for ${sale.client_name}? This action will void the transaction and restore sold quantities back to active inventory.`,
+        title: 'Archive Cancelled Order',
+        description: `Archive cancelled order "${sale.order_number}" for ${sale.client_name}? Its stock was already handled when it was cancelled; it can be restored from the Recycle Bin.`,
         details: [
-            { label: 'Invoice #', value: sale.invoice_number },
+            { label: 'Order #', value: sale.order_number },
             { label: 'Customer', value: sale.client_name },
             { label: 'Grand Total', value: formatCurrency(Number(sale.grand_total)) },
-            { label: 'Payment Method', value: sale.payment_method || 'Bank Transfer' },
         ],
-        confirmText: 'Delete Sale',
+        confirmText: 'Archive Order',
         variant: 'danger',
         action: () => deleteSale(sale),
     });
@@ -388,72 +390,6 @@ const deleteSale = (sale: Sale) => {
     });
 };
 
-// Payment Verification State
-const showVerifyModal = ref(false);
-const saleToVerify = ref<Sale | null>(null);
-const verifyDecision = ref<'Verified' | 'Rejected'>('Verified');
-const verifyNotes = ref('');
-
-const openVerifyModal = (sale: Sale) => {
-    saleToVerify.value = sale;
-    verifyDecision.value = 'Verified';
-    verifyNotes.value = '';
-    showVerifyModal.value = true;
-};
-
-const submitPaymentVerification = () => {
-    if (!saleToVerify.value) return;
-    isSubmitting.value = true;
-    router.post(`/${teamSlug.value}/sales/${saleToVerify.value.id}/verify-payment`, {
-        status: verifyDecision.value,
-        notes: verifyNotes.value || undefined,
-    }, {
-        preserveScroll: true,
-        onFinish: () => {
-            isSubmitting.value = false;
-            showVerifyModal.value = false;
-            saleToVerify.value = null;
-        }
-    });
-};
-
-// Fulfillment Management State
-const showFulfillmentModal = ref(false);
-const saleToFulfill = ref<Sale | null>(null);
-const fulfillmentTargetStatus = ref<string>('Preparing');
-const fulfillmentNotes = ref('');
-const fulfillmentProofFile = ref<File | null>(null);
-
-const onFulfillmentProofChange = (e: Event) => {
-    const input = e.target as HTMLInputElement;
-    fulfillmentProofFile.value = input.files?.[0] || null;
-};
-
-const openFulfillmentModal = (sale: Sale) => {
-    saleToFulfill.value = sale;
-    fulfillmentTargetStatus.value = sale.fulfillment?.status || 'Preparing';
-    fulfillmentNotes.value = '';
-    fulfillmentProofFile.value = null;
-    showFulfillmentModal.value = true;
-};
-
-const submitFulfillmentStatus = () => {
-    if (!saleToFulfill.value?.fulfillment) return;
-    isSubmitting.value = true;
-    router.patch(`/${teamSlug.value}/fulfillments/${saleToFulfill.value.fulfillment.id}/status`, {
-        status: fulfillmentTargetStatus.value,
-        notes: fulfillmentNotes.value || undefined,
-        proof_of_delivery: fulfillmentProofFile.value || undefined,
-    }, {
-        forceFormData: true,
-        preserveScroll: true,
-        onFinish: () => {
-            isSubmitting.value = false;
-            showFulfillmentModal.value = false;
-            saleToFulfill.value = null;
-        }
-    });
-};
 </script>
 
 <template>
@@ -461,33 +397,25 @@ const submitFulfillmentStatus = () => {
 
     <div class="workspace-page">
         <!-- Header -->
-        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-4">
+        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
             <div>
-                <h1 class="page-title">Sales & Point of Sale</h1>
-                <p class="page-subtitle">Store sales and payments. Stock updates automatically.</p>
+                <h1 class="page-title">Sales Orders</h1>
+                <p class="page-subtitle">Orders from accepted quotations and counter sales: payments, invoices and delivery in one place.</p>
             </div>
-            <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
-                <SpecularButton
-                    variant="brand"
-                    size="md"
-                    :radius="12"
-                    @click="openPosModal"
-                    class="w-full sm:w-auto"
-                >
-                    <Plus class="w-4 h-4" />
-                    New Sale (POS)
-                </SpecularButton>
-            </div>
+            <SpecularButton variant="brand" size="md" :radius="12" @click="openPosModal" class="w-full sm:w-auto">
+                <Plus class="w-4 h-4" />
+                Counter Sale
+            </SpecularButton>
         </div>
 
         <!-- Metrics -->
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div
                 v-for="card in [
-                    { label: 'Completed sales', value: metrics.totalSales, alert: '' },
-                    { label: 'Revenue today', value: formatCurrency(metrics.todaySales), alert: '' },
-                    { label: 'Revenue this month', value: formatCurrency(metrics.monthSales), alert: '' },
-                    { label: 'Pending payments', value: metrics.pendingPayments, alert: Number(metrics.pendingPayments) > 0 ? 'text-amber-600' : '' },
+                    { label: 'Sales today (confirmed)', value: formatCurrency(metrics.todaySales), alert: '' },
+                    { label: 'Sales this month', value: formatCurrency(metrics.monthSales), alert: '' },
+                    { label: 'Payments to verify', value: metrics.toVerify, alert: Number(metrics.toVerify) > 0 ? 'text-amber-600' : '' },
+                    { label: 'Outstanding balances', value: formatCurrency(metrics.outstanding), alert: '' },
                 ]"
                 :key="card.label"
                 class="bg-white border border-gray-200 rounded-xl px-4 py-3"
@@ -497,166 +425,92 @@ const submitFulfillmentStatus = () => {
             </div>
         </div>
 
-        <!-- Filter Bar -->
-        <div class="flex flex-col sm:flex-row gap-4 mb-4">
-            <div class="relative flex-1 sm:max-w-md">
-                <Search class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
-                <input
-                    v-model="search"
-                    @input="applyFilter"
-                    type="text"
-                    placeholder="Search by invoice number or client name..."
-                    class="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 focus:outline-none focus:border-gray-400"
-                />
+        <!-- Filters -->
+        <div class="rounded-xl border border-gray-200 bg-white p-4">
+            <div class="flex flex-col gap-3 md:flex-row md:flex-wrap md:items-center">
+                <div class="relative min-w-0 md:min-w-64 md:flex-1">
+                    <Search class="pointer-events-none absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-gray-400" />
+                    <input v-model="search" @input="applyFilter" type="search" aria-label="Search orders"
+                           placeholder="Order #, quotation #, invoice # or customer" class="field-control pl-10" />
+                </div>
+                <select v-model="selectedStatus" @change="applyFilter" aria-label="Order status" class="field-control md:w-44">
+                    <option value="All">All order statuses</option>
+                    <option v-for="o in options.status" :key="o.value" :value="o.value">{{ o.label }}</option>
+                </select>
+                <select v-model="selectedPayment" @change="applyFilter" aria-label="Payment status" class="field-control md:w-44">
+                    <option value="All">All payment statuses</option>
+                    <option v-for="o in options.payment_status" :key="o.value" :value="o.value">{{ o.label }}</option>
+                </select>
+                <select v-model="selectedDelivery" @change="applyFilter" aria-label="Delivery status" class="field-control md:w-44">
+                    <option value="All">All delivery statuses</option>
+                    <option v-for="o in options.delivery_status" :key="o.value" :value="o.value">{{ o.label }}</option>
+                </select>
+                <input v-model="dateFrom" @change="applyFilter" type="date" aria-label="From date" class="field-control md:w-40" />
+                <input v-model="dateTo" @change="applyFilter" type="date" aria-label="To date" class="field-control md:w-40" />
+                <select v-model="sort" @change="applyFilter" aria-label="Sort" class="field-control md:w-44">
+                    <option value="newest">Newest first</option>
+                    <option value="oldest">Oldest first</option>
+                    <option value="total_desc">Largest total</option>
+                    <option value="balance_desc">Largest balance</option>
+                </select>
+                <button v-if="hasFilters" type="button" class="secondary-button shrink-0" @click="resetFilters">Reset</button>
             </div>
-            <select
-                v-model="selectedStatus"
-                @change="applyFilter"
-                class="bg-white border border-gray-200 rounded-xl px-3.5 py-2 text-sm text-gray-900 focus:outline-none focus:border-gray-400 min-w-[150px]"
-            >
-                <option value="All">All Statuses</option>
-                <option value="Completed">Completed</option>
-                <option value="Pending Payment">Pending Payment</option>
-                <option value="Cancelled">Cancelled</option>
-            </select>
         </div>
 
-        <!-- Sales History Table -->
-        <div class="rounded-xl border border-gray-200 bg-white overflow-hidden flex flex-col">
+        <!-- Orders -->
+        <div class="rounded-xl border border-gray-200 bg-white overflow-hidden">
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-sm text-gray-600">
-                    <thead class="bg-gray-50 text-xs text-gray-500 border-b border-gray-200">
+                    <thead class="border-b border-gray-200">
                         <tr>
-                            <th class="px-6 py-4 font-medium">Invoice ID</th>
-                            <th class="px-6 py-4 font-medium">Date & Time</th>
-                            <th class="px-6 py-4 font-medium">Customer</th>
-                            <th class="px-6 py-4 font-medium">Payment & Audit</th>
-                            <th class="px-6 py-4 font-medium">Total / Balance</th>
-                            <th class="px-6 py-4 font-medium">Fulfillment</th>
-                            <th class="px-6 py-4 font-medium">Status</th>
-                            <th class="px-6 py-4 font-medium text-right">Actions</th>
+                            <th class="whitespace-nowrap">Order</th>
+                            <th class="whitespace-nowrap">Customer</th>
+                            <th class="whitespace-nowrap text-right">Total</th>
+                            <th class="whitespace-nowrap text-right">Paid / Balance</th>
+                            <th class="whitespace-nowrap">Order</th>
+                            <th class="whitespace-nowrap">Payment</th>
+                            <th class="whitespace-nowrap">Delivery</th>
+                            <th class="whitespace-nowrap text-right">Actions</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-gray-100">
                         <tr v-if="!sales.data.length">
-                            <td colspan="8" class="px-6 py-8 text-center text-gray-500">
-                                No sales records found. Click "+ New Sale (POS)" to record a transaction.
+                            <td colspan="8" class="py-10 text-center text-gray-500">
+                                No orders match. Orders are created from accepted quotations, or with Counter Sale.
                             </td>
                         </tr>
-                        <tr v-for="sale in sales.data" :key="sale.id" class="hover:bg-gray-50 transition-colors">
-                            <td class="px-6 py-4 font-mono font-semibold text-[#F8B803]">
-                                <a :href="`/${teamSlug}/sales/${sale.id}`" class="hover:underline">
-                                    {{ sale.invoice_number }}
-                                </a>
-                            </td>
-                            <td class="px-6 py-4 text-gray-600">{{ new Date(sale.sale_date).toLocaleString() }}</td>
-                            <td class="px-6 py-4 font-medium text-gray-900">{{ sale.client_name }}</td>
-                            <td class="px-6 py-4 text-gray-600 text-xs">
-                                <div class="font-medium text-gray-900">{{ sale.payment_method || 'Bank Transfer' }}</div>
-                                <div v-if="sale.payment_reference" class="text-[11px] text-gray-500 font-mono mt-0.5">
-                                    Ref: {{ sale.payment_reference }}
+                        <tr v-for="sale in sales.data" :key="sale.id">
+                            <td class="whitespace-nowrap">
+                                <a :href="`/${teamSlug}/sales/${sale.id}`" class="font-mono font-semibold text-gray-900 hover:underline">{{ sale.order_number }}</a>
+                                <div class="text-[11px] text-gray-500">
+                                    {{ new Date(sale.sale_date).toLocaleDateString() }}
+                                    · {{ sale.channel === 'counter' ? 'Counter' : (sale.quotation?.quotation_number ?? 'Quotation') }}
                                 </div>
-                                <div class="mt-1 flex items-center gap-1.5 flex-wrap">
-                                    <span
-                                        :class="[
-                                            'px-1.5 py-0.5 rounded text-[10px] font-semibold',
-                                            sale.payment_status === 'Verified' ? 'bg-emerald-100 text-emerald-800' :
-                                            sale.payment_status === 'Rejected' ? 'bg-rose-100 text-rose-800' :
-                                            'bg-amber-100 text-amber-800'
-                                        ]"
-                                    >
-                                        {{ sale.payment_status || 'Verified' }}
-                                    </span>
-                                    <a
-                                        v-if="sale.proof_url"
-                                        :href="sale.proof_url"
-                                        target="_blank"
-                                        class="inline-flex items-center gap-0.5 text-[10px] text-[#4b5320] font-semibold hover:underline"
-                                    >
-                                        <ExternalLink class="w-3 h-3" />
-                                        <span>Proof</span>
-                                    </a>
-                                </div>
+                                <div v-if="sale.invoice_number" class="font-mono text-[11px] text-gray-400">{{ sale.invoice_number }}</div>
                             </td>
-                            <td class="px-6 py-4 text-xs">
-                                <div class="font-semibold text-gray-900 text-sm">{{ formatCurrency(Number(sale.grand_total)) }}</div>
-                                <div v-if="Number(sale.outstanding_balance || 0) > 0" class="text-[11px] font-semibold text-rose-600 mt-0.5">
-                                    Bal: {{ formatCurrency(sale.outstanding_balance) }}
-                                </div>
+                            <td class="min-w-40 font-medium text-gray-900">{{ sale.client_name }}</td>
+                            <td class="whitespace-nowrap text-right font-semibold text-gray-900">{{ formatCurrency(Number(sale.grand_total)) }}</td>
+                            <td class="whitespace-nowrap text-right text-xs">
+                                <div class="text-gray-900">{{ formatCurrency(Number(sale.amount_paid || 0)) }}</div>
+                                <div v-if="Number(sale.outstanding_balance || 0) > 0" class="font-semibold text-rose-600">{{ formatCurrency(Number(sale.outstanding_balance)) }} due</div>
                             </td>
-                            <td class="px-6 py-4 text-xs">
-                                <div v-if="sale.fulfillment">
-                                    <span
-                                        :class="[
-                                            'px-2 py-0.5 rounded text-[10px] font-semibold inline-block',
-                                            sale.fulfillment.status === 'Delivered' ? 'bg-emerald-100 text-emerald-800' :
-                                            sale.fulfillment.status === 'Dispatched' ? 'bg-blue-100 text-blue-800' :
-                                            'bg-amber-100 text-amber-800'
-                                        ]"
-                                    >
-                                        {{ sale.fulfillment.status }}
-                                    </span>
-                                    <div class="text-[10px] text-gray-400 font-mono mt-0.5">
-                                        {{ sale.fulfillment.fulfillment_number }}
-                                    </div>
-                                </div>
-                                <div v-else class="text-xs text-gray-400 italic">
-                                    Store Direct
-                                </div>
+                            <td class="whitespace-nowrap"><StatusBadge :status="sale.status_label ?? sale.status" size="sm" /><div v-if="sale.is_on_hold" class="mt-0.5 text-[11px] font-medium text-amber-700">On hold</div></td>
+                            <td class="whitespace-nowrap">
+                                <StatusBadge :status="sale.payment_status_label ?? sale.payment_status" size="sm" />
+                                <div v-if="sale.payment_terms && sale.payment_terms !== 'full'" class="mt-0.5 text-[11px] text-gray-500">{{ sale.payment_terms === 'credit' ? 'Credit terms' : 'Down payment' }}</div>
                             </td>
-                            <td class="px-6 py-4">
-                                <StatusBadge :status="sale.status" size="sm" />
+                            <td class="whitespace-nowrap">
+                                <StatusBadge v-if="sale.delivery_status_label" :status="sale.delivery_status_label" size="sm" />
+                                <span v-else class="text-xs text-gray-400">Starts when confirmed</span>
+                                <div class="mt-0.5 text-[11px] text-gray-500">{{ sale.fulfillment_type === 'pickup' ? 'Pickup' : 'Delivery' }}</div>
                             </td>
-                            <td class="px-6 py-4 text-right">
-                                <div class="flex items-center justify-end gap-1.5 flex-wrap">
-                                    <!-- Verify Payment Button -->
-                                    <SpecularButton
-                                        v-if="sale.payment_status === 'Pending Verification'"
-                                        variant="brand"
-                                        size="sm"
-                                        :radius="8"
-                                        @click="openVerifyModal(sale)"
-                                        title="Verify Payment Proof"
-                                    >
-                                        <ShieldCheck class="w-3.5 h-3.5 mr-1 inline" />
-                                        Verify
-                                    </SpecularButton>
-
-                                    <!-- Update Fulfillment Button -->
-                                    <SpecularButton
-                                        v-if="sale.fulfillment"
-                                        variant="secondary"
-                                        size="sm"
-                                        :radius="8"
-                                        @click="openFulfillmentModal(sale)"
-                                        title="Track / Update Delivery"
-                                    >
-                                        <Truck class="w-3.5 h-3.5 mr-1 inline" />
-                                        Fulfill
-                                    </SpecularButton>
-
-                                    <!-- Invoice View Button -->
-                                    <SpecularButton
-                                        variant="secondary"
-                                        size="sm"
-                                        :radius="8"
-                                        @click="viewInvoice(sale)"
-                                    >
-                                        <Printer class="w-3.5 h-3.5 mr-1 inline" />
-                                        Invoice
-                                    </SpecularButton>
-
-                                    <!-- Delete Button -->
-                                    <SpecularButton
-                                        v-if="canDelete"
-                                        variant="danger"
-                                        size="sm"
-                                        :radius="8"
-                                        @click="promptDeleteSale(sale)"
-                                    >
-                                        <Trash2 class="w-3.5 h-3.5 mr-1 inline" />
-                                        Delete
-                                    </SpecularButton>
+                            <td class="whitespace-nowrap text-right">
+                                <div class="inline-flex items-center gap-1.5">
+                                    <a :href="`/${teamSlug}/sales/${sale.id}`" class="secondary-button min-h-8 px-3 text-xs">Open</a>
+                                    <button v-if="canDelete && sale.status === 'cancelled'" type="button" title="Archive cancelled order"
+                                            class="rounded-lg p-1.5 text-gray-400 hover:bg-rose-50 hover:text-rose-600" @click="promptDeleteSale(sale)">
+                                        <Trash2 class="size-4" />
+                                    </button>
                                 </div>
                             </td>
                         </tr>
@@ -665,11 +519,9 @@ const submitFulfillmentStatus = () => {
             </div>
 
             <!-- Pagination -->
-            <div v-if="sales.total > sales.data.length" class="p-4 flex items-center justify-between border-t border-gray-100">
-                <span class="text-xs text-gray-500">
-                    Showing {{ sales.data.length }} of {{ sales.total }} transactions
-                </span>
-                <div class="flex gap-1">
+            <div v-if="sales.last_page > 1" class="flex flex-col gap-3 border-t border-gray-100 p-4 sm:flex-row sm:items-center sm:justify-between">
+                <span class="text-xs text-gray-500">Showing {{ sales.data.length }} of {{ sales.total }} orders</span>
+                <div class="flex flex-wrap gap-1">
                     <button
                         v-for="(link, i) in sales.links"
                         :key="i"
@@ -677,15 +529,14 @@ const submitFulfillmentStatus = () => {
                         @click="link.url && router.visit(link.url, { preserveScroll: true })"
                         v-html="link.label"
                         :class="[
-                            'px-3 py-1 text-xs rounded-lg border transition-colors',
-                            link.active ? 'bg-[#F8B803] text-white border-[#F8B803] font-semibold' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50',
+                            'inline-flex h-8 min-w-8 items-center justify-center rounded-lg border px-3 text-xs transition-colors',
+                            link.active ? 'bg-brand text-white border-brand font-semibold' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50',
                             !link.url ? 'opacity-50 cursor-not-allowed' : ''
                         ]"
                     />
                 </div>
             </div>
         </div>
-
         <!-- POS Modal -->
         <div v-if="posModalOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
             <div class="bg-white border border-gray-200 rounded-xl shadow-xl w-full max-w-6xl flex flex-col md:flex-row h-[90vh] overflow-hidden">
@@ -826,10 +677,10 @@ const submitFulfillmentStatus = () => {
                             <div class="grid grid-cols-2 gap-2">
                                 <div>
                                     <label for="pos_amount" class="block text-xs font-semibold text-gray-700 mb-1">
-                                        Amount paid
+                                        Amount paid (USD)
                                     </label>
                                     <div class="relative">
-                                        <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 text-xs font-semibold">₱</span>
+                                        <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 text-xs font-semibold">$</span>
                                         <input
                                              id="pos_amount"
                                             v-model.number="amountPaid"
@@ -980,7 +831,7 @@ const submitFulfillmentStatus = () => {
                             :disabled="!canComplete || isSubmitting"
                             @click="promptCompleteTransaction"
                         >
-                            {{ isSubmitting ? 'Recording...' : 'Complete & Record Sale' }}
+                            {{ isSubmitting ? 'Recording...' : 'Record Counter Sale' }}
                         </SpecularButton>
                     </div>
                 </div>
@@ -988,269 +839,6 @@ const submitFulfillmentStatus = () => {
             </div>
         </div>
 
-        <!-- Printable Invoice View Modal -->
-        <div v-if="invoiceModalOpen && selectedInvoice" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-            <div class="bg-white border border-gray-200 rounded-xl shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6">
-                <div class="flex justify-between items-start mb-6 border-b border-gray-100 pb-4">
-                    <div>
-                        <h2 class="text-2xl font-semibold text-gray-900 tracking-tight">OFFICIAL RECEIPT / INVOICE</h2>
-                        <p class="text-sm text-gray-500">Invoice: <strong class="text-[#F8B803]">{{ selectedInvoice.invoice_number }}</strong></p>
-                    </div>
-                    <button @click="invoiceModalOpen = false" class="text-gray-400 hover:text-gray-600 text-xl font-semibold cursor-pointer">&times;</button>
-                </div>
-
-                <div class="grid grid-cols-2 gap-4 text-xs text-gray-600 mb-6 bg-gray-50 p-4 rounded-xl border border-gray-100">
-                    <div class="space-y-1">
-                        <div class="font-semibold text-gray-900 mb-1">Customer / Billed To:</div>
-                        <div class="text-sm font-semibold text-gray-800">{{ selectedInvoice.client_name }}</div>
-                        <div><span class="text-gray-500">Payment Method:</span> <strong class="text-gray-900">{{ selectedInvoice.payment_method || 'Bank Transfer' }}</strong></div>
-                        <div v-if="selectedInvoice.payment_reference">
-                            <span class="text-gray-500">Payment Reference:</span> <strong class="font-mono text-gray-900">{{ selectedInvoice.payment_reference }}</strong>
-                        </div>
-                        <div v-if="selectedInvoice.amount_paid">
-                            <span class="text-gray-500">Amount Paid:</span> <strong class="text-gray-900">{{ formatCurrency(Number(selectedInvoice.amount_paid)) }}</strong>
-                        </div>
-                        <div v-if="selectedInvoice.payment_date">
-                            <span class="text-gray-500">Payment Date:</span> <strong class="text-gray-900">{{ new Date(selectedInvoice.payment_date).toLocaleDateString() }}</strong>
-                        </div>
-                        <div v-if="selectedInvoice.proof_url" class="pt-1.5">
-                            <a
-                                :href="selectedInvoice.proof_url"
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                class="inline-flex items-center gap-1.5 text-xs font-semibold text-[#4b5320] hover:underline"
-                            >
-                                <ExternalLink class="w-3.5 h-3.5" />
-                                View Proof of Payment Attachment
-                            </a>
-                        </div>
-                    </div>
-                    <div class="text-right space-y-1">
-                        <div class="font-semibold text-gray-900 mb-1">Invoice Details:</div>
-                        <div>Date: {{ new Date(selectedInvoice.sale_date).toLocaleString() }}</div>
-                        <div>Status: <span class="font-semibold text-emerald-600">{{ selectedInvoice.status }}</span></div>
-                        <div v-if="selectedInvoice.notes" class="text-gray-500 italic mt-2">
-                            Notes: {{ selectedInvoice.notes }}
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Items Table -->
-                <table class="w-full text-left text-xs mb-6">
-                    <thead class="border-b border-gray-200 text-gray-500">
-                        <tr>
-                            <th class="py-2">Item Description</th>
-                            <th class="py-2 text-center">Qty</th>
-                            <th class="py-2 text-right">Price</th>
-                            <th class="py-2 text-right">Total</th>
-                        </tr>
-                    </thead>
-                    <tbody class="divide-y divide-gray-100">
-                        <tr v-for="item in selectedInvoice.items" :key="item.id">
-                            <td class="py-2 text-gray-900 font-medium">{{ item.product_name }}</td>
-                            <td class="py-2 text-center text-gray-600">{{ item.quantity }}</td>
-                            <td class="py-2 text-right text-gray-600">{{ formatCurrency(Number(item.unit_price)) }}</td>
-                            <td class="py-2 text-right font-semibold text-gray-900">{{ formatCurrency(Number(item.subtotal)) }}</td>
-                        </tr>
-                    </tbody>
-                </table>
-
-                <div class="border-t border-gray-200 pt-3 flex justify-between items-baseline text-lg font-semibold text-gray-900 mb-6">
-                    <span>Grand Total</span>
-                    <span class="text-[#F8B803] text-2xl">{{ formatCurrency(Number(selectedInvoice.grand_total)) }}</span>
-                </div>
-
-                <div class="flex justify-end gap-3 pt-2 border-t border-gray-100">
-                    <SpecularButton
-                        variant="secondary"
-                        size="md"
-                        :radius="10"
-                        @click="invoiceModalOpen = false"
-                    >
-                        Close
-                    </SpecularButton>
-                    <SpecularButton
-                        variant="brand"
-                        size="md"
-                        :radius="10"
-                        @click="printSheet"
-                    >
-                        <Printer class="w-4 h-4 mr-1.5 inline" />
-                        Print Invoice
-                    </SpecularButton>
-                </div>
-            </div>
-        </div>
-
-        <!-- Verify Payment Modal -->
-        <div v-if="showVerifyModal && saleToVerify" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-            <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl animate-in fade-in duration-150">
-                <div class="flex items-center gap-3 mb-4">
-                    <div class="p-3 bg-amber-100 text-amber-800 rounded-xl">
-                        <ShieldCheck class="w-6 h-6" />
-                    </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Audit Customer Payment</h3>
-                        <p class="text-xs text-gray-500">Invoice: {{ saleToVerify.invoice_number }} ({{ saleToVerify.client_name }})</p>
-                    </div>
-                </div>
-
-                <div class="bg-gray-50 p-3.5 rounded-xl border border-gray-200 text-xs space-y-1.5 mb-4">
-                    <div class="flex justify-between">
-                        <span class="text-gray-500">Claimed Amount:</span>
-                        <span class="font-semibold text-gray-900">{{ formatCurrency(saleToVerify.amount_paid) }}</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-gray-500">Payment Method:</span>
-                        <span class="font-semibold text-gray-900">{{ saleToVerify.payment_method }}</span>
-                    </div>
-                    <div v-if="saleToVerify.payment_reference" class="flex justify-between">
-                        <span class="text-gray-500">Reference #:</span>
-                        <span class="font-mono font-semibold text-gray-900">{{ saleToVerify.payment_reference }}</span>
-                    </div>
-                    <div v-if="saleToVerify.proof_url" class="pt-2 border-t border-gray-200">
-                        <a :href="saleToVerify.proof_url" target="_blank" class="text-[#4b5320] font-semibold inline-flex items-center gap-1 hover:underline">
-                            <ExternalLink class="w-3.5 h-3.5" />
-                            <span>View Proof of Payment File</span>
-                        </a>
-                    </div>
-                </div>
-
-                <div class="space-y-3 mb-4">
-                    <label class="block text-xs font-semibold text-gray-700">Verification Decision</label>
-                    <div class="grid grid-cols-2 gap-3">
-                        <label
-                            :class="verifyDecision === 'Verified' ? 'border-emerald-500 bg-emerald-50 text-emerald-900 font-bold' : 'border-gray-200 bg-white text-gray-700'"
-                            class="border rounded-xl p-3 cursor-pointer flex items-center gap-2 text-xs transition-colors"
-                        >
-                            <input type="radio" v-model="verifyDecision" value="Verified" class="accent-emerald-600" />
-                            <span>Approve & Verify</span>
-                        </label>
-
-                        <label
-                            :class="verifyDecision === 'Rejected' ? 'border-rose-500 bg-rose-50 text-rose-900 font-bold' : 'border-gray-200 bg-white text-gray-700'"
-                            class="border rounded-xl p-3 cursor-pointer flex items-center gap-2 text-xs transition-colors"
-                        >
-                            <input type="radio" v-model="verifyDecision" value="Rejected" class="accent-rose-600" />
-                            <span>Reject Payment</span>
-                        </label>
-                    </div>
-
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Audit Notes / Explanation</label>
-                        <textarea
-                            v-model="verifyNotes"
-                            rows="2"
-                            class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                            placeholder="Optional explanation notes for customer and staff..."
-                        ></textarea>
-                    </div>
-                </div>
-
-                <div class="flex justify-end gap-3 pt-3 border-t border-gray-100">
-                    <SpecularButton
-                        type="button"
-                        variant="secondary"
-                        size="md"
-                        :radius="10"
-                        @click="showVerifyModal = false"
-                    >
-                        Cancel
-                    </SpecularButton>
-                    <SpecularButton
-                        type="button"
-                        variant="brand"
-                        size="md"
-                        :radius="10"
-                        :disabled="isSubmitting"
-                        @click="submitPaymentVerification"
-                    >
-                        {{ isSubmitting ? 'Saving...' : 'Confirm Decision' }}
-                    </SpecularButton>
-                </div>
-            </div>
-        </div>
-
-        <!-- Update Fulfillment Modal -->
-        <div v-if="showFulfillmentModal && saleToFulfill?.fulfillment" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-            <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl animate-in fade-in duration-150">
-                <div class="flex items-center gap-3 mb-4">
-                    <div class="p-3 bg-blue-100 text-blue-800 rounded-xl">
-                        <Truck class="w-6 h-6" />
-                    </div>
-                    <div>
-                        <h3 class="text-lg font-semibold text-gray-900">Manage Dispatch & Delivery</h3>
-                        <p class="text-xs text-gray-500">Tracking: {{ saleToFulfill.fulfillment.fulfillment_number }}</p>
-                    </div>
-                </div>
-
-                <div class="space-y-4 mb-4">
-                    <div class="bg-gray-50 p-3 rounded-xl border border-gray-200 text-xs space-y-1">
-                        <div class="flex justify-between"><span class="text-gray-500">Recipient:</span> <span class="font-semibold text-gray-900">{{ saleToFulfill.fulfillment.recipient_name }}</span></div>
-                        <div class="flex justify-between"><span class="text-gray-500">Contact:</span> <span class="text-gray-800">{{ saleToFulfill.fulfillment.contact_number }}</span></div>
-                        <div v-if="saleToFulfill.fulfillment.delivery_address" class="text-gray-600 mt-1">
-                            <span class="text-gray-500 block">Destination:</span> {{ saleToFulfill.fulfillment.delivery_address }}
-                        </div>
-                    </div>
-
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Fulfillment Status</label>
-                        <select
-                            v-model="fulfillmentTargetStatus"
-                            class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                        >
-                            <option value="Preparing">Preparing Order</option>
-                            <option value="Ready for Pickup">Ready for Customer Pickup</option>
-                            <option value="Dispatched">Dispatched / Out for Delivery</option>
-                            <option value="Delivered">Delivered & Confirmed</option>
-                            <option value="Cancelled">Cancelled</option>
-                        </select>
-                    </div>
-
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Proof of Delivery / Waybill (Optional)</label>
-                        <input
-                            type="file"
-                            accept=".jpg,.jpeg,.png,.webp,.pdf"
-                            class="block w-full text-xs text-gray-500 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-[#4b5320] file:text-white hover:file:bg-[#3d431a] cursor-pointer"
-                            @change="onFulfillmentProofChange"
-                        />
-                    </div>
-
-                    <div>
-                        <label class="block text-xs font-semibold text-gray-700 mb-1">Dispatch / Delivery Notes</label>
-                        <textarea
-                            v-model="fulfillmentNotes"
-                            rows="2"
-                            class="w-full bg-white border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:border-[#4b5320] focus:outline-none"
-                            placeholder="Rider contact, courier name, tracking note..."
-                        ></textarea>
-                    </div>
-                </div>
-
-                <div class="flex justify-end gap-3 pt-3 border-t border-gray-100">
-                    <SpecularButton
-                        type="button"
-                        variant="secondary"
-                        size="md"
-                        :radius="10"
-                        @click="showFulfillmentModal = false"
-                    >
-                        Cancel
-                    </SpecularButton>
-                    <SpecularButton
-                        type="button"
-                        variant="brand"
-                        size="md"
-                        :radius="10"
-                        :disabled="isSubmitting"
-                        @click="submitFulfillmentStatus"
-                    >
-                        {{ isSubmitting ? 'Saving...' : 'Update Status' }}
-                    </SpecularButton>
-                </div>
-            </div>
-        </div>
     </div>
 
     <!-- Action Confirmation Modal -->

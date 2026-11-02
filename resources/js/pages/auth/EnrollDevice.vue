@@ -1,7 +1,19 @@
 <script setup lang="ts">
 import { Head, Link, useForm } from '@inertiajs/vue3';
 import { ref } from 'vue';
-import { ShieldCheck, Laptop, KeyRound, ArrowRight, Home, Mail, UserCheck, Clock, Eye, EyeOff } from '@lucide/vue';
+import {
+    ShieldCheck,
+    Laptop,
+    KeyRound,
+    ArrowRight,
+    Home,
+    Mail,
+    UserCheck,
+    Clock,
+    Eye,
+    EyeOff,
+    Lock,
+} from '@lucide/vue';
 import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
 import InputError from '@/components/InputError.vue';
@@ -43,203 +55,214 @@ const submit = () => {
 </script>
 
 <template>
-    <Head title="Workstation Registration - MRP ElectroDesk" />
+    <Head title="Workstation Registration | MR-Pride" />
 
-    <div class="space-y-6">
-        <!-- Status Banner -->
+    <div class="space-y-4 sm:space-y-4.5">
+        <!-- Status Message Banner -->
         <div
             v-if="status"
-            class="rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-center text-xs font-semibold text-emerald-800"
+            class="rounded-xl border border-emerald-400/40 bg-emerald-500/20 p-3 text-center text-xs font-semibold text-emerald-200"
         >
             {{ status }}
         </div>
 
-        <!-- Invitation Context Card -->
+        <!-- Explanatory Notice Banner (Staff Invitation or Direct Enrollment) -->
         <div
             v-if="assignedUser"
-            class="rounded-xl border border-[#4b5320]/20 bg-[#4b5320]/5 p-4 flex items-start gap-3.5"
+            class="flex items-start gap-3 rounded-xl border border-white/20 bg-white/10 p-3 text-white sm:p-3.5"
         >
-            <div class="flex size-9 shrink-0 items-center justify-center rounded-xl bg-[#4b5320] text-[#F8B803]">
+            <div
+                class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[#F8B803] font-semibold text-gray-950 sm:size-8.5"
+            >
                 <UserCheck class="size-4.5" />
             </div>
-            <div class="min-w-0 flex-1 text-xs text-gray-700 leading-relaxed">
+            <div class="min-w-0 flex-1 text-xs leading-relaxed text-white/90">
                 <div class="flex items-center justify-between gap-2">
-                    <h4 class="font-semibold text-gray-900">
+                    <h4 class="font-semibold text-white text-xs sm:text-sm">
                         Staff Workstation Invitation
                     </h4>
-                    <span class="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 bg-amber-100 px-2 py-0.5 rounded-full border border-amber-200">
+                    <span
+                        class="inline-flex items-center gap-1 rounded bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-bold text-amber-200 tracking-wider uppercase border border-amber-300/30"
+                    >
                         <Clock class="size-3" />
-                        Valid for 5 Minutes Only
+                        {{ expiresAt || '5 Mins' }}
                     </span>
                 </div>
-                <p class="mt-1 text-gray-600">
-                    Invitation for <strong class="text-gray-900">{{ assignedUser.name }}</strong> ({{ assignedUser.email }}).
+                <p class="mt-0.5 text-[11px] text-white/85 sm:text-xs">
+                    Invitation for <strong class="font-semibold text-[#F8B803]">{{ assignedUser.name }}</strong> ({{ assignedUser.email }}).
                 </p>
-                <p class="mt-0.5 text-[11px] text-gray-500 flex items-center gap-1">
-                    <ShieldCheck class="size-3 text-emerald-600 inline" />
-                    Strictly bound to your registered email. Cannot be transferred or used by other accounts.
+                <p class="mt-0.5 text-[10px] text-white/70 sm:text-[11px] flex items-center gap-1">
+                    <ShieldCheck class="size-3 text-emerald-300 inline shrink-0" />
+                    Strictly bound to your registered work email.
                 </p>
             </div>
         </div>
 
         <div
             v-else
-            class="rounded-xl border border-[#4b5320]/20 bg-[#4b5320]/5 p-4 flex items-start gap-3.5"
+            class="flex items-start gap-3 rounded-xl border border-white/20 bg-white/10 p-3 text-white sm:p-3.5"
         >
-            <div class="flex size-9 shrink-0 items-center justify-center rounded-xl bg-[#4b5320] text-[#F8B803]">
+            <div
+                class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[#F8B803] font-semibold text-gray-950 sm:size-8.5"
+            >
                 <Laptop class="size-4.5" />
             </div>
-            <div class="min-w-0 flex-1 text-xs text-gray-700 leading-relaxed">
-                <h4 class="font-semibold text-gray-900">
-                    Trusted Workstation Enrollment
-                </h4>
-                <p class="mt-0.5 text-gray-600">
-                    Enter your enrollment code and temporary password below to register this workstation.
+            <div class="min-w-0 flex-1 text-xs leading-relaxed text-white/90">
+                <div class="flex items-center justify-between gap-2">
+                    <h4 class="font-semibold text-white text-xs sm:text-sm">
+                        Trusted Workstation Enrollment
+                    </h4>
+                    <span
+                        class="rounded bg-white/20 px-1.5 py-0.5 text-[10px] font-bold text-white tracking-wider uppercase"
+                    >
+                        Single-Use
+                    </span>
+                </div>
+                <p class="mt-0.5 text-[11px] text-white/80 sm:text-xs">
+                    Enter your enrollment code and temporary password below to authorize this workstation.
                 </p>
             </div>
         </div>
 
-        <!-- Enrollment & Identity Verification Form -->
-        <form @submit.prevent="submit" class="space-y-4">
+        <!-- Enrollment Form with Floating Labels -->
+        <form @submit.prevent="submit" class="space-y-3.5 sm:space-y-4">
             <!-- Hidden Token field if tokenized -->
             <input v-if="token" type="hidden" name="token" :value="token" />
 
-            <!-- Floating Label: Registered Work Email -->
-            <div class="space-y-1.5">
+            <!-- Registered Work Email -->
+            <div>
                 <div class="relative">
                     <input
-                        id="employee-email"
+                        id="email"
                         v-model="form.email"
                         type="email"
                         name="email"
+                        required
+                        :readonly="!!assignedUser"
                         autocomplete="email"
                         placeholder=" "
-                        :readonly="!!assignedUser"
                         :disabled="form.processing"
-                        required
-                        class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pr-10 pb-2 text-xs text-gray-900 placeholder-transparent focus:border-[#F8B803] focus:ring-2 focus:ring-[#F8B803]/40 focus:outline-none sm:text-sm disabled:opacity-75"
+                        class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-4.5 pr-10 pb-1.5 text-xs text-gray-900 placeholder-transparent focus:border-[#F8B803] focus:ring-2 focus:ring-[#F8B803]/40 focus:outline-none sm:pt-5 sm:pb-2 sm:text-sm"
                         :class="[
-                            assignedUser ? 'bg-gray-50/90 font-medium text-gray-800 cursor-not-allowed border-gray-200' : 'border-gray-200',
+                            assignedUser ? 'bg-white/90 text-gray-800 cursor-not-allowed' : '',
                             form.errors.email ? 'border-red-400 focus:border-red-400 focus:ring-red-400' : ''
                         ]"
                     />
                     <label
-                        for="employee-email"
-                        class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-placeholder-shown:text-gray-400 peer-placeholder-shown:font-normal peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320] peer-focus:font-semibold"
-                        :class="form.email ? '-translate-y-2.5 scale-75 text-gray-600 font-semibold' : ''"
+                        for="email"
+                        class="pointer-events-none absolute top-3 left-3.5 origin-[0] -translate-y-2 scale-75 transform text-xs font-semibold text-gray-600 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-placeholder-shown:text-black peer-focus:-translate-y-2 peer-focus:scale-75 peer-focus:text-[#4b5320] sm:top-3.5 sm:-translate-y-2.5 sm:peer-focus:-translate-y-2.5"
+                        :class="form.email ? '-translate-y-2 scale-75 sm:-translate-y-2.5 text-gray-600 font-semibold' : ''"
                     >
                         Registered Work Email
                     </label>
-                    <Mail class="size-4 text-gray-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <Mail v-if="!assignedUser" class="pointer-events-none absolute right-3.5 top-1/2 size-4 -translate-y-1/2 text-gray-400" />
+                    <Lock v-else class="pointer-events-none absolute right-3.5 top-1/2 size-4 -translate-y-1/2 text-gray-400" />
                 </div>
-                <div class="flex items-center justify-between text-xs">
-                    <InputError :message="form.errors.email" class="text-xs text-red-600" />
-                    <span v-if="assignedUser" class="ml-auto inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
-                        Registered Account Only
-                    </span>
+                <div v-if="assignedUser" class="mt-1 flex items-center justify-between gap-2 text-[11px] text-white/80">
+                    <span>Permanently bound to this employee account</span>
+                    <span class="rounded bg-white/20 px-1.5 py-0.5 text-[9px] font-bold text-white uppercase tracking-wider">Locked</span>
                 </div>
-                <p v-if="assignedUser" class="text-xs text-gray-500">
-                    This enrollment link is permanently locked to this email address as registered by your administrator.
-                </p>
+                <InputError :message="form.errors.email" class="mt-1 text-xs text-red-300" />
             </div>
 
-            <!-- Floating Label: One-Time Enrollment Code -->
-            <div class="space-y-1.5">
+            <!-- One-Time Enrollment Code -->
+            <div>
                 <div class="relative">
                     <input
-                        id="enrollment-code"
+                        id="code"
                         v-model="form.code"
                         type="text"
                         name="code"
-                        placeholder=" "
+                        required
                         autocomplete="off"
                         autofocus
-                        required
+                        placeholder=" "
                         :disabled="form.processing"
-                        class="peer block w-full font-mono font-semibold rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pr-10 pb-2 text-xs text-gray-900 placeholder-transparent focus:border-[#F8B803] focus:ring-2 focus:ring-[#F8B803]/40 focus:outline-none sm:text-sm"
+                        class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-4.5 pr-10 pb-1.5 font-mono text-xs font-semibold uppercase tracking-wider text-gray-900 placeholder-transparent focus:border-[#F8B803] focus:ring-2 focus:ring-[#F8B803]/40 focus:outline-none sm:pt-5 sm:pb-2 sm:text-sm"
                         :class="form.errors.code ? 'border-red-400 focus:border-red-400 focus:ring-red-400' : ''"
                     />
                     <label
-                        for="enrollment-code"
-                        class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-placeholder-shown:text-gray-400 peer-placeholder-shown:font-normal peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320] peer-focus:font-semibold"
-                        :class="form.code ? '-translate-y-2.5 scale-75 text-gray-600 font-semibold' : ''"
+                        for="code"
+                        class="pointer-events-none absolute top-3 left-3.5 origin-[0] -translate-y-2 scale-75 transform text-xs font-semibold text-gray-600 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-placeholder-shown:text-black peer-focus:-translate-y-2 peer-focus:scale-75 peer-focus:text-[#4b5320] sm:top-3.5 sm:-translate-y-2.5 sm:peer-focus:-translate-y-2.5"
+                        :class="form.code ? '-translate-y-2 scale-75 sm:-translate-y-2.5 text-gray-600 font-semibold' : ''"
                     >
                         One-Time Enrollment Code
                     </label>
-                    <KeyRound class="size-4 text-gray-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <KeyRound class="pointer-events-none absolute right-3.5 top-1/2 size-4 -translate-y-1/2 text-gray-400" />
                 </div>
-                <InputError :message="form.errors.code" class="text-xs text-red-600" />
-                <p class="text-xs text-gray-500">
-                    Enter the single-use enrollment code shown in your invitation email or modal.
-                </p>
+                <div class="mt-1 flex items-center justify-between gap-2 text-[11px] text-white/80">
+                    <span>Format: <strong class="font-mono text-white">MRP-XXXXXX</strong></span>
+                    <span class="text-white/60">Single-use OTP</span>
+                </div>
+                <InputError :message="form.errors.code" class="mt-1 text-xs text-red-300" />
             </div>
 
-            <!-- Floating Label: Temporary Password with Toggle -->
-            <div class="space-y-1.5">
+            <!-- Temporary Password -->
+            <div>
                 <div class="relative">
                     <input
-                        id="employee-password"
+                        id="password"
                         v-model="form.password"
                         :type="showPassword ? 'text' : 'password'"
                         name="password"
-                        placeholder=" "
-                        autocomplete="current-password"
                         required
+                        autocomplete="current-password"
+                        placeholder=" "
                         :disabled="form.processing"
-                        class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pr-11 pb-2 text-xs text-gray-900 placeholder-transparent focus:border-[#F8B803] focus:ring-2 focus:ring-[#F8B803]/40 focus:outline-none sm:text-sm"
+                        class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-4.5 pr-11 pb-1.5 text-xs text-gray-900 placeholder-transparent focus:border-[#F8B803] focus:ring-2 focus:ring-[#F8B803]/40 focus:outline-none sm:pt-5 sm:pb-2 sm:text-sm"
                         :class="form.errors.password ? 'border-red-400 focus:border-red-400 focus:ring-red-400' : ''"
                     />
                     <label
-                        for="employee-password"
-                        class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-placeholder-shown:text-gray-400 peer-placeholder-shown:font-normal peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320] peer-focus:font-semibold"
-                        :class="form.password ? '-translate-y-2.5 scale-75 text-gray-600 font-semibold' : ''"
+                        for="password"
+                        class="pointer-events-none absolute top-3 left-3.5 origin-[0] -translate-y-2 scale-75 transform text-xs font-semibold text-gray-600 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-placeholder-shown:text-black peer-focus:-translate-y-2 peer-focus:scale-75 peer-focus:text-[#4b5320] sm:top-3.5 sm:-translate-y-2.5 sm:peer-focus:-translate-y-2.5"
+                        :class="form.password ? '-translate-y-2 scale-75 sm:-translate-y-2.5 text-gray-600 font-semibold' : ''"
                     >
                         Temporary Password
                     </label>
                     <button
                         type="button"
+                        tabindex="-1"
                         @click="showPassword = !showPassword"
-                        class="absolute inset-y-0 right-0 flex items-center pr-3.5 text-gray-400 hover:text-gray-700 transition-colors cursor-pointer focus:outline-none focus-visible:text-[#4b5320]"
-                        :aria-label="showPassword ? 'Hide temporary password' : 'Show temporary password'"
-                        :title="showPassword ? 'Hide temporary password' : 'Show temporary password'"
+                        class="absolute inset-y-0 right-0 flex cursor-pointer items-center pr-3.5 text-gray-400 transition-colors hover:text-black focus:outline-none"
+                        :aria-label="showPassword ? 'Hide password' : 'Show password'"
                     >
                         <EyeOff v-if="showPassword" class="size-4" />
                         <Eye v-else class="size-4" />
                     </button>
                 </div>
-                <InputError :message="form.errors.password" class="text-xs text-red-600" />
-                <p class="text-xs text-gray-500">
-                    Provided by your administrator. Confirms your employee identity and authorizes this workstation.
-                </p>
+                <div class="mt-1 text-[11px] text-white/80">
+                    <span>Provided by your administrator to verify your employee account.</span>
+                </div>
+                <InputError :message="form.errors.password" class="mt-1 text-xs text-red-300" />
             </div>
 
             <!-- Submit Button -->
             <Button
                 type="submit"
-                class="w-full h-12 mt-2 rounded-xl bg-[#F8B803] hover:bg-[#fac52e] text-gray-950 font-semibold text-sm shadow-md cursor-pointer transition-colors disabled:opacity-50"
+                class="mt-2 w-full cursor-pointer bg-[#F8B803] py-2.5 text-xs font-semibold text-gray-950 shadow-md transition-colors hover:bg-[#fac52e] focus-visible:ring-2 focus-visible:ring-[#F8B803] focus-visible:ring-offset-2 sm:py-3 sm:text-sm"
                 :disabled="form.processing || !form.code.trim() || !form.email.trim() || !form.password"
             >
                 <Spinner v-if="form.processing" class="mr-2 text-gray-950" />
-                <ShieldCheck v-else class="size-4 mr-2 text-gray-950" />
+                <ShieldCheck v-else class="mr-2 size-4 text-gray-950" />
                 Register & Authorize Workstation
             </Button>
         </form>
 
         <!-- Navigation Links -->
-        <div class="flex items-center justify-between border-t border-gray-100 pt-4 text-xs">
+        <div class="flex items-center justify-between border-t border-white/15 pt-3 text-xs">
             <Link
                 href="/"
-                class="inline-flex items-center gap-1.5 text-gray-500 hover:text-gray-900 font-medium transition-colors"
+                class="flex items-center gap-1.5 text-white/80 transition-colors hover:text-white hover:underline"
             >
                 <Home class="size-3.5" />
-                Return to Home
+                <span>Home</span>
             </Link>
 
             <Link
                 href="/login"
-                class="inline-flex items-center gap-1 text-[#4b5320] hover:underline font-semibold transition-colors"
+                class="flex items-center gap-1 font-semibold text-[#F8B803] transition-colors hover:underline"
             >
-                Proceed to Login
+                <span>Return to Login</span>
                 <ArrowRight class="size-3.5" />
             </Link>
         </div>
