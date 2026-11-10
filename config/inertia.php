@@ -16,8 +16,9 @@ return [
     */
 
     'ssr' => [
-        'enabled' => true,
-        'url' => 'http://127.0.0.1:13714',
+        // Off in the production image (no SSR server runs there); on locally, where Vite serves it.
+        'enabled' => (bool) env('INERTIA_SSR_ENABLED', true),
+        'url' => env('INERTIA_SSR_URL', 'http://127.0.0.1:13714'),
         // 'bundle' => base_path('bootstrap/ssr/ssr.mjs'),
 
     ],
