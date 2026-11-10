@@ -4,17 +4,20 @@ use App\Enums\QuotationStatus;
 use App\Enums\TeamRole;
 use App\Http\Middleware\EnsureAdminForDeletion;
 use App\Models\AuditLog;
-use App\Models\CommercialInvoice;
 use App\Models\Delivery;
 use App\Models\Product;
+use App\Models\ProductSupplier;
 use App\Models\PurchaseOrder;
 use App\Models\PurchaseRequest;
 use App\Models\Quotation;
 use App\Models\Sale;
 use App\Models\Supplier;
+use App\Models\SupplierQuote;
 use App\Models\Team;
+use App\Models\TrustedDevice;
 use App\Models\User;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Each case: [module role, model class, factory closure(team) => record, path closure(record) => url suffix]
@@ -38,7 +41,7 @@ dataset('deletable modules', [
         fn (Team $t) => Quotation::create([
             'team_id' => $t->id, 'quotation_number' => 'Q-DEL-1', 'client_name' => 'Client Co',
             'quotation_date' => now()->toDateString(), 'valid_until' => now()->addDays(30)->toDateString(),
-            'status' => QuotationStatus::Pending,
+            'status' => QuotationStatus::Draft,
         ]),
         fn ($r) => "quotations/{$r->id}",
     ],
@@ -50,15 +53,6 @@ dataset('deletable modules', [
             'estimated_cost' => 100, 'status' => 'Pending Approval', 'requested_at' => now(),
         ]),
         fn ($r) => "procurement/{$r->id}",
-    ],
-    'commercial invoice' => [
-        'staff_procurement',
-        CommercialInvoice::class,
-        fn (Team $t) => CommercialInvoice::create([
-            'team_id' => $t->id, 'invoice_date' => '2026-10-25', 'invoice_number' => 'CI-DEL-1',
-            'quantity' => 10, 'description' => 'Test CI', 'unit_cost' => 100, 'total_cost' => 1000,
-        ]),
-        fn ($r) => "procurement/commercial-invoices/{$r->id}",
     ],
     'purchase order' => [
         'staff_procurement',
@@ -174,4 +168,93 @@ it('blocks staff from the admin-only user deletion and recycle bin bulk delete r
         ->assertForbidden();
 
     expect(User::find($victim->id))->not->toBeNull();
+});
+
+it('blocks staff from deleting supplier quotes and availability records', function () {
+    $team = Team::factory()->create(['slug' => 'del-team']);
+    [$staff, $cookies] = deletionActor('staff_suppliers', $team);
+    $supplier = Supplier::create(['team_id' => $team->id, 'name' => 'Acme Supply', 'status' => 'Active']);
+    $product = Product::create(['team_id' => $team->id, 'name' => 'Breaker', 'sku' => 'BRK-1', 'price' => 50, 'stock' => 10, 'is_active' => true]);
+
+    $quote = SupplierQuote::create([
+        'team_id' => $team->id,
+        'supplier_id' => $supplier->id,
+        'product_id' => $product->id,
+        'unit_price' => 45,
+        'currency' => 'PHP',
+        'unit' => 'pcs',
+        'tax_inclusive' => true,
+        'quoted_on' => now()->toDateString(),
+        'recorded_by' => $staff->id,
+    ]);
+
+    $availability = ProductSupplier::create([
+        'team_id' => $team->id,
+        'supplier_id' => $supplier->id,
+        'product_id' => $product->id,
+        'is_available' => true,
+        'recorded_by' => $staff->id,
+    ]);
+
+    $this->actingAs($staff)->withCookies($cookies)
+        ->delete("/{$team->slug}/supplier-quotes/{$quote->id}")
+        ->assertForbidden();
+
+    $this->actingAs($staff)->withCookies($cookies)
+        ->delete("/{$team->slug}/supplier-availability/{$availability->id}")
+        ->assertForbidden();
+
+    expect(SupplierQuote::find($quote->id))->not->toBeNull()
+        ->and(ProductSupplier::find($availability->id))->not->toBeNull();
+});
+
+it('enforces exact uppercase YES confirmation when confirmation is provided and does not revoke unrelated sessions or trusted devices', function () {
+    $team = Team::factory()->create(['slug' => 'del-team']);
+    [$admin, $cookies] = deletionActor('admin', $team);
+    [$staff, $staffCookies] = deletionActor('staff_inventory', $team);
+
+    DB::table('sessions')->insert([
+        'id' => 'staff-active-session-1',
+        'user_id' => $staff->id,
+        'ip_address' => '127.0.0.1',
+        'user_agent' => 'Pest',
+        'payload' => 'test',
+        'last_activity' => now()->timestamp,
+    ]);
+
+    $supplier = Supplier::create(['team_id' => $team->id, 'name' => 'Confirm Test Supplier', 'status' => 'Active']);
+    $initialDeviceCount = TrustedDevice::count();
+    $initialSessionCount = DB::table('sessions')->where('user_id', $staff->id)->count();
+
+    // Lowercase 'yes' is rejected when confirmation is submitted
+    $this->actingAs($admin)->withCookies($cookies)
+        ->delete("/{$team->slug}/suppliers/{$supplier->id}", ['confirmation' => 'yes'])
+        ->assertSessionHasErrors('confirmation');
+
+    expect(Supplier::find($supplier->id))->not->toBeNull();
+
+    // Exact 'YES' soft-deletes the supplier
+    $this->actingAs($admin)->withCookies($cookies)
+        ->delete("/{$team->slug}/suppliers/{$supplier->id}", ['confirmation' => 'YES'])
+        ->assertSessionHasNoErrors();
+
+    expect(Supplier::find($supplier->id))->toBeNull()
+        ->and(Supplier::withTrashed()->find($supplier->id))->not->toBeNull();
+
+    // Permanent deletion from Recycle Bin also rejects lowercase 'yes' and accepts 'YES'
+    $this->actingAs($admin)->withCookies($cookies)
+        ->delete("/{$team->slug}/recycle-bin/supplier/{$supplier->id}/force", ['confirmation' => 'yes'])
+        ->assertSessionHasErrors('confirmation');
+
+    expect(Supplier::withTrashed()->find($supplier->id))->not->toBeNull();
+
+    $this->actingAs($admin)->withCookies($cookies)
+        ->delete("/{$team->slug}/recycle-bin/supplier/{$supplier->id}/force", ['confirmation' => 'YES'])
+        ->assertSessionHas('success');
+
+    expect(Supplier::withTrashed()->find($supplier->id))->toBeNull();
+
+    // Unrelated active sessions and trusted devices remain completely untouched
+    expect(TrustedDevice::count())->toBe($initialDeviceCount)
+        ->and(DB::table('sessions')->where('user_id', $staff->id)->count())->toBe($initialSessionCount);
 });

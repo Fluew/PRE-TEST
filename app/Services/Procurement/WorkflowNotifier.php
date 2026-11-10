@@ -23,7 +23,7 @@ class WorkflowNotifier
     public function notify(Team $team, array $roles, string $event, string $title, string $message, ?User $actor = null, ?string $path = null): void
     {
         try {
-            $recipients = $team->members()->get()->filter(function (User $u) use ($roles, $actor) {
+            $recipients = $team->members()->with('modulePermissions')->get()->filter(function (User $u) use ($roles, $actor) {
                 if ($actor && $u->id === $actor->id) {
                     return false;
                 }

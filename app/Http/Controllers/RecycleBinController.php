@@ -7,6 +7,7 @@ use App\Models\Client;
 use App\Models\CommercialInvoice;
 use App\Models\Delivery;
 use App\Models\Inquiry;
+use App\Models\OrderFulfillment;
 use App\Models\Product;
 use App\Models\PurchaseOrder;
 use App\Models\PurchaseRequest;
@@ -16,11 +17,13 @@ use App\Models\StockMovement;
 use App\Models\Supplier;
 use App\Models\Team;
 use App\Services\AuditLogger;
+use App\Services\RecycleBin\PermanentDeleter;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
 use Inertia\Inertia;
 use Inertia\Response;
 
@@ -72,6 +75,11 @@ class RecycleBinController extends Controller
             'label' => 'Delivery',
             'badge' => 'Purple',
         ],
+        'customer_delivery' => [
+            'class' => OrderFulfillment::class,
+            'label' => 'Customer Delivery',
+            'badge' => 'Orange',
+        ],
         'inquiry' => [
             'class' => Inquiry::class,
             'label' => 'Message / Inquiry',
@@ -85,6 +93,14 @@ class RecycleBinController extends Controller
     ];
 
     /**
+     * Record types left out of the Record Type dropdown. Their archived records still appear
+     * under "All Records" and can still be restored or deleted there.
+     *
+     * @var list<string>
+     */
+    protected const NOT_FILTERABLE_TYPES = ['inquiry'];
+
+    /**
      * Display a listing of recoverable deleted records.
      */
     public function index(Request $request, mixed $current_team = null): Response
@@ -94,26 +110,20 @@ class RecycleBinController extends Controller
 
         $team = $this->resolveTeam($current_team, $request);
 
-        $selectedType = $request->input('type', 'all');
+        // Unknown or non-filterable record types fall back to "All Records" instead of showing an empty list.
+        $filterableTypes = array_diff_key(self::TYPE_REGISTRY, array_flip(self::NOT_FILTERABLE_TYPES));
+        $selectedType = (string) $request->input('type', 'all');
+        if ($selectedType !== 'all' && ! isset($filterableTypes[$selectedType])) {
+            $selectedType = 'all';
+        }
         $search = trim((string) $request->input('search', ''));
-        $page = (int) $request->input('page', 1);
         $perPage = 15;
 
-        // Collect all trashed records for this team
+        // Counts per record type follow the current search, so each dropdown option shows
+        // how many records it will list. $totalArchived ignores filters (used by "Empty Recycle Bin").
         $allRecords = collect();
-        $counts = [
-            'all' => 0,
-            'product' => 0,
-            'supplier' => 0,
-            'client' => 0,
-            'quotation' => 0,
-            'purchase_order' => 0,
-            'purchase_request' => 0,
-            'commercial_invoice' => 0,
-            'delivery' => 0,
-            'inquiry' => 0,
-            'sale' => 0,
-        ];
+        $counts = ['all' => 0] + array_fill_keys(array_keys(self::TYPE_REGISTRY), 0);
+        $totalArchived = 0;
 
         foreach (self::TYPE_REGISTRY as $typeKey => $config) {
             $modelClass = $config['class'];
@@ -122,34 +132,36 @@ class RecycleBinController extends Controller
                 ->with(['deletedBy'])
                 ->get();
 
-            $counts[$typeKey] = $items->count();
-            $counts['all'] += $items->count();
+            $totalArchived += $items->count();
+            $isListed = $selectedType === 'all' || $selectedType === $typeKey;
 
-            // Only map items if viewing 'all' or this specific type
-            if ($selectedType === 'all' || $selectedType === $typeKey) {
-                foreach ($items as $item) {
-                    $allRecords->push($this->formatTrashedRecord($item, $typeKey, $config));
-                }
+            // Without a search, a type that is not being listed only needs its count.
+            if ($search === '' && ! $isListed) {
+                $counts[$typeKey] = $items->count();
+                $counts['all'] += $items->count();
+
+                continue;
             }
-        }
 
-        // Apply search filter if provided
-        if ($search !== '') {
-            $searchLower = strtolower($search);
-            $allRecords = $allRecords->filter(function ($rec) use ($searchLower) {
-                return str_contains(strtolower($rec['title']), $searchLower)
-                    || str_contains(strtolower($rec['identifier'] ?? ''), $searchLower)
-                    || str_contains(strtolower($rec['summary'] ?? ''), $searchLower)
-                    || str_contains(strtolower($rec['deleted_by']['name'] ?? ''), $searchLower)
-                    || str_contains(strtolower($rec['deleted_by']['email'] ?? ''), $searchLower);
-            });
+            $matching = $items
+                ->map(fn ($item) => $this->formatTrashedRecord($item, $typeKey, $config))
+                ->filter(fn (array $rec) => $this->recordMatchesSearch($rec, $search));
+
+            $counts[$typeKey] = $matching->count();
+            $counts['all'] += $matching->count();
+
+            if ($isListed) {
+                $allRecords = $allRecords->concat($matching);
+            }
         }
 
         // Sort newest deleted first
         $sortedRecords = $allRecords->sortByDesc(fn ($rec) => $rec['deleted_at_raw'])->values();
 
-        // Manual pagination
+        // Manual pagination, keeping the page inside the filtered result
         $total = $sortedRecords->count();
+        $lastPage = max(1, (int) ceil($total / $perPage));
+        $page = min(max(1, (int) $request->input('page', 1)), $lastPage);
         $sliced = $sortedRecords->slice(($page - 1) * $perPage, $perPage)->values();
 
         $paginator = new LengthAwarePaginator(
@@ -157,25 +169,33 @@ class RecycleBinController extends Controller
             $total,
             $perPage,
             $page,
-            ['path' => $request->url(), 'query' => $request->query()]
+            [
+                'path' => $request->url(),
+                // Page links carry the active filters so paging keeps the same type and search.
+                'query' => array_filter([
+                    'type' => $selectedType !== 'all' ? $selectedType : null,
+                    'search' => $search !== '' ? $search : null,
+                ]),
+            ]
         );
 
         // Stats summary
         $stats = [
-            'total' => $counts['all'],
+            'total' => $totalArchived,
             'deleted_today' => $allRecords->filter(fn ($r) => substr((string) ($r['deleted_at_raw'] ?? ''), 0, 10) === now()->toDateString())->count(),
             'types_with_records' => collect($counts)->filter(fn ($val, $k) => $k !== 'all' && $val > 0)->count(),
         ];
 
         return Inertia::render('RecycleBin/Index', [
             'records' => $paginator,
-            'counts' => $counts,
+            // 'all' still includes every archived record; only the dropdown's own categories are limited.
+            'counts' => array_diff_key($counts, array_flip(self::NOT_FILTERABLE_TYPES)),
             'stats' => $stats,
             'filters' => [
                 'type' => $selectedType,
                 'search' => $search,
             ],
-            'availableTypes' => collect(self::TYPE_REGISTRY)->map(fn ($cfg, $k) => [
+            'availableTypes' => collect($filterableTypes)->map(fn ($cfg, $k) => [
                 'key' => $k,
                 'label' => $cfg['label'],
                 'badge' => $cfg['badge'],
@@ -223,6 +243,9 @@ class RecycleBinController extends Controller
     {
         $user = $request->user();
         abort_if(! $user || ! $user->isAdmin(), 403, 'Unauthorized access.');
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
+        }
 
         $team = $this->resolveTeam($current_team, $request);
         $model = $this->findTrashedRecord($team, $type, $id);
@@ -235,7 +258,7 @@ class RecycleBinController extends Controller
         }
 
         // Permanently erase record
-        $model->forceDelete();
+        $this->permanentlyDeleteRecord($model);
 
         AuditLogger::audit(
             'recycle_bin.permanent_delete',
@@ -310,6 +333,7 @@ class RecycleBinController extends Controller
             'items' => ['required', 'array', 'min:1'],
             'items.*.type' => ['required', 'string'],
             'items.*.id' => ['required'],
+            'confirmation' => ['sometimes', 'required', 'string', Rule::in(['YES'])],
         ]);
 
         $deletedCount = 0;
@@ -325,7 +349,7 @@ class RecycleBinController extends Controller
 
                     continue;
                 }
-                $model->forceDelete();
+                $this->permanentlyDeleteRecord($model);
                 $deletedCount++;
             } catch (\Throwable) {
                 continue;
@@ -343,7 +367,7 @@ class RecycleBinController extends Controller
         );
 
         return back()->with('success', "Successfully purged {$deletedCount} records permanently."
-            .($keptCount ? " {$keptCount} sales/products with transaction or stock history were kept archived." : ''));
+            .($keptCount ? " {$keptCount} records with active stock or transaction dependencies were kept archived." : ''));
     }
 
     /**
@@ -353,6 +377,9 @@ class RecycleBinController extends Controller
     {
         $user = $request->user();
         abort_if(! $user || ! $user->isAdmin(), 403, 'Unauthorized access.');
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
+        }
 
         $team = $this->resolveTeam($current_team, $request);
         $totalPurged = 0;
@@ -368,7 +395,7 @@ class RecycleBinController extends Controller
 
                     continue;
                 }
-                $item->forceDelete();
+                $this->permanentlyDeleteRecord($item);
                 $totalPurged++;
             }
         }
@@ -384,7 +411,44 @@ class RecycleBinController extends Controller
         );
 
         return back()->with('success', "Recycle Bin emptied successfully ({$totalPurged} records permanently removed)."
-            .($keptCount ? " {$keptCount} sales/products with transaction or stock history were kept archived." : ''));
+            .($keptCount ? " {$keptCount} records with active stock or transaction dependencies were kept archived." : ''));
+    }
+
+    /**
+     * Whether a formatted archived record matches the search text (title, identifier, summary or deleter).
+     *
+     * @param  array<string, mixed>  $record
+     */
+    protected function recordMatchesSearch(array $record, string $search): bool
+    {
+        if ($search === '') {
+            return true;
+        }
+
+        $needle = mb_strtolower($search);
+
+        foreach ([
+            $record['title'] ?? '',
+            $record['identifier'] ?? '',
+            $record['summary'] ?? '',
+            $record['deleted_by']['name'] ?? '',
+            $record['deleted_by']['email'] ?? '',
+        ] as $haystack) {
+            if (str_contains(mb_strtolower((string) $haystack), $needle)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Permanently delete an archived record from the database, with its child rows, its email
+     * log entries and its stored files (see PermanentDeleter).
+     */
+    protected function permanentlyDeleteRecord(mixed $model): void
+    {
+        app(PermanentDeleter::class)->delete($model);
     }
 
     /**
@@ -449,18 +513,34 @@ class RecycleBinController extends Controller
     /**
      * Why a record must not be permanently deleted, or null if it can be.
      *
-     * The database cascades a hard delete to child rows (a sale takes its line items and
-     * fulfillments, a product takes its stock movements), so records that carry financial or
-     * stock history are kept archived instead.
+     * The database cascades a hard delete to child rows, so master records that carry active
+     * stock or procurement dependencies are kept archived instead. Archived sale transactions
+     * can be restored or permanently deleted by an authorized Admin.
      */
     protected function purgeBlockedReason(mixed $model, string $type): ?string
     {
-        if ($type === 'sale') {
-            return 'sales are financial records.';
-        }
-
         if ($type === 'product' && ($model->stockMovements()->exists() || $model->saleItems()->exists() || $model->quotationItems()->exists())) {
             return 'it has stock movement, sales or quotation history.';
+        }
+
+        if ($type === 'supplier' && ($model->purchaseOrders()->withTrashed()->exists() || $model->deliveries()->withTrashed()->exists())) {
+            return 'it has purchase order or delivery history.';
+        }
+
+        if ($type === 'purchase_order' && ($model->deliveries()->withTrashed()->exists() || $model->invoices()->withTrashed()->exists())) {
+            return 'it has linked delivery or commercial invoice records.';
+        }
+
+        if ($type === 'delivery' && ($model->posted_at !== null || $model->invoices()->withTrashed()->exists())) {
+            return 'it has been posted to stock or has linked commercial invoices.';
+        }
+
+        if ($type === 'customer_delivery' && $model->releases()->exists()) {
+            return 'its delivery releases are part of the stock movement history.';
+        }
+
+        if ($type === 'commercial_invoice' && $model->status === CommercialInvoice::VERIFIED) {
+            return 'verified commercial invoices are part of the stock and financial audit trail.';
         }
 
         return null;
@@ -497,6 +577,7 @@ class RecycleBinController extends Controller
             'purchase_request' => (string) ($model->request_number ?? "PR #{$model->id}"),
             'commercial_invoice' => (string) ($model->invoice_number ?? "Invoice #{$model->id}"),
             'delivery' => (string) ($model->delivery_number ?? "Delivery #{$model->id}"),
+            'customer_delivery' => (string) ($model->fulfillment_number ?? "Customer delivery #{$model->id}"),
             'inquiry' => (string) ($model->subject ?? ($model->name ? "Inquiry from {$model->name}" : "Inquiry #{$model->id}")),
             'sale' => (string) ($model->order_number ?? $model->invoice_number ?? "Sale #{$model->id}"),
             default => "#{$model->id}",
@@ -522,6 +603,7 @@ class RecycleBinController extends Controller
             'purchase_request' => $item->status ? "Status: {$item->status}" : 'Purchase request',
             'commercial_invoice' => 'Date: '.($item->invoice_date?->format('M d, Y') ?? 'N/A'),
             'delivery' => 'PO: '.($item->purchase_order_number ?: 'N/A'),
+            'customer_delivery' => 'Recipient: '.($item->recipient_name ?: 'N/A'),
             'inquiry' => "From: {$item->name} ({$item->email})",
             'sale' => 'Client: '.($item->client_name ?: 'Walk-in / Client'),
             default => "ID: {$item->id}",
@@ -545,6 +627,7 @@ class RecycleBinController extends Controller
             'purchase_order' => sprintf('%d %s', (int) $item->quantity, $item->unit_of_measure ?: 'units'),
             'purchase_request', 'commercial_invoice' => sprintf('Qty: %d', (int) $item->quantity),
             'delivery' => sprintf('Qty: %d %s • %s', (int) $item->quantity, $item->unit ?: 'units', $item->delivery_date?->format('M d, Y') ?? 'N/A'),
+            'customer_delivery' => ($item->status instanceof \BackedEnum ? $item->status->label() : (string) $item->status).' • '.($item->fulfillment_type === 'pickup' ? 'Pickup' : 'Delivery'),
             'inquiry' => $item->message ? Str::limit($item->message, 80) : 'Customer contact inquiry',
             'sale' => $item->status instanceof \BackedEnum ? $item->status->label() : ($item->payment_method ?: 'Sale'),
             default => '',
@@ -601,6 +684,11 @@ class RecycleBinController extends Controller
 
         if (is_string($current_team) && $current_team !== '') {
             return Team::where('slug', $current_team)->firstOrFail();
+        }
+
+        $fallbackTeam = $request->user()?->teams()->first() ?: Team::first();
+        if ($fallbackTeam) {
+            return $fallbackTeam;
         }
 
         abort(403, 'No active team context available.');

@@ -136,9 +136,10 @@ const submit = () => {
                         :aria-label="
                             showCurrent ? 'Hide password' : 'Show password'
                         "
+                        :aria-pressed="showCurrent"
                     >
-                        <EyeOff v-if="showCurrent" class="size-4" />
-                        <Eye v-else class="size-4" />
+                        <EyeOff v-if="showCurrent" class="size-4 shrink-0" />
+                        <Eye v-else class="size-4 shrink-0" />
                     </button>
                 </div>
                 <InputError
@@ -180,9 +181,10 @@ const submit = () => {
                         :aria-label="
                             showNew ? 'Hide password' : 'Show password'
                         "
+                        :aria-pressed="showNew"
                     >
-                        <EyeOff v-if="showNew" class="size-4" />
-                        <Eye v-else class="size-4" />
+                        <EyeOff v-if="showNew" class="size-4 shrink-0" />
+                        <Eye v-else class="size-4 shrink-0" />
                     </button>
                 </div>
                 <InputError
@@ -224,9 +226,10 @@ const submit = () => {
                         :aria-label="
                             showConfirm ? 'Hide password' : 'Show password'
                         "
+                        :aria-pressed="showConfirm"
                     >
-                        <EyeOff v-if="showConfirm" class="size-4" />
-                        <Eye v-else class="size-4" />
+                        <EyeOff v-if="showConfirm" class="size-4 shrink-0" />
+                        <Eye v-else class="size-4 shrink-0" />
                     </button>
                 </div>
                 <InputError

@@ -41,7 +41,9 @@ class CheckMaintenanceMode
                 'title' => 'System Under Maintenance',
                 'message' => 'MRP ElectroDesk is temporarily unavailable while we perform system maintenance.',
                 'reason' => $status['reason'],
+                'scheduled_start_at' => $status['scheduled_start_at'] ?? null,
                 'expected_return_time' => $status['expected_return_time'],
+                'expected_end_at' => $status['expected_end_at'] ?? null,
             ], 503, [
                 'Retry-After' => '300',
             ]);
@@ -51,7 +53,9 @@ class CheckMaintenanceMode
             'title' => 'System Under Maintenance',
             'message' => 'MRP ElectroDesk is temporarily unavailable while we perform system maintenance.',
             'reason' => $status['reason'],
+            'scheduledStartAt' => $status['scheduled_start_at'] ?? null,
             'expectedReturnTime' => $status['expected_return_time'],
+            'expectedEndAt' => $status['expected_end_at'] ?? null,
             'enabledAt' => $status['enabled_at'],
         ])->toResponse($request)->setStatusCode(503)->header('Retry-After', '300');
     }

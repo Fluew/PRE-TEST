@@ -1,18 +1,7 @@
 <script setup lang="ts">
 import { Head, router, usePage } from '@inertiajs/vue3';
 import { ref, computed, watch } from 'vue';
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Filler,
-  Title,
-  Tooltip,
-  Legend,
-} from 'chart.js';
-import { Line } from 'vue-chartjs';
+import { LineChart as Line } from '@/lib/lazyCharts';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
 import { useCurrency } from '@/composables/useCurrency';
 import {
@@ -33,16 +22,6 @@ import {
   RotateCcw,
 } from '@lucide/vue';
 
-ChartJS.register(
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Filler,
-  Title,
-  Tooltip,
-  Legend,
-);
 
 interface RestockItem {
     id: number;
@@ -116,9 +95,22 @@ const props = defineProps<{
     suggestedRestocks: RestockItem[];
     minDate: string;
     maxDate: string;
+    /** Forecasting periods: months => label (3 Months, 6 Months, 1 Year). */
+    forecastPeriods: Record<string, string>;
+    /** Each product's forecast for the chosen period, with the AHP priority and reorder advice it feeds. */
+    productForecasts: {
+        product: { id: number; name: string; sku: string; unit: string };
+        available_stock: number;
+        forecast: { months: number; period: string; monthly: number | null; period_total: number | null; reason: string | null };
+        classification: string | null;
+        score: number | null;
+        reorder: { needed: boolean; suggested_quantity: number; basis: string };
+    }[];
 }>();
 
 const page = usePage();
+// AHP Product Prioritization is in Reports and Analytics: link to it only for users who can open Reports.
+const canOpenReports = computed(() => Boolean((page.props as any).auth?.is_admin) || ((page.props as any).auth?.modules ?? []).includes('reports'));
 const teamSlug = computed(() => (page.props as any).currentTeam?.slug || (page.props as any).team?.slug || '');
 
 // Local filter state
@@ -251,6 +243,7 @@ const smaLabel = computed(() => {
     if (props.smaWindow === 6)  return '6-Month SMA';
     return '3-Month SMA';
 });
+const forecastPeriodLabel = computed(() => props.forecastPeriods?.[String(props.smaWindow)] ?? `${props.smaWindow} months`);
 
 // Dynamic chart title based on scope
 const chartTitle = computed(() => {
@@ -381,12 +374,12 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
 
     <div class="workspace-page">
         <!-- ─── Header ─────────────────────────────────────────── -->
-        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-4">
+        <div class="page-header">
             <div>
                 <h1 class="page-title">Demand Forecasting</h1>
                 <p class="page-subtitle">Moving-average (SMA) forecasts per category and item, from past sales.</p>
             </div>
-            <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
+            <div class="page-actions">
                 <SpecularButton
                     variant="secondary"
                     size="md"
@@ -412,7 +405,7 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                     <select
                         v-model="localCategory"
                         @change="onCategoryChange"
-                        class="bg-white border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-900 focus:border-gray-400 focus:outline-none font-medium"
+                        class="field-control font-medium sm:w-auto"
                     >
                         <option value="All">All Categories</option>
                         <option v-for="cat in categories" :key="cat" :value="cat">
@@ -438,7 +431,7 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                     <select
                         v-model="localProductId"
                         @change="onProductChange"
-                        class="bg-white border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-900 focus:border-gray-400 focus:outline-none font-medium"
+                        class="field-control font-medium sm:w-auto"
                     >
                         <option value="All">All Items (Aggregated)</option>
                         <option
@@ -462,7 +455,7 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                         :min="minDate"
                         :max="localToDate || maxDate"
                         @change="onFromDateChange"
-                        class="bg-white border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-900 focus:border-gray-400 focus:outline-none font-medium"
+                        class="field-control font-medium sm:w-auto"
                     />
                 </div>
 
@@ -477,18 +470,18 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                         :min="localFromDate || minDate"
                         :max="maxDate"
                         @change="onToDateChange"
-                        class="bg-white border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-900 focus:border-gray-400 focus:outline-none font-medium"
+                        class="field-control font-medium sm:w-auto"
                     />
                 </div>
 
                 <!-- SMA Interval & Actions -->
                 <div class="lg:col-span-2 flex flex-col gap-1">
                     <label class="text-xs font-semibold text-gray-500 flex items-center gap-1">
-                        SMA Window
+                        Forecasting period
                     </label>
-                    <div class="flex gap-1">
+                    <div class="flex gap-1" role="group" aria-label="Forecasting period">
                         <button
-                            v-for="opt in [{ label: '3M', val: 3 }, { label: '6M', val: 6 }, { label: '1Y', val: 12 }]"
+                            v-for="opt in [{ label: '3 Months', val: 3 }, { label: '6 Months', val: 6 }, { label: '1 Year', val: 12 }]"
                             :key="opt.val"
                             @click="localSma = opt.val"
                             :class="[
@@ -539,7 +532,7 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
         </div>
 
         <!-- ─── DEDICATED PRODUCT WINDOW FOR FORECASTING ────────── -->
-        <div v-if="productWindow" class="bg-white border border-gray-200 rounded-xl p-5">
+        <div v-if="productWindow" class="bg-white border border-gray-200 rounded-xl p-6">
             <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-4 pb-4 border-b border-gray-200/70">
                 <div class="flex items-start sm:items-center gap-3">
                     <div class="w-11 h-11 rounded-xl bg-[#4b5320] text-white flex items-center justify-center shrink-0">
@@ -674,7 +667,7 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
         </div>
 
         <!-- ─── CATEGORY WINDOW (When category selected but no single product) ─── -->
-        <div v-else-if="categoryWindow" class="bg-white border border-gray-200 rounded-xl p-5">
+        <div v-else-if="categoryWindow" class="bg-white border border-gray-200 rounded-xl p-6">
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4 pb-4 border-b border-amber-200/60">
                 <div class="flex items-center gap-3">
                     <div class="w-10 h-10 rounded-xl bg-[#F8B803] text-white flex items-center justify-center shrink-0">
@@ -776,10 +769,10 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
                         </div>
                         <div class="flex gap-2">
                             <span class="w-2 h-2 rounded-full bg-[#F8B803] mt-1 shrink-0"></span>
-                            <span><strong>SMA Forecast</strong> — rolling average of the last <strong>{{ props.smaWindow }}</strong> months, adjusted by an 8% seasonal trend factor</span>
+                            <span><strong>SMA Forecast</strong> — plain rolling average of the last <strong>{{ props.smaWindow }}</strong> complete months of actual demand</span>
                         </div>
                         <div class="mt-3 p-2.5 bg-gray-50 rounded-lg border border-gray-100 text-gray-500 font-mono text-[10px] leading-snug">
-                            SMA(n) = avg(last {{ smaWindow }} months) × 1.08
+                            SMA({{ smaWindow }}) = (D₁ + D₂ + … + Dₙ) / {{ smaWindow }}
                         </div>
                     </div>
                 </div>
@@ -851,7 +844,57 @@ const goToProcurement = (product?: { name: string; sku: string }) => {
             </div>
         </div>
 
-        <section class="panel p-5" aria-labelledby="sma-calc-heading">
+        <section class="panel p-6" aria-labelledby="product-forecast-heading">
+            <div class="flex flex-wrap items-baseline justify-between gap-2">
+                <div>
+                    <h2 id="product-forecast-heading" class="text-base font-semibold text-gray-900">Product forecast review: next {{ forecastPeriodLabel }}</h2>
+                    <p class="mt-1 text-sm text-gray-500">
+                        Average monthly demand over the last {{ smaWindow }} complete months (SMA-{{ smaWindow }}) × {{ smaWindow }} months.
+                        The same forecast drives AHP Product Prioritization and the reorder recommendations.
+                    </p>
+                </div>
+                <a v-if="canOpenReports" :href="`/${teamSlug}/reports?view=priority&forecast_months=${smaWindow}`" class="text-sm font-medium text-[#4b5320] hover:underline">Open AHP prioritization</a>
+            </div>
+            <div class="mt-3 overflow-x-auto">
+                <table class="w-full text-left text-sm">
+                    <thead>
+                        <tr class="text-xs text-gray-500">
+                            <th class="py-2 font-medium">Product</th>
+                            <th class="py-2 text-right font-medium">Available</th>
+                            <th class="py-2 text-right font-medium">Avg / month</th>
+                            <th class="py-2 text-right font-medium">Forecast, next {{ forecastPeriodLabel }}</th>
+                            <th class="py-2 pl-4 font-medium">AHP priority</th>
+                            <th class="py-2 pl-4 font-medium">Reorder advice</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="row in productForecasts" :key="row.product.id" class="border-t border-gray-100 align-top">
+                            <td class="py-2">
+                                <div class="font-medium text-gray-900">{{ row.product.name }}</div>
+                                <div class="font-mono text-xs text-gray-500">{{ row.product.sku }}</div>
+                            </td>
+                            <td class="py-2 text-right font-mono">{{ row.available_stock }}</td>
+                            <td class="py-2 text-right font-mono">{{ row.forecast.monthly ?? '—' }}</td>
+                            <td class="py-2 text-right font-mono">
+                                <span v-if="row.forecast.period_total != null" class="font-semibold">{{ row.forecast.period_total }} {{ row.product.unit }}</span>
+                                <span v-else class="font-sans text-xs text-amber-700" :title="row.forecast.reason ?? ''">Insufficient data</span>
+                            </td>
+                            <td class="py-2 pl-4 text-xs">{{ row.classification ?? 'Incomplete data' }}<span v-if="row.score != null" class="text-gray-500"> ({{ row.score.toFixed(2) }})</span></td>
+                            <td class="py-2 pl-4 text-xs" :title="row.reorder.basis">
+                                <span v-if="row.reorder.needed" class="font-medium text-amber-700">Reorder {{ row.reorder.suggested_quantity }} {{ row.product.unit }}</span>
+                                <span v-else class="text-gray-500">No reorder needed</span>
+                            </td>
+                        </tr>
+                        <tr v-if="!productForecasts.length">
+                            <td colspan="6" class="py-6 text-center text-sm text-gray-400">No active products in this selection.</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <p class="mt-2 text-xs text-gray-500">Products without {{ smaWindow }} full months of history show "Insufficient data"; nothing is estimated. Reorder advice is advice only: purchases go through Procurement.</p>
+        </section>
+
+        <section class="panel p-6" aria-labelledby="sma-calc-heading">
             <h2 id="sma-calc-heading" class="text-base font-semibold text-gray-900">How this forecast is calculated</h2>
             <p class="mt-1 text-sm text-gray-500">
                 SMA-{{ smaWindow }}: each month's forecast is the plain average of the {{ smaWindow }} months before it.

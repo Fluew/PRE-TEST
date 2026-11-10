@@ -47,7 +47,7 @@ function quotationNumbered(Team $team, string $number): Quotation
 {
     return Quotation::create([
         'team_id' => $team->id, 'quotation_number' => $number, 'client_name' => 'Old Client',
-        'quotation_date' => '2026-10-30', 'valid_until' => '2026-11-29', 'status' => QuotationStatus::Pending,
+        'quotation_date' => '2026-10-30', 'valid_until' => '2026-11-29', 'status' => QuotationStatus::Draft,
     ]);
 }
 
@@ -55,7 +55,7 @@ function staffQuotation(string $sku = 'PROD'): array
 {
     return [
         'client_name' => 'Metro Electric', 'quotation_date' => '2026-10-30', 'valid_until' => '2026-11-29',
-        'status' => QuotationStatus::Preparing->value,
+        'status' => QuotationStatus::Draft->value,
         'items' => [['sku' => $sku, 'product_name' => 'Breaker 30A', 'quantity' => 2, 'unit_price' => 100]],
     ];
 }

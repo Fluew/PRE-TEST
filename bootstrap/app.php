@@ -87,7 +87,7 @@ return Application::configure(basePath: dirname(__DIR__))
         // Uploads larger than the server accepts (PHP post_max_size) arrive with no form data at
         // all. Say so plainly instead of showing an error page; the form keeps what was typed.
         $exceptions->render(function (PostTooLargeException $e, Request $request) {
-            $message = 'The files you selected are larger than the server accepts. Please remove a file or choose smaller ones (10 MB each at most).';
+            $message = 'The files you selected are larger than the server accepts. Please remove a file or choose smaller ones (25 MB each at most).';
             if (! $request->header('X-Inertia') && ($request->expectsJson() || $request->ajax() || $request->is('api/*'))) {
                 return response()->json(['message' => $message, 'reason' => 'too_large'], 413);
             }

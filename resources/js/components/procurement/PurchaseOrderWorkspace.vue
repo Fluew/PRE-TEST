@@ -1,19 +1,20 @@
 <script setup lang="ts">
 /**
  * One purchase order end to end: its approved request, quantities (ordered / delivered /
- * accepted / rejected / posted), every inbound delivery with its inspection, the supplier
- * invoices with their three-way-match checks, and the next allowed actions.
+ * accepted / rejected / posted), every inbound delivery with its inspection, and the next
+ * allowed actions.
  * All rules are enforced by the backend (ProcurementWorkflow); this panel only shows them.
  */
 import { router, usePage } from '@inertiajs/vue3';
 import { computed, reactive, ref, watch } from 'vue';
 import { useCurrency } from '@/composables/useCurrency';
 
-const props = defineProps<{ poId: number | null; isAdmin: boolean }>();
+const props = defineProps<{ poId: number | null; isAdmin: boolean; /** For the administrator correction's product link. */ products?: { id: number; name: string; sku: string }[] }>();
 const emit = defineEmits<{ close: [] }>();
 
 const page = usePage();
 const teamSlug = computed(() => (page.props as any).currentTeam?.slug || (page.props as any).team?.slug || '');
+const canManageProcurement = computed(() => props.isAdmin || ['admin', 'staff_procurement'].includes((page.props as any).auth?.user?.role));
 const { formatMoney } = useCurrency();
 
 const data = ref<any>(null);
@@ -84,36 +85,41 @@ const inspectionPayload = () => ({
 });
 
 // Draft order created automatically on approval: staff confirm supplier, quantity, price, terms.
-const draft = reactive({ supplier_id: null as number | null, quantity: 0, unit_cost: 0, po_date: today, promised_delivery_date: '', payment_terms: '', quantity_adjustment_reason: '', notes: '' });
+// The order date is not edited here: it is shown read-only (an administrator correction can change it).
+const draft = reactive({ supplier_id: null as number | null, quantity: 0, unit_cost: 0, promised_delivery_date: '', payment_terms: '', quantity_adjustment_reason: '', notes: '' });
 const draftOpen = ref(false);
 const openDraft = () => {
     const p = po.value;
     Object.assign(draft, {
-        supplier_id: p.supplier_id, quantity: p.quantity, unit_cost: Number(p.unit_cost) || 0, po_date: p.po_date?.slice(0, 10) ?? today,
+        supplier_id: p.supplier_id, quantity: p.quantity, unit_cost: Number(p.unit_cost) || 0,
         promised_delivery_date: p.promised_delivery_date?.slice(0, 10) ?? '', payment_terms: p.payment_terms ?? '', quantity_adjustment_reason: p.quantity_adjustment_reason ?? '', notes: p.notes ?? '',
     });
     draftOpen.value = true;
 };
 const approvedQty = computed(() => po.value?.purchase_request?.quantity ?? po.value?.quantity);
+// "Product Not Listed" order still without a catalog product: received in Record Inbound P.O. Delivery,
+// where the product is linked or created first.
+const unlistedProduct = computed(() => !!po.value && !po.value.product_id && !po.value.purchase_request?.product_id && po.value.purchase_request?.product_description != null);
 const readyToSend = computed(() => po.value?.supplier_id && Number(po.value?.unit_cost) > 0);
 const resolution = reactive({ id: 0, resolution_status: 'returned', resolution_remarks: '' });
 
-const invoice = reactive({ open: false, delivery_id: 0, invoice_number: '', invoice_date: today, quantity: 0, unit_cost: 0, tax_amount: 0, payment_terms: '', attachment: null as File | null });
-const openInvoice = (d: any) => Object.assign(invoice, {
-    open: true, delivery_id: d.id, invoice_number: '', invoice_date: today, quantity: d.accepted_quantity ?? d.quantity,
-    unit_cost: Number(po.value?.unit_cost ?? 0), tax_amount: 0, payment_terms: po.value?.payment_terms ?? '', attachment: null,
-});
-const invoicePayload = () => {
-    const { open: _open, attachment, ...rest } = invoice;
-    return { ...rest, purchase_order_id: po.value.id, ...(attachment ? { attachment } : {}) };
-};
-const correction = reactive({ id: 0, invoice_number: '', quantity: 0, unit_cost: 0, tax_amount: 0, remarks: '' });
-const openCorrection = (ci: any) => Object.assign(correction, { id: ci.id, invoice_number: ci.invoice_number, quantity: ci.quantity, unit_cost: Number(ci.unit_cost), tax_amount: Number(ci.tax_amount ?? 0), remarks: '' });
-const decision = reactive({ id: 0, kind: '' as '' | 'verify' | 'flag', remarks: '' });
 const poReason = reactive({ kind: '' as '' | 'cancel' | 'close', reason: '' });
 
-const invoiceFor = (deliveryId: number) => (data.value?.invoices ?? []).filter((i: any) => i.delivery_id === deliveryId && i.status !== 'Cancelled');
-const hasVerifiedInvoice = (deliveryId: number) => invoiceFor(deliveryId).some((i: any) => i.status === 'Verified');
+// Administrator correction of the recorded document: Order Date (whole PO), linked product, promised date.
+const correction = reactive({ open: false, po_date: '', product_id: null as number | null, promised_delivery_date: '', reason: '' });
+const openCorrection = () => Object.assign(correction, {
+    open: true,
+    po_date: po.value?.po_date?.slice(0, 10) ?? '',
+    product_id: po.value?.product_id ?? null,
+    promised_delivery_date: po.value?.promised_delivery_date?.slice(0, 10) ?? '',
+    reason: '',
+});
+const submitCorrection = () => act('patch', `procurement/purchase-orders/${po.value.id}/correction`, {
+    po_date: correction.po_date || null,
+    product_id: correction.product_id,
+    promised_delivery_date: correction.promised_delivery_date || null,
+    reason: correction.reason,
+}, () => (correction.open = false));
 const label = (v: string) => v.replace(/_/g, ' ');
 const statusClass = (st: string) => ({
     'Draft': 'bg-gray-50 text-gray-700 border-gray-200',
@@ -156,6 +162,43 @@ const statusClass = (st: string) => ({
                 <p v-if="actionError" class="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-rose-700">{{ actionError }}</p>
 
                 <template v-if="data">
+                    <!-- The supplier's purchase order as recorded (read-only) -->
+                    <section aria-labelledby="po-ws-details">
+                        <h4 id="po-ws-details" class="mb-2 text-sm font-medium text-gray-900">Purchase order details</h4>
+                        <dl class="mb-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                            <div class="rounded-xl border border-gray-200 px-3 py-2"><dt class="text-xs text-gray-500">ORDER DATE</dt><dd class="font-medium text-gray-900">{{ po.po_date?.slice(0, 10) ?? '—' }}</dd></div>
+                            <div class="rounded-xl border border-gray-200 px-3 py-2"><dt class="text-xs text-gray-500">PURCHASE ORDER NO.</dt><dd class="font-mono font-medium text-gray-900">{{ po.po_number }}</dd></div>
+                            <div class="rounded-xl border border-gray-200 px-3 py-2"><dt class="text-xs text-gray-500">SUPPLIER</dt><dd class="font-medium text-gray-900">{{ po.supplier?.name ?? '—' }}</dd></div>
+                        </dl>
+                        <div class="overflow-x-auto rounded-xl border border-gray-200">
+                            <table class="w-full text-left text-sm">
+                                <thead class="bg-gray-50 text-xs text-gray-600">
+                                    <tr>
+                                        <th scope="col" class="px-3 py-2 text-right font-semibold">QUANTITY</th>
+                                        <th scope="col" class="px-3 py-2 font-semibold">ITEM/SKU Number</th>
+                                        <th scope="col" class="px-3 py-2 font-semibold">Description</th>
+                                        <th scope="col" class="px-3 py-2 text-right font-semibold">UNIT COST</th>
+                                        <th scope="col" class="px-3 py-2 font-semibold">U/M</th>
+                                        <th scope="col" class="px-3 py-2 text-right font-semibold">EXTENDED COST</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-100">
+                                    <tr v-for="line in data.lines ?? []" :key="line.id" :class="line.id === po.id ? 'bg-amber-50/40' : ''">
+                                        <td class="px-3 py-2 text-right font-mono">{{ line.quantity }}</td>
+                                        <td class="px-3 py-2 font-mono text-xs">{{ line.item_sku || '—' }}</td>
+                                        <td class="px-3 py-2">{{ line.description }}</td>
+                                        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{{ line.unit_cost === null ? '—' : formatMoney(line.unit_cost) }}</td>
+                                        <td class="px-3 py-2 text-xs">{{ line.unit_of_measure || '—' }}</td>
+                                        <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{{ formatMoney(line.extended_cost) }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <p class="mt-1 text-xs text-gray-500">
+                            As recorded from the supplier's document. EXTENDED COST = QUANTITY × UNIT COST.<template v-if="(data.lines ?? []).length > 1"> The highlighted line is the one opened.</template>
+                        </p>
+                    </section>
+
                     <!-- Source request and order terms -->
                     <section class="grid grid-cols-1 gap-3 md:grid-cols-2">
                         <div class="rounded-xl border border-gray-200 p-3">
@@ -163,11 +206,15 @@ const statusClass = (st: string) => ({
                             <template v-if="po.purchase_request">
                                 <p class="font-mono font-medium text-gray-900">{{ po.purchase_request.request_number }}</p>
                                 <p class="text-xs text-gray-600">
-                                    Requested {{ po.purchase_request.quantity }} by {{ po.purchase_request.requested_by?.name ?? '—' }} ·
+                                    Requested {{ po.purchase_request.quantity }}<template v-if="po.purchase_request.unit"> {{ po.purchase_request.unit }}</template> by {{ po.purchase_request.requested_by?.name ?? '—' }} ·
                                     approved by {{ po.purchase_request.reviewed_by?.name ?? '—' }} {{ po.purchase_request.reviewed_at?.slice(0, 10) }}
                                 </p>
                                 <p class="text-xs text-gray-600">AHP {{ po.purchase_request.ahp_score ?? 'incomplete' }} · forecast {{ po.purchase_request.forecast_quantity ?? 'n/a' }} · stock then {{ po.purchase_request.current_stock ?? '—' }}</p>
+                                <p v-if="po.purchase_request.product_description && !po.purchase_request.product_id" class="mt-1 text-xs font-medium text-amber-700">
+                                    Product not listed: {{ po.purchase_request.product_description }}<template v-if="!po.product_id">. It is linked to a catalog product or created when the goods are received.</template>
+                                </p>
                                 <p class="mt-1 text-xs text-gray-500">{{ po.purchase_request.justification }}</p>
+                                <p v-if="po.purchase_request.quotation" class="mt-1 text-xs font-medium text-blue-700">For quotation {{ po.purchase_request.quotation.quotation_number }} ({{ po.purchase_request.quotation.client_name }}). The quotation stays Draft until this stock is received.</p>
                             </template>
                             <p v-else class="text-xs text-amber-700">No purchase request (imported historical record).</p>
                         </div>
@@ -188,7 +235,7 @@ const statusClass = (st: string) => ({
                                 <dd class="font-mono text-base font-medium" :class="k === 'rejected' && s[k] ? 'text-rose-700' : 'text-gray-900'">{{ s[k] }}</dd>
                             </div>
                         </dl>
-                        <p class="mt-1 text-xs text-gray-500">Only accepted units with a verified invoice are added to stock. Rejected units stay owed by the supplier.</p>
+                        <p class="mt-1 text-xs text-gray-500">Accepted units are added to stock automatically when the inspection is saved. Rejected units are never added and stay owed by the supplier.</p>
                     </section>
 
                     <!-- Order actions -->
@@ -198,10 +245,10 @@ const statusClass = (st: string) => ({
                     </section>
                     <form v-if="po.status === 'Draft' && draftOpen" class="grid grid-cols-1 gap-3 rounded-xl border border-gray-200 p-3 sm:grid-cols-4" @submit.prevent="act('patch', `procurement/purchase-orders/${po.id}/draft`, { ...draft, promised_delivery_date: draft.promised_delivery_date || null }, () => (draftOpen = false))">
                         <div class="sm:col-span-2">
-                            <label class="field-label" for="dr-sup">Supplier</label>
+                            <label class="field-label" for="dr-sup">Supplier (ranked by AHP supplier evaluation; your choice)</label>
                             <select id="dr-sup" v-model="draft.supplier_id" class="field-control w-full" required>
                                 <option :value="null" disabled>Choose…</option>
-                                <option v-for="s in data.suppliers" :key="s.id" :value="s.id">{{ s.name }}</option>
+                                <option v-for="s in data.suppliers" :key="s.id" :value="s.id">{{ s.name }} — {{ s.rank ? `AHP rank #${s.rank}, ${Number(s.score).toFixed(2)} (${s.classification})` : 'not ranked (insufficient data)' }}</option>
                             </select>
                         </div>
                         <div><label class="field-label" for="dr-qty">Quantity (approved {{ approvedQty }})</label><input id="dr-qty" v-model.number="draft.quantity" type="number" min="1" class="field-control w-full" required /></div>
@@ -210,7 +257,6 @@ const statusClass = (st: string) => ({
                             <label class="field-label" for="dr-adj">Reason for changing the approved quantity{{ draft.quantity > approvedQty ? ' (administrator only)' : '' }}</label>
                             <input id="dr-adj" v-model="draft.quantity_adjustment_reason" class="field-control w-full" required />
                         </div>
-                        <div><label class="field-label" for="dr-date">Order date</label><input id="dr-date" v-model="draft.po_date" type="date" :max="today" class="field-control w-full" /></div>
                         <div><label class="field-label" for="dr-prom">Expected delivery</label><input id="dr-prom" v-model="draft.promised_delivery_date" type="date" :min="today" class="field-control w-full" /></div>
                         <div class="sm:col-span-2"><label class="field-label" for="dr-terms">Payment terms</label><input id="dr-terms" v-model="draft.payment_terms" class="field-control w-full" placeholder="e.g. 30 days" /></div>
                         <p class="text-sm sm:col-span-4">Total: <span class="font-medium">{{ formatMoney((draft.quantity || 0) * (draft.unit_cost || 0)) }}</span></p>
@@ -218,12 +264,39 @@ const statusClass = (st: string) => ({
                     </form>
 
                     <section class="flex flex-wrap gap-2">
-                        <button v-if="po.status === 'Draft' && !draftOpen" type="button" class="secondary-button" @click="openDraft">Review and edit draft</button>
-                        <button v-if="po.status === 'Draft'" type="button" class="brand-button" :disabled="busy || !readyToSend" :title="readyToSend ? '' : 'Confirm the supplier and agreed price first'" @click="act('post', `procurement/purchase-orders/${po.id}/send`)">Finalize and send to supplier</button>
-                        <button v-if="['Sent to Supplier', 'Partially Delivered'].includes(po.status)" type="button" class="brand-button" :disabled="busy" @click="openReceive">Record inbound delivery</button>
-                        <button v-if="['Draft', 'Sent to Supplier'].includes(po.status) && !data.deliveries.length" type="button" class="secondary-button" @click="poReason.kind = 'cancel'; poReason.reason = ''">Cancel order</button>
-                        <button v-if="po.status === 'Fully Delivered' || (po.status === 'Partially Delivered' && isAdmin)" type="button" class="secondary-button" @click="poReason.kind = 'close'; poReason.reason = ''">Close order</button>
+                        <button v-if="canManageProcurement && po.status === 'Draft' && !draftOpen" type="button" class="secondary-button" @click="openDraft">Review and edit draft</button>
+                        <button v-if="canManageProcurement && po.status === 'Draft'" type="button" class="brand-button" :disabled="busy || !readyToSend" :title="readyToSend ? '' : 'Confirm the supplier and agreed price first'" @click="act('post', `procurement/purchase-orders/${po.id}/send`)">Finalize and send to supplier</button>
+                        <button v-if="['Sent to Supplier', 'Partially Delivered'].includes(po.status) && !unlistedProduct" type="button" class="brand-button" :disabled="busy" @click="openReceive">Record inbound delivery</button>
+                        <p v-if="['Sent to Supplier', 'Partially Delivered'].includes(po.status) && unlistedProduct" class="self-center text-xs text-gray-600">
+                            Record this delivery in Deliveries → Record Inbound P.O. Delivery, where the product is linked to the catalog or created.
+                        </p>
+                        <button v-if="canManageProcurement && ['Draft', 'Sent to Supplier'].includes(po.status) && !data.deliveries.length" type="button" class="secondary-button" @click="poReason.kind = 'cancel'; poReason.reason = ''">Cancel order</button>
+                        <button v-if="canManageProcurement && (po.status === 'Fully Delivered' || (po.status === 'Partially Delivered' && isAdmin))" type="button" class="secondary-button" @click="poReason.kind = 'close'; poReason.reason = ''">Close order</button>
+                        <button v-if="isAdmin && !correction.open" type="button" class="secondary-button" @click="openCorrection">Correct recorded details (administrator)</button>
                     </section>
+                    <form v-if="isAdmin && correction.open" class="grid grid-cols-1 gap-3 rounded-xl border border-amber-200 bg-amber-50/40 p-3 sm:grid-cols-3" @submit.prevent="submitCorrection">
+                        <p class="text-xs text-amber-900 sm:col-span-3">Administrator correction of what was recorded from the supplier's document. The reason and every before/after value are kept in the audit trail. Quantities, prices and descriptions are not changed here.</p>
+                        <div>
+                            <label class="field-label" for="co-date">Order date (whole PO {{ po.po_number }})</label>
+                            <input id="co-date" v-model="correction.po_date" type="date" :max="today" class="field-control w-full" />
+                        </div>
+                        <div>
+                            <label class="field-label" for="co-product">Linked inventory product</label>
+                            <select id="co-product" v-model="correction.product_id" class="field-control w-full">
+                                <option :value="null">Not linked</option>
+                                <option v-for="p in products ?? []" :key="p.id" :value="p.id">{{ p.name }} ({{ p.sku }})</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="field-label" for="co-promised">Promised delivery date</label>
+                            <input id="co-promised" v-model="correction.promised_delivery_date" type="date" :min="correction.po_date || undefined" class="field-control w-full" />
+                        </div>
+                        <div class="sm:col-span-3">
+                            <label class="field-label" for="co-reason">Reason for the correction</label>
+                            <textarea id="co-reason" v-model="correction.reason" rows="2" maxlength="1000" class="field-control w-full" required></textarea>
+                        </div>
+                        <div class="flex justify-end gap-2 sm:col-span-3"><button type="button" class="secondary-button" @click="correction.open = false">Cancel</button><button class="brand-button" :disabled="busy">Save correction</button></div>
+                    </form>
                     <form v-if="poReason.kind" class="rounded-xl border border-gray-200 p-3" @submit.prevent="act('post', `procurement/purchase-orders/${po.id}/${poReason.kind}`, { reason: poReason.reason }, () => (poReason.kind = ''))">
                         <label class="field-label" for="po-reason">{{ poReason.kind === 'cancel' ? 'Reason for cancelling' : (po.status === 'Partially Delivered' ? 'Reason for closing short (the rest will not be delivered)' : 'Remarks (optional)') }}</label>
                         <textarea id="po-reason" v-model="poReason.reason" rows="2" class="field-control w-full" :required="poReason.kind === 'cancel' || po.status === 'Partially Delivered'"></textarea>
@@ -265,17 +338,13 @@ const statusClass = (st: string) => ({
                             <p v-if="d.posted_at" class="mt-1 text-xs text-emerald-700">{{ d.posted_quantity }} added to stock {{ d.posted_at.slice(0, 10) }} by {{ d.posted_by ?? '—' }}</p>
 
                             <div class="mt-2 flex flex-wrap gap-2">
-                                <button v-if="!d.posted_at && (!d.inspection_number || isAdmin)" type="button" class="secondary-button" @click="openInspection(d)">{{ d.inspection_number ? 'Correct inspection' : 'Inspect' }}</button>
+                                <button type="button" class="secondary-button" @click="openInspection(d)">{{ d.inspection_number ? 'Correct inspection' : 'Inspect' }}</button>
                                 <button v-if="d.rejected_quantity && !d.resolution_status" type="button" class="secondary-button" @click="resolution.id = d.id">Record rejection resolution</button>
-                                <button v-if="d.inspection_number && !invoiceFor(d.id).length" type="button" class="secondary-button" @click="openInvoice(d)">Record supplier invoice</button>
-                                <!-- Normally automatic on invoice verification; shown only for older verified invoices. -->
-                                <button v-if="d.inspection_number && d.accepted_quantity && !d.posted_at && hasVerifiedInvoice(d.id)" type="button" class="secondary-button" :disabled="busy" @click="act('post', `deliveries/${d.id}/post-inventory`)">
+                                <!-- Normally automatic at inspection; shown only for deliveries inspected before that. -->
+                                <button v-if="d.inspection_number && d.accepted_quantity && !d.posted_at" type="button" class="secondary-button" :disabled="busy" @click="act('post', `deliveries/${d.id}/post-inventory`)">
                                     Post {{ d.accepted_quantity }} accepted to inventory
                                 </button>
                             </div>
-                            <p v-if="d.inspection_number && d.accepted_quantity && !d.posted_at && !hasVerifiedInvoice(d.id)" class="mt-1 text-xs text-gray-500">
-                                The {{ d.accepted_quantity }} accepted units are added to stock automatically when the supplier invoice is verified.
-                            </p>
 
                             <form v-if="inspection.id === d.id" class="mt-3 grid grid-cols-1 gap-3 rounded-xl bg-gray-50 p-3 sm:grid-cols-4" @submit.prevent="act('post', `deliveries/${d.id}/inspection`, inspectionPayload(), () => (inspection.id = 0))">
                                 <div><label class="field-label" :for="`in-a-${d.id}`">Accepted</label><input :id="`in-a-${d.id}`" v-model.number="inspection.accepted_quantity" type="number" min="0" class="field-control w-full" /></div>
@@ -298,7 +367,7 @@ const statusClass = (st: string) => ({
                                     <div class="sm:col-span-3"><label class="field-label" :for="`in-rr-${d.id}`">Defect / rejection reason</label><input :id="`in-rr-${d.id}`" v-model="inspection.rejection_reason" class="field-control w-full" required /></div>
                                 </template>
                                 <div class="sm:col-span-4"><label class="field-label" :for="`in-rm-${d.id}`">Remarks (condition, specification check)</label><input :id="`in-rm-${d.id}`" v-model="inspection.inspection_remarks" class="field-control w-full" /></div>
-                                <div class="flex justify-end gap-2 sm:col-span-4"><button type="button" class="secondary-button" @click="inspection.id = 0">Cancel</button><button class="brand-button" :disabled="busy">Save inspection</button></div>
+                                <div class="flex justify-end gap-2 sm:col-span-4"><p class="mr-auto self-center text-xs text-gray-500">Saving adds the accepted units to stock{{ d.posted_at ? ' (only the difference for a correction)' : '' }}.</p><button type="button" class="secondary-button" @click="inspection.id = 0">Cancel</button><button class="brand-button" :disabled="busy">Save inspection</button></div>
                             </form>
 
                             <form v-if="resolution.id === d.id" class="mt-3 grid grid-cols-1 gap-3 rounded-xl bg-gray-50 p-3 sm:grid-cols-4" @submit.prevent="act('post', `deliveries/${d.id}/resolution`, { resolution_status: resolution.resolution_status, resolution_remarks: resolution.resolution_remarks }, () => (resolution.id = 0))">
@@ -308,66 +377,6 @@ const statusClass = (st: string) => ({
                                 </div>
                                 <div class="sm:col-span-3"><label class="field-label" :for="`rsr-${d.id}`">Remarks (RMA, credit note, replacement delivery…)</label><input :id="`rsr-${d.id}`" v-model="resolution.resolution_remarks" class="field-control w-full" /></div>
                                 <div class="flex justify-end gap-2 sm:col-span-4"><button type="button" class="secondary-button" @click="resolution.id = 0">Cancel</button><button class="brand-button" :disabled="busy">Save</button></div>
-                            </form>
-
-                            <form v-if="invoice.open && invoice.delivery_id === d.id" class="mt-3 grid grid-cols-1 gap-3 rounded-xl bg-gray-50 p-3 sm:grid-cols-4" @submit.prevent="act('post', 'procurement/invoices', invoicePayload(), () => (invoice.open = false))">
-                                <div><label class="field-label" :for="`iv-n-${d.id}`">Supplier invoice no.</label><input :id="`iv-n-${d.id}`" v-model="invoice.invoice_number" class="field-control w-full" required /></div>
-                                <div><label class="field-label" :for="`iv-d-${d.id}`">Invoice date</label><input :id="`iv-d-${d.id}`" v-model="invoice.invoice_date" type="date" :max="today" class="field-control w-full" required /></div>
-                                <div><label class="field-label" :for="`iv-q-${d.id}`">Invoiced quantity</label><input :id="`iv-q-${d.id}`" v-model.number="invoice.quantity" type="number" min="1" class="field-control w-full" required /></div>
-                                <div><label class="field-label" :for="`iv-u-${d.id}`">Invoiced unit price</label><input :id="`iv-u-${d.id}`" v-model.number="invoice.unit_cost" type="number" min="0" step="0.01" class="field-control w-full" required /></div>
-                                <div><label class="field-label" :for="`iv-t-${d.id}`">Tax</label><input :id="`iv-t-${d.id}`" v-model.number="invoice.tax_amount" type="number" min="0" step="0.01" class="field-control w-full" /></div>
-                                <div class="sm:col-span-2"><label class="field-label" :for="`iv-p-${d.id}`">Payment terms</label><input :id="`iv-p-${d.id}`" v-model="invoice.payment_terms" class="field-control w-full" /></div>
-                                <p class="self-end text-xs text-gray-500">Enter what the supplier charged, not what was ordered.</p>
-                                <div class="sm:col-span-4">
-                                    <label class="field-label" :for="`iv-f-${d.id}`">Invoice document (PDF or image, optional, up to 25 MB)</label>
-                                    <input :id="`iv-f-${d.id}`" type="file" accept=".pdf,.png,.jpg,.jpeg" class="field-control w-full" @change="invoice.attachment = ($event.target as HTMLInputElement).files?.[0] ?? null" />
-                                </div>
-                                <div class="flex justify-end gap-2 sm:col-span-4"><button type="button" class="secondary-button" @click="invoice.open = false">Cancel</button><button class="brand-button" :disabled="busy">Record invoice</button></div>
-                            </form>
-                        </div>
-                    </section>
-
-                    <!-- Invoices -->
-                    <section>
-                        <h4 class="mb-2 text-sm font-medium text-gray-900">Commercial invoices (PO ↔ delivery ↔ inspection ↔ invoice)</h4>
-                        <p v-if="!data.invoices.length" class="text-xs text-gray-500">No supplier invoice recorded yet.</p>
-                        <div v-for="ci in data.invoices" :key="ci.id" class="mb-3 rounded-xl border border-gray-200 p-3">
-                            <div class="flex flex-wrap items-center justify-between gap-2">
-                                <div>
-                                    <span class="font-mono font-medium text-gray-900">{{ ci.invoice_number }}</span>
-                                    <span class="text-xs text-gray-500"> · {{ ci.invoice_date?.slice(0, 10) }} · delivery {{ ci.delivery_number ?? '—' }} · {{ ci.quantity }} × {{ formatMoney(Number(ci.unit_cost)) }}<template v-if="Number(ci.tax_amount)"> + tax {{ formatMoney(Number(ci.tax_amount)) }}</template> = {{ formatMoney(Number(ci.total_cost)) }}</span>
-                                </div>
-                                <span :class="statusClass(ci.status)" class="rounded-full border px-2.5 py-0.5 text-xs font-medium">{{ ci.status }}</span>
-                            </div>
-                            <ul v-if="ci.discrepancies?.length" class="mt-2 space-y-0.5 text-xs" :class="ci.status === 'Verified' ? 'text-gray-600' : 'text-rose-700'">
-                                <li v-for="f in ci.discrepancies" :key="f.code">{{ ci.status === 'Verified' ? 'Accepted difference: ' : '' }}{{ f.message }}{{ f.overridable || ci.status === 'Verified' ? '' : ' (must be fixed)' }}</li>
-                            </ul>
-                            <p v-else-if="ci.status !== 'Verified'" class="mt-1 text-xs text-emerald-700">Matches the purchase order and the accepted quantity.</p>
-                            <p v-if="ci.attachment_name" class="mt-1 text-xs"><a :href="`/${teamSlug}/procurement/invoices/${ci.id}/attachment`" class="text-[#4b5320] underline">{{ ci.attachment_name }}</a></p>
-                            <p v-if="ci.verification_remarks" class="mt-1 text-xs text-gray-600">Remarks: {{ ci.verification_remarks }}</p>
-                            <p v-if="ci.verified_at" class="text-xs text-gray-500">Verified {{ ci.verified_at.slice(0, 10) }} by {{ ci.verified_by ?? '—' }}. Verification is not payment.</p>
-
-                            <div v-if="['Pending Verification', 'Flagged'].includes(ci.status)" class="mt-2 flex flex-wrap gap-2">
-                                <button type="button" class="brand-button" :disabled="busy" :title="'Verifying adds the accepted units to stock automatically'" @click="decision.id = ci.id; decision.kind = 'verify'; decision.remarks = ''">Verify and receive into stock</button>
-                                <button v-if="ci.status === 'Pending Verification'" type="button" class="secondary-button" @click="decision.id = ci.id; decision.kind = 'flag'; decision.remarks = ''">Flag problem</button>
-                                <button type="button" class="secondary-button" @click="openCorrection(ci)">Correct invoice</button>
-                            </div>
-
-                            <form v-if="decision.id === ci.id && decision.kind" class="mt-3 rounded-xl bg-gray-50 p-3" @submit.prevent="act('post', `procurement/invoices/${ci.id}/${decision.kind}`, { remarks: decision.remarks }, () => (decision.kind = ''))">
-                                <label class="field-label" :for="`dc-${ci.id}`">
-                                    {{ decision.kind === 'flag' ? 'Describe the problem' : (ci.discrepancies?.length ? 'Why the difference is accepted (administrator only)' : 'Verification remarks (optional)') }}
-                                </label>
-                                <textarea :id="`dc-${ci.id}`" v-model="decision.remarks" rows="2" class="field-control w-full" :required="decision.kind === 'flag' || ci.discrepancies?.length > 0"></textarea>
-                                <div class="mt-2 flex justify-end gap-2"><button type="button" class="secondary-button" @click="decision.kind = ''">Back</button><button class="brand-button" :disabled="busy">{{ decision.kind === 'flag' ? 'Flag invoice' : 'Verify invoice' }}</button></div>
-                            </form>
-
-                            <form v-if="correction.id === ci.id" class="mt-3 grid grid-cols-1 gap-3 rounded-xl bg-gray-50 p-3 sm:grid-cols-4" @submit.prevent="act('patch', `procurement/invoices/${ci.id}`, { ...correction }, () => (correction.id = 0))">
-                                <div><label class="field-label" :for="`cr-n-${ci.id}`">Invoice no.</label><input :id="`cr-n-${ci.id}`" v-model="correction.invoice_number" class="field-control w-full" /></div>
-                                <div><label class="field-label" :for="`cr-q-${ci.id}`">Quantity</label><input :id="`cr-q-${ci.id}`" v-model.number="correction.quantity" type="number" min="1" class="field-control w-full" /></div>
-                                <div><label class="field-label" :for="`cr-u-${ci.id}`">Unit price</label><input :id="`cr-u-${ci.id}`" v-model.number="correction.unit_cost" type="number" min="0" step="0.01" class="field-control w-full" /></div>
-                                <div><label class="field-label" :for="`cr-t-${ci.id}`">Tax</label><input :id="`cr-t-${ci.id}`" v-model.number="correction.tax_amount" type="number" min="0" step="0.01" class="field-control w-full" /></div>
-                                <div class="sm:col-span-4"><label class="field-label" :for="`cr-r-${ci.id}`">Reason (e.g. corrected invoice received)</label><input :id="`cr-r-${ci.id}`" v-model="correction.remarks" class="field-control w-full" required /></div>
-                                <div class="flex justify-end gap-2 sm:col-span-4"><button type="button" class="secondary-button" @click="correction.id = 0">Cancel</button><button class="brand-button" :disabled="busy">Save correction</button></div>
                             </form>
                         </div>
                     </section>

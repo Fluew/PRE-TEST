@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Services\Import\ValueParser;
 use App\Traits\TracksDeletions;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -16,9 +17,12 @@ class PurchaseRequest extends Model
         'team_id',
         'request_number',
         'product_id',
+        'product_description',
+        'quotation_id',
         'supplier_id',
         'requested_by_id',
         'quantity',
+        'unit',
         'estimated_cost',
         'status',
         'notes',
@@ -72,6 +76,12 @@ class PurchaseRequest extends Model
         return $this->belongsTo(User::class, 'reviewed_by_id');
     }
 
+    /** The quotation whose short items this request buys (null for reorder requests). */
+    public function quotation(): BelongsTo
+    {
+        return $this->belongsTo(Quotation::class);
+    }
+
     public function purchaseOrder(): HasOne
     {
         return $this->hasOne(PurchaseOrder::class, 'purchase_request_id');
@@ -100,9 +110,41 @@ class PurchaseRequest extends Model
     /**
      * Generate the next purchase request number for a team.
      */
+    /**
+     * A request for a product that is not in the Product Catalog ("Product Not Listed"): no product,
+     * the staff's description and the unit they chose. No inventory record is created for it.
+     */
+    public function isUnlisted(): bool
+    {
+        return $this->product_id === null && $this->product_description !== null;
+    }
+
+    /** What was requested: the catalog product's name, or the description of an unlisted product. */
+    public function itemName(): string
+    {
+        return $this->product?->name ?? ($this->product_description !== null ? 'Not listed: '.$this->product_description : 'Product');
+    }
+
+    /**
+     * Units an unlisted product can be requested in: the system's units of measure plus any unit
+     * already used on this team's products, each listed once ("PCS", "pc" and "pcs" are all "pcs").
+     *
+     * @return list<string>
+     */
+    public static function unitOptions(int $teamId): array
+    {
+        $used = Product::where('team_id', $teamId)->whereNotNull('unit')->distinct()->pluck('unit')
+            ->map(fn ($u) => ValueParser::unit($u) ?? mb_strtolower(trim((string) $u)))
+            ->filter()->all();
+        $units = array_values(array_unique([...ValueParser::units(), ...$used]));
+        sort($units, SORT_NATURAL | SORT_FLAG_CASE);
+
+        return $units;
+    }
+
     public static function generateRequestNumber(int $teamId): string
     {
-        $year = date('Y');
+        $year = now()->format('Y'); // the app clock (same as date('Y') in normal use)
         $n = static::withTrashed()->where('team_id', $teamId)->whereYear('created_at', $year)->count() + 1;
         // Numbers are unique per team (archived ones included), so skip any already taken.
         while (static::withTrashed()->where('team_id', $teamId)->where('request_number', $candidate = sprintf('PR-%s-%04d', substr($year, 2), $n))->exists()) {

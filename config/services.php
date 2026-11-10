@@ -27,6 +27,14 @@ return [
         'dev_redirect_to' => env('RESEND_DEV_REDIRECT_TO'),
     ],
 
+    // Automatic customer emails (delivery status, order and payment updates). "auto": sent by the
+    // web request itself right after its response, so no queue worker is needed; console code
+    // uses the queue. "queue": always through the queue (run `php artisan queue:work`).
+    // "after_response": always in the same process.
+    'customer_emails' => [
+        'send' => env('CUSTOMER_EMAILS_SEND', 'auto'),
+    ],
+
     // OCR for uploaded material lists (images and scanned PDFs). Point these at the installed
     // programs if they are not on the PATH, e.g. "C:\Program Files\Tesseract-OCR\tesseract.exe".
     'ocr' => [

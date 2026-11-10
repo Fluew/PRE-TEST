@@ -2,7 +2,6 @@
 
 namespace App\Listeners;
 
-use App\Events\Procurement\CommercialInvoiceVerified;
 use App\Events\Procurement\InboundDeliveryRecorded;
 use App\Events\Procurement\InventoryUpdated;
 use App\Events\Procurement\QualityInspectionCompleted;
@@ -23,11 +22,6 @@ class RefreshEvaluations
     public function handleQualityInspectionCompleted(QualityInspectionCompleted $e): void
     {
         RecalculateEvaluations::dispatch($e->delivery->team_id, 'inspection.completed', $e->delivery->inspection_number);
-    }
-
-    public function handleCommercialInvoiceVerified(CommercialInvoiceVerified $e): void
-    {
-        RecalculateEvaluations::dispatch($e->invoice->team_id, 'commercial_invoice.verified', $e->invoice->invoice_number);
     }
 
     public function handleInventoryUpdated(InventoryUpdated $e): void

@@ -6,7 +6,9 @@ defineProps<{
     title?: string;
     message?: string;
     reason?: string;
+    scheduledStartAt?: string | null;
     expectedReturnTime?: string | null;
+    expectedEndAt?: string | null;
     enabledAt?: string | null;
 }>();
 </script>
@@ -34,16 +36,24 @@ defineProps<{
                     {{ message || 'MRP ElectroDesk is temporarily unavailable while we perform system maintenance.' }}
                 </p>
 
+                <!-- Maintenance Reason -->
+                <div v-if="reason" class="mt-5 mx-auto max-w-md rounded-xl bg-gray-50 border border-gray-200/80 px-4 py-3 text-xs text-gray-700">
+                    <span class="font-semibold text-gray-900">Maintenance Notice:</span>
+                    <span class="ml-1">{{ reason }}</span>
+                </div>
+
                 <!-- Expected Return Time Badge -->
-                <div v-if="expectedReturnTime" class="mt-6 inline-flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-200 rounded-full text-xs font-semibold text-amber-900">
+                <div v-if="expectedReturnTime" class="mt-5 inline-flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-200 rounded-full text-xs font-semibold text-amber-900">
                     <Clock class="size-4 text-amber-600 shrink-0" />
                     <span>Expected Return: <strong class="text-amber-950 font-semibold">{{ expectedReturnTime }}</strong></span>
                 </div>
 
                 <!-- Controlled Maintenance Procedure Active -->
-                <div class="mt-6 inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-gray-50 border border-gray-200/80 text-gray-700 font-semibold text-xs">
-                    <ShieldCheck class="size-3.5 text-[#4b5320]" />
-                    <span>Controlled Maintenance Procedure Active</span>
+                <div class="mt-5 flex justify-center">
+                    <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-gray-50 border border-gray-200/80 text-gray-700 font-semibold text-xs">
+                        <ShieldCheck class="size-3.5 text-[#4b5320]" />
+                        <span>Controlled Maintenance Procedure Active</span>
+                    </div>
                 </div>
             </div>
 

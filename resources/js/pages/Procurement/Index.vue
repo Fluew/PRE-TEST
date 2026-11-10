@@ -3,10 +3,11 @@ import { Head, router, useForm, usePage } from '@inertiajs/vue3';
 import { useCanDelete } from '@/composables/useCanDelete';
 import { useCurrency } from '@/composables/useCurrency';
 import { showToast } from '@/composables/useFlashToast';
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
 import PurchaseRequestCreator, { type PrCandidate } from '@/components/procurement/PurchaseRequestCreator.vue';
 import PurchaseOrderWorkspace from '@/components/procurement/PurchaseOrderWorkspace.vue';
+import PurchaseOrderDocumentImport from '@/components/procurement/PurchaseOrderDocumentImport.vue';
 import { 
     Search, 
     Plus, 
@@ -23,29 +24,9 @@ import {
     Receipt,
     ShoppingCart,
     UploadCloud,
-    Download,
     AlertCircle,
     Eye
 } from '@lucide/vue';
-
-interface CommercialInvoiceItem {
-    id: number;
-    invoice_date: string;
-    invoice_number: string;
-    quantity: number;
-    description: string;
-    unit_cost: number;
-    total_cost: number;
-    supplier_id?: number | null;
-    status: string;
-    notes?: string | null;
-    supplier?: { id: number; name: string };
-    purchase_order_id?: number | null;
-    purchase_order?: { id: number; po_number: string } | null;
-    delivery?: { id: number; delivery_number: string } | null;
-    discrepancies?: { code: string; message: string; overridable: boolean }[] | null;
-    verified_by?: { id: number; name: string } | null;
-}
 
 interface PurchaseOrderItem {
     id: number;
@@ -74,6 +55,9 @@ interface PurchaseRequestItem {
     product_id: number;
     supplier_id: number;
     quantity: number;
+    /** Unit of the requested quantity and the staff's own description (New Purchase Request form). */
+    unit?: string | null;
+    product_description?: string | null;
     estimated_cost: number;
     status: string;
     notes?: string | null;
@@ -87,7 +71,7 @@ interface PurchaseRequestItem {
     justification?: string | null;
     reviewed_at?: string | null;
     review_remarks?: string | null;
-    product?: { id: number; name: string; sku: string };
+    product?: { id: number; name: string; sku: string } | null;
     supplier?: { id: number; name: string };
     requested_by?: { id: number; name: string };
     reviewed_by?: { id: number; name: string } | null;
@@ -98,6 +82,7 @@ interface ProductItem {
     id: number;
     name: string;
     sku: string;
+    unit?: string | null;
     cost_price: number;
     price: number;
     stock: number;
@@ -110,13 +95,6 @@ interface SupplierItem {
 }
 
 const props = defineProps<{
-    commercialInvoices?: {
-        data: CommercialInvoiceItem[];
-        current_page: number;
-        last_page: number;
-        total: number;
-        links: any[];
-    };
     purchaseOrders?: {
         data: PurchaseOrderItem[];
         current_page: number;
@@ -146,15 +124,15 @@ const props = defineProps<{
         requestedCount: number;
         orderedCount: number;
         deliveredCount: number;
-        totalCommercialInvoices?: number;
-        totalCommercialInvoiceAmount?: number;
         totalPurchaseOrders?: number;
         totalPurchaseOrderAmount?: number;
     };
     products: ProductItem[];
+    /** The system's units of measure, each once ("Product Not Listed" requests). */
+    unitOptions?: string[];
     suppliers: SupplierItem[];
     isAdmin: boolean;
-    statusOptions: { requests: string[]; purchase_orders: string[]; commercial_invoices: string[] };
+    statusOptions: { requests: string[]; purchase_orders: string[] };
 }>();
 
 const page = usePage();
@@ -177,8 +155,8 @@ const formatDate = (dateStr: string) => {
     return `${mm}-${dd}-${yyyy}`;
 };
 
-// Tabs: 'commercial_invoices' | 'purchase_orders' | 'requests'
-const activeTab = ref(props.activeTab || props.filters?.tab || 'commercial_invoices');
+// Tabs: 'purchase_orders' | 'requests'
+const activeTab = ref(props.activeTab || props.filters?.tab || 'purchase_orders');
 
 // Search & Filters state
 const search = ref(props.filters?.search || '');
@@ -233,153 +211,8 @@ const hasActiveFilters = computed(() => {
 });
 
 // ==========================================
-// 1. COMMERCIAL INVOICES LOGIC
-// ==========================================
-const showDeleteCiModal = ref(false);
-const selectedCi = ref<CommercialInvoiceItem | null>(null);
-const deleteCiConfirmInput = ref('');
-
-const openDeleteCiModal = (ci: CommercialInvoiceItem) => {
-    deleteCiConfirmInput.value = '';
-    selectedCi.value = ci;
-    showDeleteCiModal.value = true;
-};
-
-const confirmDeleteCi = () => {
-    if (!selectedCi.value) return;
-    router.delete(`/${teamSlug.value}/procurement/commercial-invoices/${selectedCi.value.id}`, {
-        preserveScroll: true,
-        onSuccess: () => {
-            showDeleteCiModal.value = false;
-            selectedCi.value = null;
-            showToast('Commercial invoice deleted successfully.', 'success');
-        },
-    });
-};
-
-// CI CSV Import
-const showCiImportModal = ref(false);
-const ciImportFile = ref<File | null>(null);
-const isValidatingCiCsv = ref(false);
-const isImportingCiCsv = ref(false);
-const ciCsvValidationResult = ref<any>(null);
-const ciCsvError = ref('');
-
-const openCiImportModal = () => {
-    ciImportFile.value = null;
-    ciCsvValidationResult.value = null;
-    ciCsvError.value = '';
-    showCiImportModal.value = true;
-};
-
-const handleCiFileChange = (e: Event) => {
-    const input = e.target as HTMLInputElement;
-    if (input.files && input.files[0]) {
-        ciImportFile.value = input.files[0];
-        validateCiCsv();
-    }
-};
-
-const validateCiCsv = async () => {
-    if (!ciImportFile.value) return;
-    isValidatingCiCsv.value = true;
-    ciCsvError.value = '';
-
-    const formData = new FormData();
-    formData.append('file', ciImportFile.value);
-    formData.append('execute', '0');
-
-    const token = (document.querySelector('meta[name="csrf-token"]') as HTMLMetaElement)?.content || '';
-
-    try {
-        const response = await fetch(`/${teamSlug.value}/procurement/commercial-invoices/import-csv`, {
-            method: 'POST',
-            body: formData,
-            headers: {
-                'X-CSRF-TOKEN': token,
-                'Accept': 'application/json',
-            }
-        });
-        const data = await response.json();
-        if (response.ok && data.success) {
-            ciCsvValidationResult.value = data;
-        } else {
-            ciCsvError.value = data.message || 'Failed to validate CSV structure.';
-            ciCsvValidationResult.value = null;
-        }
-    } catch (err: any) {
-        ciCsvError.value = err.message || 'Failed to process CSV file.';
-        ciCsvValidationResult.value = null;
-    } finally {
-        isValidatingCiCsv.value = false;
-    }
-};
-
-const downloadSampleCiCsv = () => {
-    const headers = 'DATE,COMMERCIAL INVOICE,QUANTITY,Description,UNIT COST\n';
-    const sampleRows = [
-        '10-25-2026,CI-035-0722,50,"Heavy Duty Electrical Conduit 20mm",120.00',
-        '10-25-2026,CI-036-0722,15,"Industrial Circuit Breaker 3-Phase 100A",1450.00',
-        '07-22-2022,CI-035-0722,100,"Single Gang Electrical Outlet Grounded",95.50'
-    ].join('\n');
-
-    const blob = new Blob([headers + sampleRows], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'mr_pride_commercial_invoices_template.csv';
-    link.click();
-    URL.revokeObjectURL(link.href);
-    showToast('Sample Commercial Invoice CSV downloaded with required headers!', 'info');
-};
-
-const executeCiCsvImport = () => {
-    if (!ciImportFile.value || !ciCsvValidationResult.value || ciCsvValidationResult.value.summary?.valid_count === 0) {
-        showToast('No valid rows available to import.', 'error');
-        return;
-    }
-
-    isImportingCiCsv.value = true;
-    const formData = new FormData();
-    formData.append('file', ciImportFile.value);
-    formData.append('execute', '1');
-
-    router.post(`/${teamSlug.value}/procurement/commercial-invoices/import-csv`, formData as any, {
-        onSuccess: () => {
-            showCiImportModal.value = false;
-            isImportingCiCsv.value = false;
-            showToast('Commercial invoices imported successfully!', 'success');
-        },
-        onError: (err) => {
-            isImportingCiCsv.value = false;
-            const msg = Object.values(err)[0] as string;
-            showToast(msg || 'Failed to import CSV.', 'error');
-        }
-    });
-};
-
-// ==========================================
 // 2. PURCHASE ORDERS LOGIC
 // ==========================================
-// Product and promised delivery date of an existing purchase order (Supplier Evaluation uses them).
-const schedulePo = ref<PurchaseOrderItem | null>(null);
-const scheduleForm = useForm({ product_id: null as number | null, promised_delivery_date: '' });
-const openSchedule = (po: PurchaseOrderItem) => {
-    schedulePo.value = po;
-    scheduleForm.clearErrors();
-    scheduleForm.product_id = po.product_id ?? null;
-    scheduleForm.promised_delivery_date = po.promised_delivery_date?.slice(0, 10) ?? '';
-};
-const submitSchedule = () => {
-    if (!schedulePo.value) return;
-    scheduleForm.transform((d) => ({ ...d, promised_delivery_date: d.promised_delivery_date || null }))
-        .patch(`/${teamSlug.value}/procurement/purchase-orders/${schedulePo.value.id}/schedule`, {
-            preserveScroll: true,
-            onSuccess: () => {
-                schedulePo.value = null;
-            },
-        });
-};
-
 const showDeletePoModal = ref(false);
 const selectedPo = ref<PurchaseOrderItem | null>(null);
 const deletePoConfirmInput = ref('');
@@ -391,8 +224,9 @@ const openDeletePoModal = (po: PurchaseOrderItem) => {
 };
 
 const confirmDeletePo = () => {
-    if (!selectedPo.value) return;
+    if (!selectedPo.value || deletePoConfirmInput.value !== 'YES') return;
     router.delete(`/${teamSlug.value}/procurement/purchase-orders/${selectedPo.value.id}`, {
+        data: { confirmation: deletePoConfirmInput.value },
         preserveScroll: true,
         onSuccess: () => {
             showDeletePoModal.value = false;
@@ -402,16 +236,20 @@ const confirmDeletePo = () => {
     });
 };
 
-// PO CSV Import
+// PO Import: CSV, or a purchase order document (PDF, PNG, JPG) read into an editable preview.
 const showPoImportModal = ref(false);
 const poImportFile = ref<File | null>(null);
+const poDocumentFile = ref<File | null>(null);
 const isValidatingPoCsv = ref(false);
 const isImportingPoCsv = ref(false);
 const poCsvValidationResult = ref<any>(null);
 const poCsvError = ref('');
+const PO_DOCUMENT_TYPES = ['pdf', 'png', 'jpg', 'jpeg'];
+const PO_DOCUMENT_MAX_BYTES = 25 * 1024 * 1024;
 
 const openPoImportModal = () => {
     poImportFile.value = null;
+    poDocumentFile.value = null;
     poCsvValidationResult.value = null;
     poCsvError.value = '';
     showPoImportModal.value = true;
@@ -419,10 +257,34 @@ const openPoImportModal = () => {
 
 const handlePoFileChange = (e: Event) => {
     const input = e.target as HTMLInputElement;
-    if (input.files && input.files[0]) {
-        poImportFile.value = input.files[0];
-        validatePoCsv();
+    const file = input.files?.[0];
+    if (!file) {
+        return;
     }
+    poImportFile.value = null;
+    poDocumentFile.value = null;
+    poCsvValidationResult.value = null;
+    poCsvError.value = '';
+    const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+    if (PO_DOCUMENT_TYPES.includes(ext)) {
+        if (file.size > PO_DOCUMENT_MAX_BYTES) {
+            poCsvError.value = 'The document is larger than 25 MB. Please upload a smaller file.';
+        } else {
+            poDocumentFile.value = file; // read by PurchaseOrderDocumentImport
+        }
+    } else if (['csv', 'txt'].includes(ext)) {
+        poImportFile.value = file;
+        validatePoCsv();
+    } else {
+        poCsvError.value = 'Choose a PDF, PNG or JPG purchase order document, or a CSV file.';
+    }
+    input.value = '';
+};
+
+const onPoDocumentSaved = () => {
+    showPoImportModal.value = false;
+    poDocumentFile.value = null;
+    showToast('Purchase order imported successfully!', 'success');
 };
 
 const validatePoCsv = async () => {
@@ -460,23 +322,6 @@ const validatePoCsv = async () => {
     }
 };
 
-const downloadSamplePoCsv = () => {
-    const headers = 'Date,Purchase Order No.,Quantity,ITEM/SKU Number,Description,U/M,Unit Cost\n';
-    const sampleRows = [
-        '10-25-2026,4000005472,100,068SSCR2,"0.68mm Stainless Steel Conduit Rod 2m",PCS,450.00',
-        '10-25-2026,4000005473,40,BRK-40A,"Circuit Breaker 2P 40A Rail Mounted",BOX,320.00',
-        '10-25-2026,4000005474,250,WIR-THHN,"THHN Building Wire 3.5mm Stranded",MTR,35.00'
-    ].join('\n');
-
-    const blob = new Blob([headers + sampleRows], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'mr_pride_purchase_orders_template.csv';
-    link.click();
-    URL.revokeObjectURL(link.href);
-    showToast('Sample Purchase Order CSV downloaded with required headers!', 'info');
-};
-
 const executePoCsvImport = () => {
     if (!poImportFile.value || !poCsvValidationResult.value || poCsvValidationResult.value.summary?.valid_count === 0) {
         showToast('No valid rows available to import.', 'error');
@@ -509,22 +354,78 @@ const showDeleteModal = ref(false);
 const selectedRequest = ref<PurchaseRequestItem | null>(null);
 const actionBusy = ref(false);
 
-// New request: pick a product; the server takes the AHP / forecast snapshot on submit.
+// New request. A catalog product: only the quantity (its unit comes from the Product Catalog,
+// read-only). "Product Not Listed": a description, the quantity and a unit from the system's units;
+// nothing is added to inventory. Then the request creator (justification, submit).
+const UNLISTED = 'unlisted' as const;
 const showProductPicker = ref(false);
-const pickedProductId = ref<number | null>(null);
+const pickedProductId = ref<number | typeof UNLISTED | null>(null);
+const pickedDescription = ref('');
+const pickedQuantity = ref<number | string | null>(null);
+const pickedUnitChoice = ref('');
+const pickerFocus = ref<'' | 'product' | 'unit'>('');
+const pickerErrors = ref<{ product?: string; description?: string; quantity?: string; unit?: string }>({});
 const prCandidates = ref<PrCandidate[]>([]);
 const showPrCreator = ref(false);
+const isUnlisted = computed(() => pickedProductId.value === UNLISTED);
+const pickedProduct = computed(() => (typeof pickedProductId.value === 'number' ? props.products.find((x) => x.id === pickedProductId.value) ?? null : null));
+const pickedUnit = computed(() => (pickedProduct.value?.unit ?? '').trim());
+// A catalog product without a unit is not given one: staff must add it in Inventory first.
+const missingUnitMessage = computed(() =>
+    pickedProduct.value && !pickedUnit.value ? `${pickedProduct.value.name} has no unit of measure in the Product Catalog. Add its unit in Inventory first.` : '',
+);
+// Switching between a catalog product and "Product Not Listed" clears the fields that no longer apply.
+watch(isUnlisted, () => {
+    pickedDescription.value = '';
+    pickedUnitChoice.value = '';
+    pickerErrors.value = { ...pickerErrors.value, description: undefined, unit: undefined };
+});
 const openNewRequest = () => {
-    pickedProductId.value = props.products[0]?.id ?? null;
+    // Nothing is preselected: staff choose the product themselves.
+    pickedProductId.value = null;
+    pickedDescription.value = '';
+    pickedQuantity.value = null;
+    pickedUnitChoice.value = '';
+    pickerErrors.value = {};
     showProductPicker.value = true;
 };
+// Positive whole numbers only: no zero, negatives, decimals or empty values.
+const wholeQuantity = (v: number | string | null): number | null => {
+    const text = String(v ?? '').trim();
+    return /^\d+$/.test(text) && Number(text) >= 1 ? Number(text) : null;
+};
+const validateNewRequest = () => {
+    const errors: typeof pickerErrors.value = {};
+    if (isUnlisted.value) {
+        if (!pickedDescription.value.trim()) errors.description = 'Describe the product you need to purchase.';
+        if (!pickedUnitChoice.value) errors.unit = 'Select the unit.';
+    } else if (!pickedProduct.value) {
+        errors.product = 'Select a product.';
+    } else if (missingUnitMessage.value) {
+        errors.product = missingUnitMessage.value;
+    }
+    if (wholeQuantity(pickedQuantity.value) === null) errors.quantity = 'Enter a whole number of at least 1.';
+    pickerErrors.value = errors;
+    return Object.keys(errors).length === 0;
+};
 const continueNewRequest = () => {
-    const p = props.products.find((x) => x.id === pickedProductId.value);
-    if (!p) return;
-    prCandidates.value = [{ product_id: p.id, name: p.name, sku: p.sku, current_stock: p.stock, forecast: null, ahp_score: null, classification: null, recommended_quantity: null }];
+    if (!validateNewRequest()) return;
+    const common = { forecast: null, ahp_score: null, classification: null, recommended_quantity: null, requested_quantity: wholeQuantity(pickedQuantity.value) };
+    if (isUnlisted.value) {
+        const description = pickedDescription.value.trim();
+        prCandidates.value = [{ ...common, product_id: null, name: description, sku: '', current_stock: null, unit: pickedUnitChoice.value, description }];
+    } else {
+        const p = pickedProduct.value!;
+        // The unit is shown only; the server saves the product's own unit.
+        prCandidates.value = [{ ...common, product_id: p.id, name: p.name, sku: p.sku, current_stock: p.stock, unit: pickedUnit.value }];
+    }
     showProductPicker.value = false;
     showPrCreator.value = true;
 };
+// Floating labels (same look as the other forms): up when focused or filled.
+const floatField = 'peer block w-full rounded-xl border bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm';
+const floatLabel = 'pointer-events-none absolute top-3.5 left-3.5 origin-[0] transform text-xs font-semibold duration-200 sm:text-sm';
+const floatUp = '-translate-y-2.5 scale-75 text-[#4b5320]';
 
 // Review (admin) and conversion to a purchase order.
 const reviewing = ref<PurchaseRequestItem | null>(null);
@@ -547,11 +448,11 @@ const submitDraftRequest = (req: PurchaseRequestItem) => {
     router.post(`/${teamSlug.value}/procurement/requests/${req.id}/submit`, {}, { preserveScroll: true });
 };
 
-// Purchase order workspace (deliveries, inspection, invoices, posting).
+// Purchase order workspace (deliveries, inspection, stock posting).
 const workspacePoId = ref<number | null>(null);
 const closeWorkspace = () => {
     workspacePoId.value = null;
-    router.reload({ only: ['purchaseOrders', 'commercialInvoices', 'requests', 'metrics'] });
+    router.reload({ only: ['purchaseOrders', 'requests', 'metrics'] });
 };
 
 const prStatusClass = (st: string) => ({
@@ -601,21 +502,29 @@ const handleConfirmedAction = () => {
     confirmOptions.value.action();
 };
 
-const deleteConfirmInput = ref('');
+const deletingRequest = ref(false);
 
 const openDeleteModal = (req: PurchaseRequestItem) => {
-    deleteConfirmInput.value = '';
     selectedRequest.value = req;
     showDeleteModal.value = true;
 };
 
+// Admin only (the server enforces it too). The redirect reloads the request list and tab counts;
+// the success or error message arrives as a flash toast.
 const confirmDelete = () => {
-    if (!selectedRequest.value) return;
+    if (!selectedRequest.value || deletingRequest.value) return;
+    deletingRequest.value = true;
     router.delete(`/${teamSlug.value}/procurement/${selectedRequest.value.id}`, {
         preserveScroll: true,
         onSuccess: () => {
             showDeleteModal.value = false;
             selectedRequest.value = null;
+        },
+        onError: () => {
+            showToast('The purchase request could not be deleted.', 'error');
+        },
+        onFinish: () => {
+            deletingRequest.value = false;
         },
     });
 };
@@ -626,27 +535,15 @@ const confirmDelete = () => {
 
     <div class="workspace-page">
         <!-- Page Header -->
-        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-4">
+        <div class="page-header">
             <div>
                 <h1 class="page-title">Procurement & Sourcing</h1>
-                <p class="page-subtitle">Commercial invoices, purchase orders and restock requests.</p>
+                <p class="page-subtitle">Purchase orders and purchase requests.</p>
             </div>
 
             <!-- Contextual Actions -->
-            <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
-                <template v-if="activeTab === 'commercial_invoices'">
-                    <SpecularButton
-                        variant="secondary"
-                        size="md"
-                        :radius="12"
-                        @click="openCiImportModal"
-                    >
-                        <UploadCloud class="w-4 h-4 text-gray-500" />
-                        <span>Import CSV</span>
-                    </SpecularButton>
-                </template>
-
-                <template v-else-if="activeTab === 'purchase_orders'">
+            <div class="page-actions">
+                <template v-if="activeTab === 'purchase_orders'">
                     <SpecularButton
                         variant="secondary"
                         size="md"
@@ -654,7 +551,7 @@ const confirmDelete = () => {
                         @click="openPoImportModal"
                     >
                         <UploadCloud class="w-4 h-4 text-gray-500" />
-                        <span>Import CSV</span>
+                        <span>Import Purchase Order</span>
                     </SpecularButton>
                 </template>
 
@@ -673,27 +570,7 @@ const confirmDelete = () => {
         </div>
 
         <!-- Tab Switcher -->
-        <div class="flex items-center gap-2 border-b border-gray-200 pb-3 mb-6 overflow-x-auto">
-            <button
-                type="button"
-                @click="switchTab('commercial_invoices')"
-                :class="[
-                    'flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer whitespace-nowrap',
-                    activeTab === 'commercial_invoices'
-                        ? 'bg-gray-100 text-gray-900'
-                        : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
-                ]"
-            >
-                <Receipt class="w-4 h-4" />
-                <span>Commercial Invoices</span>
-                <span 
-                    v-if="metrics.totalCommercialInvoices !== undefined" 
-                    class="ml-1 px-2 py-0.5 text-xs rounded-full bg-black/10 text-gray-900 font-semibold"
-                >
-                    {{ metrics.totalCommercialInvoices }}
-                </span>
-            </button>
-
+        <div class="flex items-center gap-2 border-b border-gray-200 pb-3 overflow-x-auto">
             <button
                 type="button"
                 @click="switchTab('purchase_orders')"
@@ -733,29 +610,9 @@ const confirmDelete = () => {
         </div>
 
         <!-- Metrics Cards Section -->
-        <div v-if="activeTab === 'commercial_invoices'" class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
-            <div class="bg-white border border-gray-200 rounded-xl p-5">
-                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-2">
-                    <span>Total Invoices</span>
-                    <Receipt class="w-4 h-4 text-emerald-500" />
-                </div>
-                <div class="text-2xl font-semibold text-gray-900">{{ metrics.totalCommercialInvoices || 0 }}</div>
-                <div class="text-xs text-gray-500 mt-1">Logged vendor invoices</div>
-            </div>
-
-            <div class="bg-white border border-gray-200 rounded-xl p-5">
-                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-2">
-                    <span>Total Cost Value</span>
-                    <Package class="w-4 h-4 text-[#F8B803]" />
-                </div>
-                <div class="text-2xl font-semibold text-[#B45309]">{{ formatCurrency(metrics.totalCommercialInvoiceAmount || 0) }}</div>
-                <div class="text-xs text-gray-500 mt-1">Total invoiced goods value</div>
-            </div>
-        </div>
-
-        <div v-else-if="activeTab === 'purchase_orders'" class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
-            <div class="bg-white border border-gray-200 rounded-xl p-5">
-                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-2">
+        <div v-if="activeTab === 'purchase_orders'" class="grid grid-cols-2 gap-3">
+            <div class="bg-white border border-gray-200 rounded-xl px-4 py-3">
+                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-1">
                     <span>Total Purchase Orders</span>
                     <ShoppingCart class="w-4 h-4 text-blue-500" />
                 </div>
@@ -763,8 +620,8 @@ const confirmDelete = () => {
                 <div class="text-xs text-gray-500 mt-1">Issued vendor POs</div>
             </div>
 
-            <div class="bg-white border border-gray-200 rounded-xl p-5">
-                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-2">
+            <div class="bg-white border border-gray-200 rounded-xl px-4 py-3">
+                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-1">
                     <span>Total PO Amount</span>
                     <Receipt class="w-4 h-4 text-[#F8B803]" />
                 </div>
@@ -773,9 +630,9 @@ const confirmDelete = () => {
             </div>
         </div>
 
-        <div v-else class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-            <div class="bg-white border border-gray-200 rounded-xl p-5">
-                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-2">
+        <div v-else class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div class="bg-white border border-gray-200 rounded-xl px-4 py-3">
+                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-1">
                     <span>Total Requests</span>
                     <Package class="w-4 h-4 text-gray-400" />
                 </div>
@@ -783,8 +640,8 @@ const confirmDelete = () => {
                 <div class="text-xs text-gray-500 mt-1">All lifecycle stages</div>
             </div>
 
-            <div class="bg-white border border-gray-200 rounded-xl p-5">
-                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-2">
+            <div class="bg-white border border-gray-200 rounded-xl px-4 py-3">
+                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-1">
                     <span>Pending approval</span>
                     <Clock class="w-4 h-4 text-blue-500" />
                 </div>
@@ -792,8 +649,8 @@ const confirmDelete = () => {
                 <div class="text-xs text-gray-500 mt-1">Waiting for an administrator</div>
             </div>
 
-            <div class="bg-white border border-gray-200 rounded-xl p-5">
-                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-2">
+            <div class="bg-white border border-gray-200 rounded-xl px-4 py-3">
+                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-1">
                     <span>Approved</span>
                     <Truck class="w-4 h-4 text-[#F8B803]" />
                 </div>
@@ -801,8 +658,8 @@ const confirmDelete = () => {
                 <div class="text-xs text-gray-500 mt-1">Ready for a purchase order</div>
             </div>
 
-            <div class="bg-white border border-gray-200 rounded-xl p-5">
-                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-2">
+            <div class="bg-white border border-gray-200 rounded-xl px-4 py-3">
+                <div class="flex items-center justify-between text-gray-500 text-xs font-semibold mb-1">
                     <span>Converted</span>
                     <CheckCircle2 class="w-4 h-4 text-emerald-500" />
                 </div>
@@ -812,7 +669,7 @@ const confirmDelete = () => {
         </div>
 
         <!-- Search & Filters Bar (Beside search bar) -->
-        <div class="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3 mb-6 bg-white p-3 rounded-xl border border-gray-200">
+        <div class="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3 bg-white p-4 rounded-xl border border-gray-200">
             <!-- Search Bar -->
             <div class="relative flex-1 max-w-md">
                 <Search class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
@@ -821,13 +678,11 @@ const confirmDelete = () => {
                     @input="applyFilter"
                     type="text"
                     :placeholder="
-                        activeTab === 'commercial_invoices' 
-                            ? 'Search by invoice #, description or supplier...'
-                            : activeTab === 'purchase_orders'
+                        activeTab === 'purchase_orders'
                             ? 'Search by PO #, SKU, description or supplier...'
                             : 'Search by request #, product or supplier...'
                     "
-                    class="w-full pl-10 pr-4 py-2 bg-gray-50/80 hover:bg-white focus:bg-white border border-gray-200 rounded-xl text-sm text-gray-900 focus:outline-none focus:border-[#F8B803] transition-colors"
+                    class="field-control w-full pl-10 pr-4"
                 />
             </div>
 
@@ -838,7 +693,7 @@ const confirmDelete = () => {
                     <select
                         v-model="selectedStatus"
                         @change="applyFilter"
-                        class="w-full bg-gray-50/80 hover:bg-white border border-gray-200 rounded-xl px-3.5 py-2 text-xs font-semibold text-gray-700 focus:outline-none focus:border-[#F8B803] focus:bg-white cursor-pointer transition-colors"
+                        class="field-control w-full cursor-pointer"
                     >
                         <option value="All">All Statuses</option>
                         <option v-for="st in (statusOptions as any)[activeTab] ?? []" :key="st" :value="st">{{ st }}</option>
@@ -850,7 +705,7 @@ const confirmDelete = () => {
                     <select
                         v-model="selectedSupplier"
                         @change="applyFilter"
-                        class="w-full bg-gray-50/80 hover:bg-white border border-gray-200 rounded-xl px-3.5 py-2 text-xs font-semibold text-gray-700 focus:outline-none focus:border-[#F8B803] focus:bg-white cursor-pointer transition-colors"
+                        class="field-control w-full cursor-pointer"
                     >
                         <option value="All">All Suppliers</option>
                         <option v-for="s in suppliers" :key="s.id" :value="String(s.id)">{{ s.name }}</option>
@@ -862,7 +717,7 @@ const confirmDelete = () => {
                     <select
                         v-model="selectedUm"
                         @change="applyFilter"
-                        class="w-full bg-gray-50/80 hover:bg-white border border-gray-200 rounded-xl px-3.5 py-2 text-xs font-semibold text-gray-700 focus:outline-none focus:border-[#F8B803] focus:bg-white cursor-pointer transition-colors"
+                        class="field-control w-full cursor-pointer"
                     >
                         <option value="All">All U/M</option>
                         <option value="PCS">PCS</option>
@@ -889,116 +744,28 @@ const confirmDelete = () => {
         </div>
 
         <!-- ======================================================== -->
-        <!-- TAB 1: COMMERCIAL INVOICES TABLE -->
-        <!-- ======================================================== -->
-        <div v-if="activeTab === 'commercial_invoices'" class="rounded-xl border border-gray-200 bg-white overflow-hidden flex flex-col">
-            <div class="overflow-x-auto">
-                <table class="w-full text-left text-sm text-gray-600">
-                    <thead class="bg-gray-50 text-xs text-gray-500 border-b border-gray-200">
-                        <tr>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">DATE</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">COMMERCIAL INVOICE</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 text-center tracking-wider">QUANTITY</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">Description</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 text-right tracking-wider">UNIT COST</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 text-right tracking-wider">TOTAL AMOUNT</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">PO / Delivery</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">Verification</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 text-right tracking-wider">ACTIONS</th>
-                        </tr>
-                    </thead>
-                    <tbody class="divide-y divide-gray-100">
-                        <tr v-if="!commercialInvoices?.data?.length">
-                            <td colspan="9" class="px-6 py-10 text-center text-gray-500">
-                                <div class="max-w-md mx-auto space-y-2">
-                                    <Receipt class="w-8 h-8 mx-auto text-gray-300" />
-                                    <p class="font-medium text-gray-700">No commercial invoices found</p>
-                                    <p class="text-xs text-gray-400">Record a supplier invoice from its purchase order (Purchase Orders → Open) after the delivery is inspected.</p>
-                                </div>
-                            </td>
-                        </tr>
-                        <tr v-for="ci in commercialInvoices?.data" :key="ci.id" class="hover:bg-gray-50/80 transition-colors">
-                            <td class="px-6 py-4 text-gray-700 font-medium whitespace-nowrap">{{ formatDate(ci.invoice_date) }}</td>
-                            <td class="px-6 py-4 font-mono font-semibold text-[#b45309] whitespace-nowrap">{{ ci.invoice_number }}</td>
-                            <td class="px-6 py-4 text-center font-semibold text-gray-900">{{ ci.quantity }}</td>
-                            <td class="px-6 py-4 text-gray-900 font-medium max-w-md truncate">{{ ci.description }}</td>
-                            <td class="px-6 py-4 text-right font-medium text-gray-800 whitespace-nowrap">{{ formatCurrency(ci.unit_cost) }}</td>
-                            <td class="px-6 py-4 text-right font-semibold text-gray-900 whitespace-nowrap">{{ formatCurrency(ci.total_cost) }}</td>
-                            <td class="px-6 py-4 font-mono text-xs whitespace-nowrap">
-                                <template v-if="ci.purchase_order">{{ ci.purchase_order.po_number }} / {{ ci.delivery?.delivery_number ?? '—' }}</template>
-                                <span v-else class="font-sans text-amber-700">Not linked</span>
-                            </td>
-                            <td class="px-6 py-4 whitespace-nowrap">
-                                <span :class="prStatusClass(ci.status)" class="rounded-full border px-2.5 py-0.5 text-xs font-medium">{{ ci.status }}</span>
-                                <div v-if="ci.status !== 'Verified' && ci.discrepancies?.length" class="mt-1 text-xs text-rose-700">{{ ci.discrepancies.length }} discrepancy flag(s)</div>
-                            </td>
-                            <td class="px-6 py-4 text-right whitespace-nowrap">
-                                <button v-if="ci.purchase_order_id" type="button" class="mr-1 inline-flex items-center px-2.5 py-1 text-xs font-medium border border-gray-200 rounded-lg hover:bg-gray-50" @click="workspacePoId = ci.purchase_order_id">
-                                    {{ ['Pending Verification', 'Flagged'].includes(ci.status) ? 'Review & verify' : 'Open PO' }}
-                                </button>
-                                <button
-                                    v-if="canDelete"
-                                    type="button"
-                                    @click="openDeleteCiModal(ci)"
-                                    class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-red-600 hover:text-red-700 hover:bg-red-50 border border-red-200 rounded-lg transition-colors cursor-pointer"
-                                    title="Delete invoice"
-                                >
-                                    <Trash2 class="w-3.5 h-3.5" />
-                                    <span>Delete</span>
-                                </button>
-                            </td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- Commercial Invoices Pagination -->
-            <div v-if="commercialInvoices && commercialInvoices.total > commercialInvoices.data.length" class="p-4 flex items-center justify-between border-t border-gray-100">
-                <span class="text-xs text-gray-500">
-                    Showing {{ commercialInvoices.data.length }} of {{ commercialInvoices.total }} commercial invoices
-                </span>
-                <div class="flex gap-1">
-                    <button
-                        v-for="(link, i) in commercialInvoices.links"
-                        :key="i"
-                        :disabled="!link.url || link.active"
-                        @click="link.url && router.visit(link.url, { preserveScroll: true })"
-                        v-html="link.label"
-                        :class="[
-                            'px-3 py-1 text-xs rounded-lg border transition-colors',
-                            link.active ? 'bg-[#F8B803] text-gray-900 border-[#F8B803] font-semibold' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50',
-                            !link.url ? 'opacity-50 cursor-not-allowed' : ''
-                        ]"
-                    />
-                </div>
-            </div>
-        </div>
-
-        <!-- ======================================================== -->
         <!-- TAB 2: PURCHASE ORDERS TABLE -->
         <!-- ======================================================== -->
-        <div v-else-if="activeTab === 'purchase_orders'" class="rounded-xl border border-gray-200 bg-white overflow-hidden flex flex-col">
+        <div v-if="activeTab === 'purchase_orders'" class="rounded-xl border border-gray-200 bg-white overflow-hidden flex flex-col">
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-sm text-gray-600">
                     <thead class="bg-gray-50 text-xs text-gray-500 border-b border-gray-200">
                         <tr>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">Date</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">Purchase Order No.</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 text-center tracking-wider">Quantity</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">ITEM/SKU Number</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">Description</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 text-center tracking-wider">U/M</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 text-right tracking-wider">Unit Cost</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 text-right tracking-wider">Total Amount</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">Promised Delivery</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">Request</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 tracking-wider">Status</th>
-                            <th class="px-6 py-4 font-semibold text-gray-900 text-right tracking-wider">Actions</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 tracking-wider">ORDER DATE</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 tracking-wider">PURCHASE ORDER NO.</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 text-center tracking-wider">QTY ORDERED</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 tracking-wider">SUPPLIER</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 tracking-wider">ITEM/SKU Number</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 tracking-wider">Description</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 text-right tracking-wider">UNIT COST</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 text-center tracking-wider">U/M</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 text-right tracking-wider">EXTENDED COST</th>
+                            <th class="px-4 py-3 font-semibold text-gray-900 text-right tracking-wider">Actions</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-gray-100">
                         <tr v-if="!purchaseOrders?.data?.length">
-                            <td colspan="12" class="px-6 py-10 text-center text-gray-500">
+                            <td colspan="10" class="px-4 py-10 text-center text-gray-500">
                                 <div class="max-w-md mx-auto space-y-2">
                                     <ShoppingCart class="w-8 h-8 mx-auto text-gray-300" />
                                     <p class="font-medium text-gray-700">No purchase orders found</p>
@@ -1007,24 +774,17 @@ const confirmDelete = () => {
                             </td>
                         </tr>
                         <tr v-for="po in purchaseOrders?.data" :key="po.id" class="hover:bg-gray-50/80 transition-colors">
-                            <td class="px-6 py-4 text-gray-700 font-medium whitespace-nowrap">{{ formatDate(po.po_date) }}</td>
-                            <td class="px-6 py-4 font-mono font-semibold text-blue-700 whitespace-nowrap">{{ po.po_number }}</td>
-                            <td class="px-6 py-4 text-center font-semibold text-gray-900">{{ po.quantity }}</td>
-                            <td class="px-6 py-4 font-mono text-xs font-semibold text-gray-800 whitespace-nowrap">{{ po.item_sku || '—' }}</td>
-                            <td class="px-6 py-4 text-gray-900 font-medium max-w-sm truncate">{{ po.description }}</td>
-                            <td class="px-6 py-4 text-center text-xs font-semibold text-gray-700">{{ po.unit_of_measure || 'PCS' }}</td>
-                            <td class="px-6 py-4 text-right font-medium text-gray-800 whitespace-nowrap">{{ formatCurrency(po.unit_cost) }}</td>
-                            <td class="px-6 py-4 text-right font-semibold text-gray-900 whitespace-nowrap">{{ formatCurrency(po.total_cost) }}</td>
-                            <td class="px-6 py-4 text-xs whitespace-nowrap">
-                                <span v-if="po.promised_delivery_date">{{ formatDate(po.promised_delivery_date) }}</span>
-                                <span v-else class="text-amber-700">Not set</span>
-                                <div v-if="!po.product_id" class="text-amber-700">No product linked</div>
-                            </td>
-                            <td class="px-6 py-4 font-mono text-xs whitespace-nowrap">{{ po.purchase_request?.request_number ?? '—' }}</td>
-                            <td class="px-6 py-4 whitespace-nowrap"><span :class="prStatusClass(po.status)" class="rounded-full border px-2.5 py-0.5 text-xs font-medium">{{ po.status }}</span></td>
-                            <td class="px-6 py-4 text-right whitespace-nowrap">
+                            <td class="px-4 py-3 text-gray-700 font-medium whitespace-nowrap">{{ formatDate(po.po_date) }}</td>
+                            <td class="px-4 py-3 font-mono font-semibold text-blue-700 whitespace-nowrap">{{ po.po_number }}</td>
+                            <td class="px-4 py-3 text-center font-semibold text-gray-900">{{ po.quantity }}</td>
+                            <td class="px-4 py-3 text-gray-600 whitespace-nowrap">{{ po.supplier?.name || '—' }}</td>
+                            <td class="px-4 py-3 font-mono text-xs font-semibold text-gray-800 whitespace-nowrap">{{ po.item_sku || '—' }}</td>
+                            <td class="px-4 py-3 text-gray-900 font-medium max-w-sm truncate">{{ po.description }}</td>
+                            <td class="px-4 py-3 text-right font-medium text-gray-800 whitespace-nowrap">{{ formatCurrency(po.unit_cost) }}</td>
+                            <td class="px-4 py-3 text-center text-xs font-semibold text-gray-700">{{ po.unit_of_measure || 'PCS' }}</td>
+                            <td class="px-4 py-3 text-right font-semibold text-gray-900 whitespace-nowrap">{{ formatCurrency(po.total_cost) }}</td>
+                            <td class="px-4 py-3 text-right whitespace-nowrap">
                                 <button type="button" class="mr-1 inline-flex items-center px-2.5 py-1 text-xs font-medium border border-[#4b5320] text-[#4b5320] rounded-lg hover:bg-gray-50" @click="workspacePoId = po.id">Open</button>
-                                <button type="button" class="mr-1 inline-flex items-center px-2.5 py-1 text-xs font-medium border border-gray-200 rounded-lg hover:bg-gray-50" @click="openSchedule(po)">Product &amp; date</button>
                                 <button
                                     v-if="canDelete"
                                     type="button"
@@ -1071,46 +831,51 @@ const confirmDelete = () => {
                 <table class="w-full text-left text-sm text-gray-600">
                     <thead class="bg-gray-50 text-xs text-gray-500 border-b border-gray-200">
                         <tr>
-                            <th class="px-6 py-4 font-medium">Request ID</th>
-                            <th class="px-6 py-4 font-medium">Item Name</th>
-                            <th class="px-6 py-4 font-medium">Supplier</th>
-                            <th class="px-6 py-4 font-medium text-center">Requested / Recommended</th>
-                            <th class="px-6 py-4 font-medium">Stock · Forecast · AHP</th>
-                            <th class="px-6 py-4 font-medium">Submitted</th>
-                            <th class="px-6 py-4 font-medium text-center">Status</th>
-                            <th class="px-6 py-4 font-medium text-right">Actions</th>
+                            <th class="px-4 py-3 font-medium">Request ID</th>
+                            <th class="px-4 py-3 font-medium">Item Name</th>
+                            <th class="px-4 py-3 font-medium">Supplier</th>
+                            <th class="px-4 py-3 font-medium text-center">Requested / Recommended</th>
+                            <th class="px-4 py-3 font-medium">Stock · Forecast · AHP</th>
+                            <th class="px-4 py-3 font-medium">Submitted</th>
+                            <th class="px-4 py-3 font-medium text-center">Status</th>
+                            <th class="px-4 py-3 font-medium text-right">Actions</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-gray-100">
                         <tr v-if="!requests.data.length">
-                            <td colspan="8" class="px-6 py-8 text-center text-gray-500">
-                                No purchase requests found. Create them from Inventory → AHP Product Prioritization, or with "New Purchase Request".
+                            <td colspan="8" class="px-4 py-8 text-center text-gray-500">
+                                No purchase requests found. Create them from Reports &amp; Analytics → AHP Product Prioritization, or with "New Purchase Request".
                             </td>
                         </tr>
                         <tr v-for="req in requests.data" :key="req.id" class="hover:bg-gray-50 transition-colors align-top">
-                            <td class="px-6 py-4 font-mono font-semibold text-[#b45309]">{{ req.request_number }}</td>
-                            <td class="px-6 py-4">
-                                <div class="font-semibold text-gray-900">{{ req.product?.name || '—' }}</div>
+                            <td class="px-4 py-3 font-mono font-semibold text-[#b45309]">{{ req.request_number }}</td>
+                            <td class="px-4 py-3">
+                                <div v-if="req.product" class="font-semibold text-gray-900">{{ req.product.name }}</div>
+                                <template v-else-if="req.product_description">
+                                    <span class="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">Product not listed</span>
+                                    <div class="mt-1 max-w-xs font-semibold text-gray-900">{{ req.product_description }}</div>
+                                </template>
+                                <div v-else class="font-semibold text-gray-900">—</div>
                                 <div v-if="req.justification" class="max-w-xs text-xs text-gray-500">{{ req.justification }}</div>
                                 <div class="text-xs text-gray-400">by {{ req.requested_by?.name ?? '—' }}</div>
                             </td>
-                            <td class="px-6 py-4 text-gray-600">{{ req.supplier?.name || '—' }}</td>
-                            <td class="px-6 py-4 text-center font-mono">
-                                <span class="font-semibold text-gray-900">{{ req.quantity }}</span> / {{ req.recommended_quantity ?? '—' }}
+                            <td class="px-4 py-3 text-gray-600">{{ req.supplier?.name || '—' }}</td>
+                            <td class="px-4 py-3 text-center font-mono">
+                                <span class="font-semibold text-gray-900">{{ req.quantity }}</span><span v-if="req.unit" class="font-sans text-xs text-gray-500"> {{ req.unit }}</span> / {{ req.recommended_quantity ?? '—' }}
                                 <div class="text-xs text-gray-400">{{ formatCurrency(Number(req.estimated_cost)) }}</div>
                             </td>
-                            <td class="px-6 py-4 font-mono text-xs text-gray-600">
+                            <td class="px-4 py-3 font-mono text-xs text-gray-600">
                                 {{ req.current_stock ?? '—' }} · {{ req.forecast_quantity ?? 'n/a' }} · {{ req.ahp_score != null ? Number(req.ahp_score).toFixed(2) : 'incomplete' }}
                                 <div class="font-sans text-gray-400">{{ req.ahp_classification ?? '' }}</div>
                             </td>
-                            <td class="px-6 py-4 text-gray-500 text-xs">{{ req.submitted_at ? formatDate(req.submitted_at) : 'Draft' }}</td>
-                            <td class="px-6 py-4 text-center">
+                            <td class="px-4 py-3 text-gray-500 text-xs">{{ req.submitted_at ? formatDate(req.submitted_at) : 'Draft' }}</td>
+                            <td class="px-4 py-3 text-center">
                                 <span :class="prStatusClass(req.status)" class="rounded-full border px-2.5 py-0.5 text-xs font-medium">{{ req.status }}</span>
                                 <div v-if="req.reviewed_by" class="mt-1 text-xs text-gray-500">{{ req.reviewed_by.name }} · {{ formatDate(req.reviewed_at ?? '') }}</div>
                                 <div v-if="req.review_remarks" class="max-w-[12rem] text-xs text-gray-500">{{ req.review_remarks }}</div>
                                 <div v-if="req.purchase_order" class="mt-1 font-mono text-xs text-blue-700">PO {{ req.purchase_order.po_number }}</div>
                             </td>
-                            <td class="px-6 py-4">
+                            <td class="px-4 py-3">
                                 <div class="flex items-center justify-end gap-2">
                                     <button v-if="req.status === 'Draft'" type="button" class="inline-flex items-center px-2.5 py-1 text-xs font-medium border border-gray-200 rounded-lg hover:bg-gray-50" @click="submitDraftRequest(req)">Submit</button>
                                     <button v-if="isAdmin && req.status === 'Pending Approval'" type="button" class="inline-flex items-center px-2.5 py-1 text-xs font-medium border border-[#4b5320] text-[#4b5320] rounded-lg hover:bg-gray-50" @click="openReview(req)">Review</button>
@@ -1156,165 +921,43 @@ const confirmDelete = () => {
     </div>
 
     <!-- ======================================================== -->
-    <!-- MODAL: IMPORT COMMERCIAL INVOICES CSV -->
-    <!-- ======================================================== -->
-    <div v-if="showCiImportModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-        <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-2xl shadow-xl max-h-[90vh] overflow-y-auto">
-            <div class="flex justify-between items-center mb-4 border-b border-gray-100 pb-3">
-                <div>
-                    <h3 class="text-xl font-semibold text-gray-900">Import Commercial Invoices CSV</h3>
-                    <p class="text-xs text-gray-500">Headers: <code class="bg-gray-100 px-1 py-0.5 rounded font-semibold text-gray-800">DATE, COMMERCIAL INVOICE, QUANTITY, Description, UNIT COST</code></p>
-                </div>
-                <button @click="showCiImportModal = false" class="text-gray-400 hover:text-gray-600 text-xl cursor-pointer">&times;</button>
-            </div>
-
-            <!-- Upload Area & Sample Template -->
-            <div class="flex flex-col sm:flex-row gap-4 items-center justify-between p-4 bg-amber-50/60 border border-amber-100 rounded-xl mb-4">
-                <div>
-                    <h4 class="text-sm font-semibold text-gray-900">Need the template?</h4>
-                    <p class="text-xs text-gray-600">Sample CI format: <code class="font-mono text-amber-800 font-semibold">CI-035-0722</code></p>
-                </div>
-                <button
-                    type="button"
-                    @click="downloadSampleCiCsv"
-                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-white border border-amber-200 text-amber-900 hover:bg-amber-50 cursor-pointer whitespace-nowrap"
-                >
-                    <Download class="w-3.5 h-3.5" />
-                    Download Sample CSV
-                </button>
-            </div>
-
-            <!-- File Input -->
-            <div class="mb-4">
-                <label class="block text-xs font-semibold text-gray-700 mb-2">Select CSV File (.csv, .txt)</label>
-                <input
-                    type="file"
-                    accept=".csv,.txt"
-                    @change="handleCiFileChange"
-                    class="w-full text-xs text-gray-600 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-[#F8B803] file:text-gray-900 hover:file:opacity-90 cursor-pointer border border-gray-200 rounded-xl p-2"
-                />
-            </div>
-
-            <!-- Loading State -->
-            <div v-if="isValidatingCiCsv" class="py-6 text-center text-gray-500 text-xs">
-                <Clock class="w-5 h-5 mx-auto animate-spin mb-1 text-[#F8B803]" />
-                Validating CSV rows...
-            </div>
-
-            <!-- Error Message -->
-            <div v-if="ciCsvError" class="p-3 mb-4 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 flex items-start gap-2">
-                <AlertCircle class="w-4 h-4 shrink-0 text-red-500 mt-0.5" />
-                <span>{{ ciCsvError }}</span>
-            </div>
-
-            <!-- Preview Results -->
-            <div v-if="ciCsvValidationResult" class="space-y-4">
-                <div class="flex gap-4 p-3 bg-gray-50 rounded-xl border border-gray-100 text-xs">
-                    <div>
-                        <span class="text-gray-500">Total Rows:</span>
-                        <span class="ml-1 font-semibold text-gray-900">{{ ciCsvValidationResult.summary.total_rows }}</span>
-                    </div>
-                    <div>
-                        <span class="text-gray-500">Valid:</span>
-                        <span class="ml-1 font-semibold text-emerald-600">{{ ciCsvValidationResult.summary.valid_count }}</span>
-                    </div>
-                    <div>
-                        <span class="text-gray-500">Invalid:</span>
-                        <span class="ml-1 font-semibold text-red-600">{{ ciCsvValidationResult.summary.invalid_count }}</span>
-                    </div>
-                </div>
-
-                <!-- Preview Table -->
-                <div v-if="ciCsvValidationResult.valid_rows?.length" class="max-h-60 overflow-y-auto border border-gray-200 rounded-xl">
-                    <table class="w-full text-left text-xs text-gray-600">
-                        <thead class="bg-gray-50 font-semibold text-gray-700 border-b border-gray-200 sticky top-0">
-                            <tr>
-                                <th class="p-2">DATE</th>
-                                <th class="p-2">COMMERCIAL INVOICE</th>
-                                <th class="p-2 text-center">QUANTITY</th>
-                                <th class="p-2">Description</th>
-                                <th class="p-2 text-right">UNIT COST</th>
-                                <th class="p-2 text-right">TOTAL</th>
-                            </tr>
-                        </thead>
-                        <tbody class="divide-y divide-gray-100">
-                            <tr v-for="r in ciCsvValidationResult.valid_rows.slice(0, 10)" :key="r.row_number">
-                                <td class="p-2 whitespace-nowrap">{{ r.display_date || r.date }}</td>
-                                <td class="p-2 font-mono font-semibold text-amber-700 whitespace-nowrap">{{ r.invoice_number }}</td>
-                                <td class="p-2 text-center font-semibold">{{ r.quantity }}</td>
-                                <td class="p-2 max-w-xs truncate">{{ r.description }}</td>
-                                <td class="p-2 text-right whitespace-nowrap">{{ formatCurrency(r.unit_cost) }}</td>
-                                <td class="p-2 text-right font-semibold whitespace-nowrap">{{ formatCurrency(r.total_cost) }}</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Modal Footer -->
-            <div class="flex justify-end gap-3 mt-6 pt-3 border-t border-gray-100">
-                <SpecularButton
-                    type="button"
-                    variant="secondary"
-                    size="md"
-                    :radius="10"
-                    @click="showCiImportModal = false"
-                >
-                    Cancel
-                </SpecularButton>
-                <SpecularButton
-                    type="button"
-                    variant="brand"
-                    size="md"
-                    :radius="10"
-                    :disabled="isImportingCiCsv || !ciCsvValidationResult || ciCsvValidationResult.summary?.valid_count === 0"
-                    @click="executeCiCsvImport"
-                >
-                    {{ isImportingCiCsv ? 'Importing...' : `Import ${ciCsvValidationResult?.summary?.valid_count || ''} Invoices` }}
-                </SpecularButton>
-            </div>
-        </div>
-    </div>
-
-    <!-- ======================================================== -->
     <!-- MODAL: IMPORT PURCHASE ORDERS CSV -->
     <!-- ======================================================== -->
     <div v-if="showPoImportModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-        <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-2xl shadow-xl max-h-[90vh] overflow-y-auto">
+        <div class="bg-white border border-gray-200 p-6 rounded-xl w-full shadow-xl max-h-[90vh] overflow-y-auto" :class="poDocumentFile ? 'max-w-5xl' : 'max-w-2xl'">
             <div class="flex justify-between items-center mb-4 border-b border-gray-100 pb-3">
                 <div>
-                    <h3 class="text-xl font-semibold text-gray-900">Import Purchase Orders CSV</h3>
-                    <p class="text-xs text-gray-500">Headers: <code class="bg-gray-100 px-1 py-0.5 rounded font-semibold text-gray-800">Date, Purchase Order No., Quantity, ITEM/SKU Number, Description, U/M, Unit Cost</code></p>
+                    <h3 class="text-xl font-semibold text-gray-900">Import Purchase Orders</h3>
+                    <p class="text-xs text-gray-500">
+                        A purchase order document (PDF, PNG, JPG) is read automatically and shown for checking, or a CSV with
+                        <code class="bg-gray-100 px-1 py-0.5 rounded font-semibold text-gray-800">ORDER DATE, PURCHASE ORDER NO., QTY ORDERED, SUPPLIER, ITEM/SKU Number, Description, UNIT COST, U/M, EXTENDED COST</code>
+                    </p>
                 </div>
                 <button @click="showPoImportModal = false" class="text-gray-400 hover:text-gray-600 text-xl cursor-pointer">&times;</button>
             </div>
 
-            <!-- Upload Area & Sample Template -->
-            <div class="flex flex-col sm:flex-row gap-4 items-center justify-between p-4 bg-blue-50/60 border border-blue-100 rounded-xl mb-4">
-                <div>
-                    <h4 class="text-sm font-semibold text-gray-900">Need the template?</h4>
-                    <p class="text-xs text-gray-600">Sample PO No: <code class="font-mono text-blue-800 font-semibold">4000005472</code></p>
-                </div>
-                <button
-                    type="button"
-                    @click="downloadSamplePoCsv"
-                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-white border border-blue-200 text-blue-900 hover:bg-blue-50 cursor-pointer whitespace-nowrap"
-                >
-                    <Download class="w-3.5 h-3.5" />
-                    Download Sample CSV
-                </button>
-            </div>
-
             <!-- File Input -->
             <div class="mb-4">
-                <label class="block text-xs font-semibold text-gray-700 mb-2">Select CSV File (.csv, .txt)</label>
+                <label for="po_import_file" class="block text-xs font-semibold text-gray-700 mb-2">Select a purchase order document (PDF, PNG, JPG, up to 25 MB) or a CSV file</label>
                 <input
+                    id="po_import_file"
                     type="file"
-                    accept=".csv,.txt"
+                    accept=".pdf,.png,.jpg,.jpeg,.csv,.txt"
+                    data-test="po-import-file"
                     @change="handlePoFileChange"
                     class="w-full text-xs text-gray-600 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-[#F8B803] file:text-gray-900 hover:file:opacity-90 cursor-pointer border border-gray-200 rounded-xl p-2"
                 />
             </div>
+
+            <!-- A purchase order document: read, checked and corrected, then saved (has its own buttons) -->
+            <PurchaseOrderDocumentImport
+                v-if="poDocumentFile"
+                :file="poDocumentFile"
+                :team-slug="teamSlug"
+                :suppliers="suppliers ?? []"
+                @saved="onPoDocumentSaved"
+                @cancel="showPoImportModal = false"
+            />
 
             <!-- Loading State -->
             <div v-if="isValidatingPoCsv" class="py-6 text-center text-gray-500 text-xs">
@@ -1352,7 +995,7 @@ const confirmDelete = () => {
                             <tr>
                                 <th class="p-2">Date</th>
                                 <th class="p-2">Purchase Order No.</th>
-                                <th class="p-2 text-center">Quantity</th>
+                                <th class="p-2 text-center">QTY ORDERED</th>
                                 <th class="p-2">ITEM/SKU</th>
                                 <th class="p-2">Description</th>
                                 <th class="p-2 text-center">U/M</th>
@@ -1377,7 +1020,7 @@ const confirmDelete = () => {
             </div>
 
             <!-- Modal Footer -->
-            <div class="flex justify-end gap-3 mt-6 pt-3 border-t border-gray-100">
+            <div v-if="!poDocumentFile" class="flex justify-end gap-3 mt-6 pt-3 border-t border-gray-100">
                 <SpecularButton
                     type="button"
                     variant="secondary"
@@ -1402,65 +1045,27 @@ const confirmDelete = () => {
     </div>
 
     <!-- ======================================================== -->
-    <!-- MODAL: DELETE COMMERCIAL INVOICE -->
-    <!-- ======================================================== -->
-    <div v-if="showDeleteCiModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-        <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl">
-            <h3 class="text-xl font-semibold text-gray-900 mb-2">Delete Commercial Invoice</h3>
-            <p class="text-gray-600 text-sm mb-4">
-                Are you sure you want to delete commercial invoice <span class="font-semibold text-gray-900">{{ selectedCi?.invoice_number }}</span>?
-            </p>
-            <div class="mt-4 mb-6">
-                <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> if you wish to delete:
-                </label>
-                <input
-                    v-model="deleteCiConfirmInput"
-                    type="text"
-                    placeholder="Type YES here"
-                    class="w-full px-3 py-2 text-sm font-mono rounded-xl border border-gray-300 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
-                />
-            </div>
-            <div class="flex justify-end gap-3">
-                <SpecularButton
-                    variant="secondary"
-                    size="md"
-                    :radius="10"
-                    @click="showDeleteCiModal = false"
-                >
-                    Cancel
-                </SpecularButton>
-                <SpecularButton
-                    variant="destructive"
-                    size="md"
-                    :radius="10"
-                    @click="confirmDeleteCi"
-                    :disabled="deleteCiConfirmInput.trim().toUpperCase() !== 'YES'"
-                >
-                    Delete Invoice
-                </SpecularButton>
-            </div>
-        </div>
-    </div>
-
-    <!-- ======================================================== -->
     <!-- MODAL: DELETE PURCHASE ORDER -->
     <!-- ======================================================== -->
     <div v-if="showDeletePoModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
         <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl">
             <h3 class="text-xl font-semibold text-gray-900 mb-2">Delete Purchase Order</h3>
-            <p class="text-gray-600 text-sm mb-4">
-                Are you sure you want to delete purchase order <span class="font-semibold text-gray-900">{{ selectedPo?.po_number }}</span>?
+            <p class="text-gray-600 text-sm mb-2">
+                Move purchase order <span class="font-semibold text-gray-900">{{ selectedPo?.po_number }}</span> to the Recycle Bin?
+            </p>
+            <p class="text-gray-500 text-xs mb-4">
+                An Admin can restore or permanently delete this record from the Recycle Bin. Unrelated active sessions and trusted devices are not affected.
             </p>
             <div class="mt-4 mb-6">
                 <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm deletion:
                 </label>
                 <input
                     v-model="deletePoConfirmInput"
                     type="text"
                     placeholder="Type YES here"
                     class="w-full px-3 py-2 text-sm font-mono rounded-xl border border-gray-300 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                    @keyup.enter="deletePoConfirmInput === 'YES' && confirmDeletePo()"
                 />
             </div>
             <div class="flex justify-end gap-3">
@@ -1477,7 +1082,7 @@ const confirmDelete = () => {
                     size="md"
                     :radius="10"
                     @click="confirmDeletePo"
-                    :disabled="deletePoConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="deletePoConfirmInput !== 'YES'"
                 >
                     Delete Order
                 </SpecularButton>
@@ -1489,25 +1094,21 @@ const confirmDelete = () => {
     <!-- MODAL: DELETE PURCHASE REQUEST -->
     <!-- ======================================================== -->
     <div v-if="showDeleteModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-        <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl">
-            <h3 class="text-xl font-semibold text-gray-900 mb-2">Delete Purchase Request</h3>
-            <p class="text-gray-600 text-sm mb-4">Are you sure you want to cancel and delete request <span class="font-semibold text-gray-900">{{ selectedRequest?.request_number }}</span>?</p>
-            <div class="mt-4 mb-6">
-                <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> if you wish to delete:
-                </label>
-                <input
-                    v-model="deleteConfirmInput"
-                    type="text"
-                    placeholder="Type YES here"
-                    class="w-full px-3 py-2 text-sm font-mono rounded-xl border border-gray-300 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
-                />
+        <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl" role="dialog" aria-modal="true" aria-labelledby="delete-pr-title">
+            <h3 id="delete-pr-title" class="text-xl font-semibold text-gray-900 mb-2">Delete Purchase Request?</h3>
+            <p class="text-gray-600 text-sm mb-4">
+                Are you sure you want to delete this purchase request? This action cannot be undone.
+            </p>
+            <div class="bg-gray-50 border border-gray-100 rounded-xl p-3.5 mb-6 text-xs text-gray-600">
+                <span class="font-mono font-semibold text-gray-900">{{ selectedRequest?.request_number }}</span><template v-if="selectedRequest?.product?.name"> · {{ selectedRequest.product.name }}</template>
+                <span class="block mt-1 text-gray-500">Its product, supplier, quotations and purchase orders are not changed.</span>
             </div>
             <div class="flex justify-end gap-3">
                 <SpecularButton
                     variant="secondary"
                     size="md"
                     :radius="10"
+                    :disabled="deletingRequest"
                     @click="showDeleteModal = false"
                 >
                     Cancel
@@ -1517,9 +1118,9 @@ const confirmDelete = () => {
                     size="md"
                     :radius="10"
                     @click="confirmDelete"
-                    :disabled="deleteConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="deletingRequest"
                 >
-                    Delete Request
+                    {{ deletingRequest ? 'Deleting...' : 'Delete' }}
                 </SpecularButton>
             </div>
         </div>
@@ -1573,15 +1174,73 @@ const confirmDelete = () => {
     <div v-if="showProductPicker" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" @click.self="showProductPicker = false">
         <div class="w-full max-w-md rounded-xl border border-gray-200 bg-white p-6" role="dialog" aria-modal="true" aria-labelledby="pick-title">
             <h3 id="pick-title" class="text-base font-semibold text-gray-900">New purchase request</h3>
-            <p class="mb-3 text-xs text-gray-500">Tip: Inventory → AHP Product Prioritization lists the products the system recommends reordering.</p>
-            <label class="field-label" for="pick-product">Product</label>
-            <select id="pick-product" v-model="pickedProductId" class="field-control w-full">
-                <option v-for="p in products" :key="p.id" :value="p.id">{{ p.name }} ({{ p.sku }}) · stock {{ p.stock }}</option>
-            </select>
-            <div class="mt-4 flex justify-end gap-2">
-                <button type="button" class="secondary-button" @click="showProductPicker = false">Cancel</button>
-                <button type="button" class="brand-button" :disabled="!pickedProductId" @click="continueNewRequest">Continue</button>
-            </div>
+            <p class="mb-3 text-xs text-gray-500">Tip: Reports &amp; Analytics → AHP Product Prioritization lists the products the system recommends reordering.</p>
+            <form class="space-y-3" novalidate @submit.prevent="continueNewRequest">
+                <!-- 1. Product -->
+                <div>
+                    <div class="relative">
+                        <select id="pick-product" v-model="pickedProductId" required
+                                :class="[floatField, pickerErrors.product ? 'border-rose-400' : 'border-gray-200', pickedProductId === null && pickerFocus !== 'product' ? 'text-transparent' : '']"
+                                :aria-invalid="!!(pickerErrors.product || missingUnitMessage)" :aria-describedby="pickerErrors.product || missingUnitMessage ? 'pick-product-error' : undefined"
+                                @focus="pickerFocus = 'product'" @blur="pickerFocus = ''" @change="pickerErrors.product = undefined">
+                            <option :value="null" disabled>Select Product</option>
+                            <option v-for="p in products" :key="p.id" :value="p.id" class="text-gray-900">{{ p.name }} ({{ p.sku }}) · stock {{ p.stock }}</option>
+                            <option :value="UNLISTED" class="text-gray-900">Product Not Listed</option>
+                        </select>
+                        <label for="pick-product" :class="[floatLabel, pickedProductId !== null || pickerFocus === 'product' ? floatUp : 'text-gray-500']">Select Product</label>
+                    </div>
+                    <p v-if="pickerErrors.product || missingUnitMessage" id="pick-product-error" class="mt-1 text-xs text-rose-600">{{ pickerErrors.product || missingUnitMessage }}</p>
+                </div>
+
+                <!-- Product Not Listed: the staff's description of what to buy -->
+                <div v-if="isUnlisted">
+                    <div class="relative">
+                        <textarea id="pick-description" v-model="pickedDescription" rows="3" maxlength="1000" placeholder=" " required
+                                  :class="[floatField, 'resize-y', pickerErrors.description ? 'border-rose-400' : 'border-gray-200']"
+                                  :aria-invalid="!!pickerErrors.description" :aria-describedby="pickerErrors.description ? 'pick-description-error' : undefined"
+                                  @input="pickerErrors.description = undefined"></textarea>
+                        <label for="pick-description"
+                               :class="[floatLabel, 'text-gray-500 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]', pickedDescription ? floatUp : '']">Product Description</label>
+                    </div>
+                    <p v-if="pickerErrors.description" id="pick-description-error" class="mt-1 text-xs text-rose-600">{{ pickerErrors.description }}</p>
+                </div>
+
+                <!-- Required quantity (positive whole number); a catalog product's unit is shown beside it -->
+                <div>
+                    <div class="relative">
+                        <input id="pick-quantity" v-model="pickedQuantity" type="number" min="1" step="1" inputmode="numeric" placeholder=" " required
+                               :class="[floatField, pickedUnit ? 'pr-20' : '', pickerErrors.quantity ? 'border-rose-400' : 'border-gray-200']"
+                               :aria-invalid="!!pickerErrors.quantity" :aria-describedby="[pickerErrors.quantity ? 'pick-quantity-error' : '', pickedUnit ? 'pick-unit' : ''].filter(Boolean).join(' ') || undefined"
+                               @keydown="['.', ',', '-', '+', 'e', 'E'].includes($event.key) && $event.preventDefault()"
+                               @input="pickerErrors.quantity = undefined" />
+                        <label for="pick-quantity"
+                               :class="[floatLabel, 'text-gray-500 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]', pickedQuantity !== null && pickedQuantity !== '' ? floatUp : '']">Required Quantity</label>
+                        <!-- The product's unit (Product Catalog), read-only -->
+                        <span v-if="pickedUnit" id="pick-unit" class="pointer-events-none absolute inset-y-0 right-3.5 flex items-center pt-2 text-xs font-medium text-gray-500 sm:text-sm"><span class="sr-only">Unit: </span>{{ pickedUnit }}</span>
+                    </div>
+                    <p v-if="pickerErrors.quantity" id="pick-quantity-error" class="mt-1 text-xs text-rose-600">{{ pickerErrors.quantity }}</p>
+                </div>
+
+                <!-- Product Not Listed: unit from the system's units -->
+                <div v-if="isUnlisted">
+                    <div class="relative">
+                        <select id="pick-unit-choice" v-model="pickedUnitChoice" required
+                                :class="[floatField, pickerErrors.unit ? 'border-rose-400' : 'border-gray-200', !pickedUnitChoice && pickerFocus !== 'unit' ? 'text-transparent' : '']"
+                                :aria-invalid="!!pickerErrors.unit" :aria-describedby="pickerErrors.unit ? 'pick-unit-error' : undefined"
+                                @focus="pickerFocus = 'unit'" @blur="pickerFocus = ''" @change="pickerErrors.unit = undefined">
+                            <option value="" disabled>Select Unit</option>
+                            <option v-for="u in unitOptions ?? []" :key="u" :value="u" class="text-gray-900">{{ u }}</option>
+                        </select>
+                        <label for="pick-unit-choice" :class="[floatLabel, pickedUnitChoice || pickerFocus === 'unit' ? floatUp : 'text-gray-500']">{{ pickedUnitChoice || pickerFocus === 'unit' ? 'Unit' : 'Select Unit' }}</label>
+                    </div>
+                    <p v-if="pickerErrors.unit" id="pick-unit-error" class="mt-1 text-xs text-rose-600">{{ pickerErrors.unit }}</p>
+                </div>
+
+                <div class="flex justify-end gap-2 pt-1">
+                    <button type="button" class="secondary-button" @click="showProductPicker = false">Cancel</button>
+                    <button type="submit" class="brand-button">Continue</button>
+                </div>
+            </form>
         </div>
     </div>
     <PurchaseRequestCreator :open="showPrCreator" :candidates="prCandidates" @close="showPrCreator = false" @submitted="showPrCreator = false; showToast('Purchase request saved.')" />
@@ -1591,12 +1250,13 @@ const confirmDelete = () => {
         <div class="w-full max-w-lg rounded-xl border border-gray-200 bg-white p-6" role="dialog" aria-modal="true" aria-labelledby="review-title">
             <h3 id="review-title" class="text-base font-semibold text-gray-900">Review {{ reviewing.request_number }}</h3>
             <dl class="my-3 grid grid-cols-2 gap-2 text-sm">
-                <div><dt class="text-xs text-gray-500">Product</dt><dd>{{ reviewing.product?.name }}</dd></div>
+                <div><dt class="text-xs text-gray-500">Product</dt><dd>{{ reviewing.product?.name ?? (reviewing.product_description ? 'Not listed in the Product Catalog' : '—') }}</dd></div>
                 <div><dt class="text-xs text-gray-500">Requested by</dt><dd>{{ reviewing.requested_by?.name ?? '—' }}</dd></div>
-                <div><dt class="text-xs text-gray-500">Requested / recommended</dt><dd class="font-mono">{{ reviewing.quantity }} / {{ reviewing.recommended_quantity ?? '—' }}</dd></div>
+                <div><dt class="text-xs text-gray-500">Requested / recommended</dt><dd class="font-mono">{{ reviewing.quantity }}<template v-if="reviewing.unit"> {{ reviewing.unit }}</template> / {{ reviewing.recommended_quantity ?? '—' }}</dd></div>
                 <div><dt class="text-xs text-gray-500">Stock at request · SMA forecast</dt><dd class="font-mono">{{ reviewing.current_stock ?? '—' }} · {{ reviewing.forecast_quantity ?? 'n/a' }}</dd></div>
                 <div><dt class="text-xs text-gray-500">AHP score</dt><dd class="font-mono">{{ reviewing.ahp_score != null ? Number(reviewing.ahp_score).toFixed(2) : 'Incomplete data' }} {{ reviewing.ahp_classification ?? '' }}</dd></div>
                 <div><dt class="text-xs text-gray-500">Estimated cost</dt><dd>{{ formatCurrency(Number(reviewing.estimated_cost)) }}</dd></div>
+                <div v-if="reviewing.product_description" class="col-span-2"><dt class="text-xs text-gray-500">Product description (not listed: no inventory record until the goods are received)</dt><dd class="whitespace-pre-line">{{ reviewing.product_description }}</dd></div>
                 <div class="col-span-2"><dt class="text-xs text-gray-500">Justification</dt><dd>{{ reviewing.justification || '—' }}</dd></div>
             </dl>
             <label class="field-label" for="review-remarks">Remarks (required to reject)</label>
@@ -1611,30 +1271,6 @@ const confirmDelete = () => {
     </div>
 
 
-    <PurchaseOrderWorkspace :po-id="workspacePoId" :is-admin="isAdmin" @close="closeWorkspace" />
+    <PurchaseOrderWorkspace :po-id="workspacePoId" :is-admin="isAdmin" :products="products" @close="closeWorkspace" />
 
-    <!-- Purchase order product and promised date -->
-    <div v-if="schedulePo" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" @click.self="schedulePo = null">
-        <form class="w-full max-w-md rounded-xl border border-gray-200 bg-white p-6" role="dialog" aria-modal="true" aria-labelledby="po-schedule-title" @submit.prevent="submitSchedule">
-            <h3 id="po-schedule-title" class="text-lg font-semibold text-gray-900">Purchase order {{ schedulePo.po_number }}</h3>
-            <p class="mt-1 text-sm text-gray-500">Supplier Evaluation compares the promised date with the actual delivery date.</p>
-            <div class="mt-4">
-                <label class="field-label" for="sch-product">Product</label>
-                <select id="sch-product" v-model="scheduleForm.product_id" class="field-control">
-                    <option :value="null">Not linked</option>
-                    <option v-for="p in products" :key="p.id" :value="p.id">{{ p.name }} ({{ p.sku }})</option>
-                </select>
-            </div>
-            <div class="mt-3">
-                <label class="field-label" for="sch-date">Promised delivery date</label>
-                <input id="sch-date" v-model="scheduleForm.promised_delivery_date" type="date" :min="schedulePo.po_date.slice(0, 10)" class="field-control" />
-                <p v-if="schedulePo.deliveries_count" class="mt-1 text-xs text-amber-700">Goods were already received against this order; only an administrator can change the date.</p>
-                <p v-if="scheduleForm.errors.promised_delivery_date" class="mt-1 text-xs text-red-500">{{ scheduleForm.errors.promised_delivery_date }}</p>
-            </div>
-            <div class="mt-5 flex justify-end gap-2">
-                <button type="button" class="secondary-button" @click="schedulePo = null">Cancel</button>
-                <button type="submit" class="brand-button" :disabled="scheduleForm.processing">Save</button>
-            </div>
-        </form>
-    </div>
 </template>

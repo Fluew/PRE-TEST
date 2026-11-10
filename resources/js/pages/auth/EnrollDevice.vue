@@ -225,9 +225,10 @@ const submit = () => {
                         @click="showPassword = !showPassword"
                         class="absolute inset-y-0 right-0 flex cursor-pointer items-center pr-3.5 text-gray-400 transition-colors hover:text-black focus:outline-none"
                         :aria-label="showPassword ? 'Hide password' : 'Show password'"
+                        :aria-pressed="showPassword"
                     >
-                        <EyeOff v-if="showPassword" class="size-4" />
-                        <Eye v-else class="size-4" />
+                        <EyeOff v-if="showPassword" class="size-4 shrink-0" />
+                        <Eye v-else class="size-4 shrink-0" />
                     </button>
                 </div>
                 <div class="mt-1 text-[11px] text-white/80">

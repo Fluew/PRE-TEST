@@ -1,75 +1,15 @@
 <script setup lang="ts">
 import { Head, Link, usePage } from '@inertiajs/vue3';
-import { computed, defineAsyncComponent, shallowRef } from 'vue';
+import { computed, shallowRef } from 'vue';
 import PendingInvitationsModal from '@/components/PendingInvitationsModal.vue';
 import { useCurrency } from '@/composables/useCurrency';
 import { dashboard } from '@/routes';
 import { index as quotationsRoute } from '@/routes/admin/quotations';
 import { index as inventoryRoute } from '@/routes/inventory';
 import type { DashboardInvitation, Team } from '@/types';
+// Chart.js loads on demand (shared with Reports and Forecast).
+import { LineChart } from '@/lib/lazyCharts';
 
-// Lazy-load Chart.js + vue-chartjs — keeps them out of the initial bundle
-const LineChart = defineAsyncComponent(async () => {
-    const chartjs = await import('chart.js');
-    const { Line } = await import('vue-chartjs');
-    chartjs.Chart.register(
-        chartjs.CategoryScale,
-        chartjs.LinearScale,
-        chartjs.PointElement,
-        chartjs.LineElement,
-        chartjs.Title,
-        chartjs.Tooltip,
-        chartjs.Legend,
-    );
-
-    return Line;
-});
-
-// shallowRef avoids deep Vue reactivity overhead on plain chart data
-const chartData = shallowRef({
-    labels: [
-        'Jan',
-        'Feb',
-        'Mar',
-        'Apr',
-        'May',
-        'Jun',
-        'Jul',
-        'Aug',
-        'Sep',
-        'Oct',
-        'Nov',
-    ],
-    datasets: [
-        {
-            label: 'Historical Demand',
-            backgroundColor: '#4ade80',
-            borderColor: '#4ade80',
-            data: [150, 170, 160, 180, 190, 200, 220, 210, 230, 250, null],
-            tension: 0.3,
-        },
-        {
-            label: 'Forecast (SMA)',
-            backgroundColor: '#F8B803',
-            borderColor: '#F8B803',
-            borderDash: [5, 5],
-            data: [
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                250,
-                275,
-            ],
-            tension: 0.3,
-        },
-    ],
-});
 
 const chartOptions = shallowRef({
     responsive: true,
@@ -101,12 +41,43 @@ interface DashboardStats {
     };
 }
 
+interface ForecastSeries {
+    labels: string[];
+    historical: number[];
+    forecast: (number | null)[];
+    window: number;
+    hasData: boolean;
+    sourceRecordCount: number;
+}
+
 const props = defineProps<{
     pendingInvitations?: DashboardInvitation[];
     stats?: DashboardStats;
     recentActivity?: ActivityItem[];
+    forecastSeries?: ForecastSeries | null;
     isFirstLogin?: boolean;
 }>();
+
+const chartData = computed(() => ({
+    labels: props.forecastSeries?.labels ?? ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
+    datasets: [
+        {
+            label: 'Historical Demand (Units)',
+            backgroundColor: '#4ade80',
+            borderColor: '#4ade80',
+            data: props.forecastSeries?.historical ?? [],
+            tension: 0.3,
+        },
+        {
+            label: `Forecast (SMA-${props.forecastSeries?.window ?? 3})`,
+            backgroundColor: '#F8B803',
+            borderColor: '#F8B803',
+            borderDash: [5, 5],
+            data: props.forecastSeries?.forecast ?? [],
+            tension: 0.3,
+        },
+    ],
+}));
 
 const page = usePage();
 const currentUser = computed(() => (page.props as any).auth?.user);
@@ -169,32 +140,30 @@ defineOptions({
 
     <div class="workspace-page">
         <!-- Dashboard Header -->
-        <div class="flex flex-col">
-            <h1
-                class="page-title"
-            >
-                Hello, {{ firstName }}!
-            </h1>
-            <p class="page-subtitle">
-                <template v-if="isFirstTimeLogin">
-                    Welcome to MRP ElectroDesk. Let's get started.
-                </template>
-                <template v-else>
-                    Welcome back to MRP ElectroDesk.
-                </template>
-            </p>
-        </div>
+        <div class="page-header">
+            <div>
+                <h1 class="page-title">Hello, {{ firstName }}!</h1>
+                <p class="page-subtitle">
+                    <template v-if="isFirstTimeLogin">
+                        Welcome to MRP ElectroDesk. Let's get started.
+                    </template>
+                    <template v-else>
+                        Welcome back to MRP ElectroDesk.
+                    </template>
+                </p>
+            </div>
 
-        <div v-if="$page.props.currentTeam" class="flex flex-wrap gap-3">
-            <Link
-                :href="inventoryRoute($page.props.currentTeam.slug)"
-                class="brand-button"
-                >Manage inventory</Link
-            ><Link
-                :href="quotationsRoute($page.props.currentTeam.slug)"
-                class="secondary-button"
-                >Review quotations</Link
-            >
+            <div v-if="$page.props.currentTeam" class="page-actions">
+                <Link
+                    :href="inventoryRoute($page.props.currentTeam.slug)"
+                    class="brand-button"
+                    >Manage inventory</Link
+                ><Link
+                    :href="quotationsRoute($page.props.currentTeam.slug)"
+                    class="secondary-button"
+                    >Review quotations</Link
+                >
+            </div>
         </div>
         <!-- Stat Cards -->
         <div class="grid grid-cols-2 gap-3 xl:grid-cols-4">
@@ -226,9 +195,14 @@ defineOptions({
             <div
                 class="min-w-0 rounded-xl border border-gray-200 bg-white p-6"
             >
-                <h3 class="mb-4 text-lg font-semibold text-gray-900">
-                    Sales &amp; Demand Forecast (SMA)
-                </h3>
+                <div class="mb-4 flex flex-wrap items-baseline justify-between gap-2">
+                    <h3 class="text-base font-semibold text-gray-900">
+                        Sales &amp; Demand Forecast (SMA)
+                    </h3>
+                    <span v-if="forecastSeries && !forecastSeries.hasData" class="text-xs text-amber-700">
+                        No recorded sales or outgoing stock movements yet
+                    </span>
+                </div>
                 <div class="h-[280px] w-full sm:h-[300px]">
                     <Suspense>
                         <LineChart :data="chartData" :options="chartOptions" />
@@ -261,7 +235,7 @@ defineOptions({
             <div
                 class="max-h-[400px] overflow-y-auto rounded-xl border border-gray-200 bg-white p-6"
             >
-                <h3 class="mb-4 text-lg font-semibold text-gray-900">
+                <h3 class="mb-4 text-base font-semibold text-gray-900">
                     Recent Activity Feed
                 </h3>
                 <ul class="divide-y divide-gray-100">

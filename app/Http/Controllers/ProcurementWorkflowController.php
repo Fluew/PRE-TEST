@@ -2,20 +2,19 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\CommercialInvoice;
 use App\Models\Delivery;
 use App\Models\PurchaseOrder;
 use App\Models\PurchaseRequest;
 use App\Models\Supplier;
 use App\Models\Team;
+use App\Services\Forecast\SmaForecaster;
 use App\Services\Procurement\ProcurementWorkflow;
+use App\Services\Suppliers\SupplierEvaluator;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
-use Symfony\Component\HttpFoundation\StreamedResponse;
 
 /**
  * HTTP side of the Inventory-to-Procurement workflow. Validation and team scoping only;
@@ -31,15 +30,24 @@ class ProcurementWorkflowController extends Controller
         $team = $this->team($request);
         $data = $request->validate([
             'lines' => ['required', 'array', 'min:1', 'max:50'],
-            'lines.*.product_id' => ['required', 'integer'],
+            // A catalog product (its own unit is used), or "Product Not Listed": no product, a
+            // description and one of the system's units. Nothing is added to inventory.
+            'lines.*.product_id' => ['nullable', 'integer'],
             'lines.*.quantity' => ['required', 'integer', 'min:1', 'max:1000000'],
+            'lines.*.product_description' => ['nullable', 'required_without:lines.*.product_id', 'string', 'max:1000'],
+            'lines.*.unit' => ['nullable', 'required_without:lines.*.product_id', 'string', Rule::in(PurchaseRequest::unitOptions($team->id))],
             'lines.*.justification' => ['required', 'string', 'max:1000'],
             'lines.*.supplier_id' => ['nullable', 'integer', Rule::exists('suppliers', 'id')->where('team_id', $team->id)],
             'draft' => ['nullable', 'boolean'],
+            'forecast_months' => ['nullable', 'integer', Rule::in(SmaForecaster::WINDOWS)],
+        ], [
+            'lines.*.product_description.required_without' => 'Describe the product you need to purchase.',
+            'lines.*.unit.required_without' => 'Select the unit.',
+            'lines.*.unit.in' => 'Select one of the listed units.',
         ]);
 
         return $this->runWorkflow(function () use ($team, $request, $data) {
-            $prs = $this->workflow->submitRequests($team, $request->user(), $data['lines'], (bool) ($data['draft'] ?? false));
+            $prs = $this->workflow->submitRequests($team, $request->user(), $data['lines'], (bool) ($data['draft'] ?? false), $data['forecast_months'] ?? null);
 
             return ($data['draft'] ?? false)
                 ? 'Saved as draft: '.$prs->pluck('request_number')->implode(', ').'.'
@@ -83,7 +91,7 @@ class ProcurementWorkflowController extends Controller
             'supplier_id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where('team_id', $team->id)],
             'quantity' => ['required', 'integer', 'min:1'],
             'unit_cost' => ['required', 'numeric', 'gt:0', 'max:99999999'],
-            'po_date' => ['nullable', 'date', 'before_or_equal:today'],
+            // The order date is not changed here (only an administrator correction can change it).
             'promised_delivery_date' => ['nullable', 'date', 'after_or_equal:today'],
             'payment_terms' => ['nullable', 'string', 'max:100'],
             'quantity_adjustment_reason' => ['nullable', 'string', 'max:1000'],
@@ -91,15 +99,6 @@ class ProcurementWorkflowController extends Controller
         ]);
 
         return $this->runWorkflow(fn () => 'Draft purchase order '.$this->workflow->updateDraftPurchaseOrder($po, $request->user(), $data)->po_number.' saved. Send it when the supplier terms are final.');
-    }
-
-    /** The supplier's invoice document, from private storage. */
-    public function invoiceAttachment(Request $request): StreamedResponse
-    {
-        $ci = $this->find($request, CommercialInvoice::class, 'commercialInvoice');
-        abort_unless($ci->attachment_path && Storage::disk('local')->exists($ci->attachment_path), 404);
-
-        return Storage::disk('local')->download($ci->attachment_path, $ci->attachment_name ?: 'invoice');
     }
 
     public function sendPurchaseOrder(Request $request): RedirectResponse
@@ -142,7 +141,7 @@ class ProcurementWorkflowController extends Controller
     {
         $po = $this->find($request, PurchaseOrder::class, 'purchaseOrder');
         $po->load(['supplier:id,name', 'product:id,name,sku,unit,stock', 'preparedBy:id,name',
-            'purchaseRequest.requestedBy:id,name', 'purchaseRequest.reviewedBy:id,name']);
+            'purchaseRequest.requestedBy:id,name', 'purchaseRequest.reviewedBy:id,name', 'purchaseRequest.quotation:id,quotation_number,client_name']);
 
         $deliveries = Delivery::where('purchase_order_id', $po->id)->with(['inspectedBy:id,name', 'receivedBy:id,name', 'postedBy:id,name'])
             ->orderBy('delivery_date')->orderBy('id')->get()
@@ -155,26 +154,50 @@ class ProcurementWorkflowController extends Controller
                     'posted_by' => $d->postedBy?->name,
                 ]);
 
-        $invoices = CommercialInvoice::where('purchase_order_id', $po->id)->with(['recordedBy:id,name', 'verifiedBy:id,name', 'delivery:id,delivery_number'])
-            ->orderBy('invoice_date')->get()
-            ->map(fn (CommercialInvoice $ci) => $ci->only(['id', 'invoice_number', 'invoice_date', 'quantity', 'unit_cost', 'tax_amount', 'total_cost', 'payment_terms', 'status',
-                'verified_at', 'verification_remarks', 'delivery_id', 'attachment_name']) + [
-                    // Live check for open invoices; the stored result for verified ones.
-                    'discrepancies' => in_array($ci->status, [CommercialInvoice::PENDING, CommercialInvoice::FLAGGED], true) ? $this->workflow->checkInvoice($ci) : ($ci->discrepancies ?? []),
-                    'delivery_number' => $ci->delivery?->delivery_number,
-                    'recorded_by' => $ci->recordedBy?->name,
-                    'verified_by' => $ci->verifiedBy?->name,
-                ]);
+        // All products on this purchase order number (one purchase_orders row each), read-only.
+        $lines = PurchaseOrder::where('team_id', $po->team_id)->where('po_number', $po->po_number)->with('supplier:id,name')
+            ->orderBy('id')->get()
+            ->map(fn (PurchaseOrder $line) => [
+                'id' => $line->id,
+                'po_date' => $line->po_date?->toDateString(),
+                'po_number' => $line->po_number,
+                'supplier' => $line->supplier?->name,
+                'quantity' => (int) $line->quantity,
+                'item_sku' => $line->item_sku,
+                'description' => $line->description,
+                'unit_cost' => $line->unit_cost !== null ? (float) $line->unit_cost : null,
+                'unit_of_measure' => $line->unit_of_measure,
+                // EXTENDED COST = QUANTITY × UNIT COST.
+                'extended_cost' => round((int) $line->quantity * (float) $line->unit_cost, 2),
+                'product_id' => $line->product_id,
+            ]);
 
         return response()->json([
             'purchase_order' => $po,
+            'lines' => $lines,
             'summary' => $this->workflow->summary($po),
             'deliveries' => $deliveries,
-            'invoices' => $invoices,
             'rejection_categories' => Delivery::REJECTION_CATEGORIES,
-            'suppliers' => Supplier::where('team_id', $po->team_id)->where('status', 'Active')->orderBy('name')->get(['id', 'name']),
+            'suppliers' => $po->status === PurchaseOrder::DRAFT ? $this->rankedSuppliers($po->team_id) : [],
             'resolutions' => Delivery::RESOLUTIONS,
         ]);
+    }
+
+    /**
+     * Active suppliers for the draft order's supplier choice, best AHP rank first, with their
+     * score. Information for staff only: the choice stays theirs.
+     *
+     * @return list<array{id: int, name: string, rank: ?int, score: ?float, classification: ?string}>
+     */
+    private function rankedSuppliers(int $teamId): array
+    {
+        $evaluations = app(SupplierEvaluator::class)->forTeam($teamId);
+
+        return Supplier::where('team_id', $teamId)->where('status', 'Active')->orderBy('name')->get(['id', 'name'])
+            ->map(fn (Supplier $s) => ['id' => $s->id, 'name' => $s->name, 'rank' => $evaluations[$s->id]['rank'] ?? null,
+                'score' => $evaluations[$s->id]['score'] ?? null, 'classification' => $evaluations[$s->id]['classification'] ?? null])
+            ->sortBy(fn ($s) => [$s['rank'] === null ? 1 : 0, $s['rank'] ?? 0, $s['name']])
+            ->values()->all();
     }
 
     public function recordDelivery(Request $request): RedirectResponse
@@ -235,73 +258,6 @@ class ProcurementWorkflowController extends Controller
         $delivery = $this->find($request, Delivery::class, 'delivery');
 
         return $this->runWorkflow(fn () => $this->workflow->postToInventory($delivery, $request->user())->quantity." accepted units of {$delivery->delivery_number} added to inventory.");
-    }
-
-    public function recordInvoice(Request $request): RedirectResponse
-    {
-        $team = $this->team($request);
-        $data = $request->validate([
-            'purchase_order_id' => ['required', 'integer', Rule::exists('purchase_orders', 'id')->where('team_id', $team->id)],
-            'delivery_id' => ['required', 'integer', Rule::exists('deliveries', 'id')->where('team_id', $team->id)],
-            'invoice_number' => ['required', 'string', 'max:100'],
-            'invoice_date' => ['required', 'date', 'before_or_equal:today'],
-            'quantity' => ['required', 'integer', 'min:1'],
-            'unit_cost' => ['required', 'numeric', 'min:0', 'max:99999999'],
-            'tax_amount' => ['nullable', 'numeric', 'min:0', 'max:99999999'],
-            'payment_terms' => ['nullable', 'string', 'max:100'],
-            'notes' => ['nullable', 'string', 'max:1000'],
-            'attachment' => ['nullable', 'file', 'max:25600', 'mimes:pdf,png,jpg,jpeg'],
-        ]);
-        unset($data['attachment']);
-
-        return $this->runWorkflow(function () use ($team, $request, $data) {
-            $ci = $this->workflow->recordInvoice($team, $request->user(), $data, $request->file('attachment'));
-            $n = count($ci->discrepancies ?? []);
-
-            return "Invoice {$ci->invoice_number} recorded".($n ? " with {$n} discrepancy flag(s) to resolve." : '; it matches the order and inspection. Verify it next.');
-        });
-    }
-
-    public function correctInvoice(Request $request): RedirectResponse
-    {
-        $ci = $this->find($request, CommercialInvoice::class, 'commercialInvoice');
-        $data = $request->validate([
-            'invoice_number' => ['nullable', 'string', 'max:100'],
-            'quantity' => ['required', 'integer', 'min:1'],
-            'unit_cost' => ['required', 'numeric', 'min:0', 'max:99999999'],
-            'tax_amount' => ['nullable', 'numeric', 'min:0', 'max:99999999'],
-            'remarks' => ['required', 'string', 'max:1000'],
-        ]);
-
-        return $this->runWorkflow(function () use ($ci, $request, $data) {
-            $ci = $this->workflow->correctInvoice($ci, $request->user(), $data);
-
-            return "Invoice {$ci->invoice_number} corrected; ".(count($ci->discrepancies ?? []) ? 'some discrepancies remain.' : 'it now matches.');
-        });
-    }
-
-    public function verifyInvoice(Request $request): RedirectResponse
-    {
-        $ci = $this->find($request, CommercialInvoice::class, 'commercialInvoice');
-        $data = $request->validate(['remarks' => ['nullable', 'string', 'max:1000']]);
-
-        return $this->runWorkflow(function () use ($ci, $request, $data) {
-            $this->workflow->verifyInvoice($ci, $request->user(), $data['remarks'] ?? null);
-
-            return "Invoice {$ci->invoice_number} verified.";
-        });
-    }
-
-    public function flagInvoice(Request $request): RedirectResponse
-    {
-        $ci = $this->find($request, CommercialInvoice::class, 'commercialInvoice');
-        $data = $request->validate(['remarks' => ['required', 'string', 'max:1000']]);
-
-        return $this->runWorkflow(function () use ($ci, $request, $data) {
-            $this->workflow->flagInvoice($ci, $request->user(), $data['remarks']);
-
-            return "Invoice {$ci->invoice_number} flagged.";
-        });
     }
 
     private function team(Request $request): Team

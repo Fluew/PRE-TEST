@@ -1,5 +1,6 @@
 <?php
 
+use App\Enums\QuotationStatus;
 use App\Enums\SalesOrderStatus;
 use App\Enums\TeamRole;
 use App\Models\Product;
@@ -9,7 +10,9 @@ use App\Models\StockMovement;
 use App\Models\Supplier;
 use App\Models\Team;
 use App\Models\User;
+use App\Services\Sales\PaymentService;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Storage;
 
 /**
  * Covers the deletion pathways that are not plain DELETE routes:
@@ -59,7 +62,7 @@ it('no longer offers a replace-mode inventory import to anyone', function (strin
 })->with(['staff_inventory', 'admin']);
 
 it('lets staff import new products without touching the existing catalog', function () {
-    Illuminate\Support\Facades\Storage::fake('local');
+    Storage::fake('local');
     $team = Team::factory()->create(['slug' => 'gap-team']);
     [$staff, $cookies] = gapActor('staff_inventory', $team);
     $existing = gapProduct($team);
@@ -108,9 +111,9 @@ it('rejects guests on protected delete routes', function () {
     expect(Product::find($product->id))->not->toBeNull();
 });
 
-// --- Recycle bin: history is never purged -------------------------------------------------
+// --- Recycle bin: authorized Admin can permanently delete archived sales ------------------
 
-it('refuses to permanently delete a voided sale', function () {
+it('allows an authorized admin to permanently delete a voided sale', function () {
     $team = Team::factory()->create(['slug' => 'gap-team']);
     [$admin, $cookies] = gapActor('admin', $team);
     $sale = Sale::create([
@@ -122,9 +125,9 @@ it('refuses to permanently delete a voided sale', function () {
 
     $this->actingAs($admin)->withCookies($cookies)
         ->delete("/{$team->slug}/recycle-bin/sale/{$sale->id}/force")
-        ->assertSessionHas('error');
+        ->assertSessionHas('success');
 
-    expect(Sale::withTrashed()->find($sale->id))->not->toBeNull();
+    expect(Sale::withTrashed()->find($sale->id))->toBeNull();
 });
 
 it('refuses to permanently delete a product with stock history, but purges one without', function () {
@@ -154,7 +157,7 @@ it('refuses to permanently delete a product with stock history, but purges one w
         ->and(Product::withTrashed()->find($clean->id))->toBeNull();
 });
 
-it('keeps sales when the recycle bin is emptied', function () {
+it('purges archived sales when the recycle bin is emptied by an admin', function () {
     $team = Team::factory()->create(['slug' => 'gap-team']);
     [$admin, $cookies] = gapActor('admin', $team);
     $sale = Sale::create([
@@ -170,7 +173,7 @@ it('keeps sales when the recycle bin is emptied', function () {
         ->post("/{$team->slug}/recycle-bin/empty")
         ->assertSessionHas('success');
 
-    expect(Sale::withTrashed()->find($sale->id))->not->toBeNull()
+    expect(Sale::withTrashed()->find($sale->id))->toBeNull()
         ->and(Supplier::withTrashed()->find($supplier->id))->toBeNull();
 });
 
@@ -194,33 +197,40 @@ it('tells the frontend only admins can delete', function () {
 
 // --- Recycle bin: restoring a voided sale -------------------------------------------------
 
-it('cancels before archiving: the stock goes back once, and restoring the archived order does not take it again', function () {
+it('cancels before archiving: reserved stock is freed once, and restoring the archived order does not take it again', function () {
     $team = Team::factory()->create(['slug' => 'gap-team']);
     [$admin, $cookies] = gapActor('admin', $team);
     $product = Product::create([
         'team_id' => $team->id, 'sku' => 'SKU-RST', 'name' => 'Restorable', 'price' => 100, 'stock' => 10, 'is_active' => true,
     ]);
 
-    // A counter sale whose payment proof is still waiting for verification (goods already taken).
-    $this->actingAs($admin)->withCookies($cookies)->post("/{$team->slug}/sales", [
-        'customer' => 'Restore Test Co', 'payment_method' => 'GCash', 'payment_reference' => 'GCASH-RESTORE-1',
-        'amount_paid' => 200, 'payment_date' => now()->toDateString(),
-        'proof_of_payment' => UploadedFile::fake()->image('proof.png'),
-        'items' => [['product_id' => $product->id, 'qty' => 2]],
-    ])->assertSessionHasNoErrors();
-    $sale = Sale::where('team_id', $team->id)->latest('id')->firstOrFail();
-    expect($product->fresh()->stock)->toBe(8);
+    // An order created from an accepted quotation, then paid and confirmed: 2 units reserved for it.
+    $quotation = Quotation::create([
+        'team_id' => $team->id, 'quotation_number' => 'Q-RESTORE-1', 'client_name' => 'Restore Test Co', 'address' => 'Pasig',
+        'quotation_date' => now()->toDateString(), 'valid_until' => now()->addDays(15)->toDateString(),
+        'subtotal' => 200, 'discount' => 0, 'tax_rate' => 0, 'tax_amount' => 0, 'grand_total' => 200, 'status' => QuotationStatus::Accepted,
+    ]);
+    $quotation->items()->create(['product_id' => $product->id, 'sku' => $product->sku, 'product_name' => $product->name, 'quantity' => 2, 'unit_price' => 100, 'discount' => 0, 'subtotal' => 200]);
+    $this->actingAs($admin)->withCookies($cookies)->post("/{$team->slug}/sales", ['quotation_id' => $quotation->id])->assertSessionHasNoErrors();
+    $sale = Sale::where('quotation_id', $quotation->id)->sole();
+    $payments = app(PaymentService::class);
+    $payments->verify(
+        $payments->record($sale, ['method' => 'GCash', 'amount' => 200, 'reference' => 'GCASH-RESTORE-1', 'payment_date' => now()->toDateString()], null, $admin),
+        ['reference' => 'GCASH-RESTORE-1', 'amount' => 200, 'payment_date' => now()->toDateString()], $admin,
+    );
+    expect($product->fresh()->stock)->toBe(10)->and($product->fresh()->availableStock())->toBe(8);
 
     // Only cancelled orders can be archived.
     $this->delete("/{$team->slug}/sales/{$sale->id}")->assertSessionHasErrors('error');
     expect(Sale::find($sale->id))->not->toBeNull();
 
     $this->post("/{$team->slug}/sales/{$sale->id}/cancel", ['reason' => 'Customer changed their mind'])->assertSessionHasNoErrors();
-    expect($product->fresh()->stock)->toBe(10);
+    expect($product->fresh()->stock)->toBe(10)->and($product->fresh()->availableStock())->toBe(10);
 
     $this->delete("/{$team->slug}/sales/{$sale->id}")->assertSessionHas('success');
     $this->post("/{$team->slug}/recycle-bin/sale/{$sale->id}/restore")->assertSessionHas('success');
 
+    expect($product->fresh()->availableStock())->toBe(10);
     expect(Sale::find($sale->id)?->status)->toBe(SalesOrderStatus::Cancelled)
         ->and($product->fresh()->stock)->toBe(10);
 });

@@ -204,7 +204,7 @@ it('finds the header row below a title and creates only new products, with no st
 
     expect(Product::where('team_id', $this->team->id)->where('sku', 'WR-35')->first())
         ->name->toBe('THHN Wire 3.5mm')->stock->toBe(0);
-    expect(Product::where('name', 'Missing SKU')->value('sku'))->toStartWith('PRD-');
+    expect(Product::where('name', 'Missing SKU')->value('sku'))->toBe('WIR-000001'); // generated from its category
 });
 
 it('reads a photo of a stock list with OCR and reports misread digits', function () {
@@ -222,7 +222,7 @@ it('reads a photo of a stock list with OCR and reports misread digits', function
         ->and($batch->extraction_method)->toBe('ocr')
         ->and(invRowValues($batch, ['sku', 'name', 'stock', 'price']))
         ->toEqual([['BRK-60', 'Circuit Breaker 60A', 10.0, 450.0], ['LED-9', 'LED Bulb 9W', 15.0, 85.0]])
-        ->and($batch->rows()->get()->flatMap->issues->pluck('message')->implode(' '))->toContain('read by OCR as "1O"');
+        ->and($batch->rows()->get()->flatMap->issues->pluck('message')->implode(' '))->toContain('read as "1O"');
 
     // OCR values need an explicit check before import.
     $this->actingAs($this->user)->withCookies($this->cookies)

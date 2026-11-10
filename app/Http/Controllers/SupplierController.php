@@ -98,7 +98,14 @@ class SupplierController extends Controller
 
         $validated['team_id'] = $team->id;
 
-        Supplier::create($validated);
+        $supplier = Supplier::create($validated);
+        AuditLogger::record(
+            'supplier.created',
+            "Created supplier {$supplier->name}.",
+            $supplier,
+            ['name' => $supplier->name, 'status' => $supplier->status],
+            $request->user()
+        );
 
         return back()->with('success', 'Supplier created successfully.');
     }
@@ -122,6 +129,13 @@ class SupplierController extends Controller
         ]);
 
         $supplier->update($validated);
+        AuditLogger::record(
+            'supplier.updated',
+            "Updated supplier {$supplier->name}.",
+            $supplier,
+            ['name' => $supplier->name, 'status' => $supplier->status],
+            $request->user()
+        );
 
         return back()->with('success', 'Supplier updated successfully.');
     }
@@ -131,6 +145,10 @@ class SupplierController extends Controller
      */
     public function destroy(Request $request, mixed $current_team = null, mixed $supplier = null): RedirectResponse
     {
+        abort_unless($request->user()?->isAdmin(), 403, 'Only administrators can delete records.');
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
+        }
         $supplier = $this->resolveSupplier($supplier, $current_team, $request);
         $team = $request->user()->currentTeam;
         abort_if(! $team || $supplier->team_id !== $team->id, 403);
@@ -140,6 +158,13 @@ class SupplierController extends Controller
             return back()->withErrors(['supplier' => 'Cannot delete supplier with linked products. Reassign products first.']);
         }
 
+        AuditLogger::record(
+            'supplier.deleted',
+            "Moved supplier {$supplier->name} to Recycle Bin.",
+            $supplier,
+            ['name' => $supplier->name],
+            $request->user()
+        );
         $supplier->delete();
 
         return back()->with('success', 'Supplier deleted successfully.');
@@ -239,9 +264,10 @@ class SupplierController extends Controller
 
     public function destroyQuote(Request $request, mixed $current_team = null, mixed $quote = null): RedirectResponse
     {
+        abort_unless($request->user()?->isAdmin(), 403, 'Only administrators can delete records.');
         $quote = $this->findTeamRecord(SupplierQuote::class, $quote ?? $request->route('quote'), $request);
-        if ($quote->verified_at && ! $request->user()->isAdmin()) {
-            return back()->withErrors(['quote' => 'Only an administrator can remove a verified quote.']);
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
         }
 
         AuditLogger::record('supplier_quote.removed', 'Supplier quote removed.', $quote, $quote->only(['product_id', 'unit_price', 'quoted_on']), $request->user());
@@ -293,9 +319,10 @@ class SupplierController extends Controller
 
     public function destroyAvailability(Request $request, mixed $current_team = null, mixed $availability = null): RedirectResponse
     {
+        abort_unless($request->user()?->isAdmin(), 403, 'Only administrators can delete records.');
         $record = $this->findTeamRecord(ProductSupplier::class, $availability ?? $request->route('availability'), $request);
-        if ($record->verified_at && ! $request->user()->isAdmin()) {
-            return back()->withErrors(['availability' => 'Only an administrator can remove a verified availability record.']);
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
         }
 
         AuditLogger::record('supplier_availability.removed', 'Supplier availability record removed.', $record, $record->only(['product_id', 'is_available']), $request->user());

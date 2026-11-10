@@ -5,29 +5,7 @@ import SpecularButton from '@/components/ui/SpecularButton.vue';
 import StatusBadge from '@/components/ui/StatusBadge.vue';
 import { useCanDelete } from '@/composables/useCanDelete';
 import { useCurrency } from '@/composables/useCurrency';
-import {
-    Search, 
-    Plus, 
-    Printer, 
-    Receipt, 
-    ShoppingCart, 
-    TrendingUp, 
-    Calendar, 
-    CheckCircle2, 
-    Check,
-    Clock, 
-    Trash2, 
-    X,
-    CreditCard,
-    Building2,
-    Smartphone,
-    Upload,
-    FileText,
-    ExternalLink,
-    Truck,
-    ShieldCheck,
-    AlertTriangle
-} from '@lucide/vue';
+import { Search, Plus, Check, CheckCircle2, Trash2 } from '@lucide/vue';
 
 interface SaleItem {
     id: number;
@@ -62,13 +40,31 @@ interface Sale {
 }
 
 type Option = { value: string; label: string };
-interface ProductItem {
+/** An agreed line of an accepted quotation (read-only: it is copied into the Sales Order as it is). */
+interface QuotationLineOption {
     id: number;
-    sku: string;
-    name: string;
-    price: number;
-    stock: number;
-    category: string;
+    sku?: string | null;
+    description: string;
+    quantity: number;
+    unit?: string | null;
+    unit_price: number;
+    amount: number;
+}
+
+/** An accepted quotation that has no Sales Order yet. */
+interface QuotationOption {
+    id: number;
+    quotation_number: string;
+    client_name: string;
+    address?: string | null;
+    quotation_date: string;
+    accepted_on?: string | null;
+    subtotal: number;
+    discount: number;
+    tax_rate: number;
+    tax_amount: number;
+    grand_total: number;
+    items: QuotationLineOption[];
 }
 
 const props = defineProps<{
@@ -96,7 +92,8 @@ const props = defineProps<{
         toVerify: number;
         outstanding: number;
     };
-    products: ProductItem[];
+    /** Accepted quotations without a Sales Order (the only source of new orders). */
+    quotations?: QuotationOption[];
     options: { status: Option[]; payment_status: Option[]; delivery_status: Option[] };
 }>();
 
@@ -146,130 +143,80 @@ const resetFilters = () => {
     sort.value = 'newest';
     applyFilter();
 };
-// POS State
-const posModalOpen = ref(false);
-const productSearch = ref('');
-const currentCustomer = ref('');
-const paymentMethod = ref<'Bank Transfer' | 'GCash'>('Bank Transfer');
-const paymentReference = ref('');
-const amountPaid = ref<number | ''>('');
-const paymentDate = ref(new Date().toISOString().split('T')[0]);
-const proofOfPaymentFile = ref<File | null>(null);
-const proofFileName = ref('');
-const notes = ref('');
-const cart = ref<Array<{
-    product_id: number;
-    name: string;
-    sku: string;
-    price: number;
-    stock: number;
-    qty: number;
-}>>([]);
+// New Sales Order: from an accepted quotation only. Customer, products, quantities and agreed
+// prices come from the quotation and cannot be changed here. No payment is taken here (payments
+// are recorded on the order page) and no stock moves.
+const orderModalOpen = ref(false);
+const selectedQuotationId = ref<number | null>(null);
+const quotationSearch = ref('');
+const quotationFocus = ref(false);
+const quotationError = ref('');
+const fulfillmentType = ref<'delivery' | 'pickup'>('delivery');
+const deliveryAddress = ref('');
+const isSubmitting = ref(false);
 
-const filteredProducts = computed(() => {
-    const q = productSearch.value.toLowerCase().trim();
-    if (!q) return props.products;
-    return props.products.filter(p => 
-        p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q) || p.category.toLowerCase().includes(q)
+const selectedQuotation = computed(() => (props.quotations ?? []).find((q) => q.id === selectedQuotationId.value) ?? null);
+// The search box appears only when the list is long enough to need it.
+const showQuotationSearch = computed(() => (props.quotations ?? []).length > 8);
+const quotationChoices = computed(() => {
+    const term = quotationSearch.value.trim().toLowerCase();
+    const all = props.quotations ?? [];
+    const matches = term ? all.filter((q) => q.quotation_number.toLowerCase().includes(term) || q.client_name.toLowerCase().includes(term)) : all;
+    // Keep the chosen quotation in the list while searching.
+    return selectedQuotation.value && !matches.includes(selectedQuotation.value) ? [selectedQuotation.value, ...matches] : matches;
+});
+
+watch(selectedQuotation, (q) => {
+    quotationError.value = '';
+    fulfillmentType.value = 'delivery';
+    deliveryAddress.value = q?.address ?? '';
+});
+
+const openOrderModal = () => {
+    selectedQuotationId.value = null;
+    quotationSearch.value = '';
+    quotationError.value = '';
+    fulfillmentType.value = 'delivery';
+    deliveryAddress.value = '';
+    orderModalOpen.value = true;
+};
+const closeOrderModal = () => {
+    orderModalOpen.value = false;
+};
+
+const createSalesOrder = () => {
+    if (!selectedQuotation.value) {
+        quotationError.value = 'Select a quotation.';
+        return;
+    }
+    isSubmitting.value = true;
+    router.post(
+        `/${teamSlug.value}/sales`,
+        {
+            quotation_id: selectedQuotation.value.id,
+            fulfillment_type: fulfillmentType.value,
+            delivery_address: fulfillmentType.value === 'delivery' ? deliveryAddress.value.trim() || undefined : undefined,
+        },
+        {
+            preserveScroll: true,
+            onSuccess: (visit) => {
+                // A refused order comes back as a page error (errors.error), not as a success.
+                const errors = (visit.props as any).errors ?? {};
+                if (errors.error || errors.quotation_id) {
+                    quotationError.value = errors.quotation_id ?? errors.error;
+                    return;
+                }
+                closeOrderModal();
+            },
+            onError: (errors) => {
+                quotationError.value = errors.quotation_id ?? errors.error ?? 'The Sales Order could not be created.';
+            },
+            onFinish: () => {
+                isSubmitting.value = false;
+            },
+        },
     );
-});
-
-const openPosModal = () => {
-    currentCustomer.value = '';
-    paymentMethod.value = 'Bank Transfer';
-    paymentReference.value = '';
-    amountPaid.value = '';
-    paymentDate.value = new Date().toISOString().split('T')[0];
-    proofOfPaymentFile.value = null;
-    proofFileName.value = '';
-    notes.value = '';
-    cart.value = [];
-    productSearch.value = '';
-    posModalOpen.value = true;
 };
-
-const closePosModal = () => {
-    posModalOpen.value = false;
-};
-
-const addToCart = (product: ProductItem) => {
-    const existing = cart.value.find(item => item.product_id === product.id);
-    if (existing) {
-        if (existing.qty < product.stock) {
-            existing.qty++;
-        }
-    } else {
-        cart.value.push({
-            product_id: product.id,
-            name: product.name,
-            sku: product.sku,
-            price: Number(product.price),
-            stock: product.stock,
-            qty: 1,
-        });
-    }
-};
-
-const updateQty = (index: number, newQty: number) => {
-    const item = cart.value[index];
-    if (newQty <= 0) {
-        cart.value.splice(index, 1);
-    } else if (newQty <= item.stock) {
-        item.qty = newQty;
-    }
-};
-
-const removeFromCart = (index: number) => {
-    cart.value.splice(index, 1);
-};
-
-const cartTotal = computed(() => {
-    return cart.value.reduce((sum, item) => sum + item.price * item.qty, 0);
-});
-
-// Auto-sync amount paid with cart total when total changes
-watch(cartTotal, (newTotal) => {
-    if (newTotal > 0) {
-        amountPaid.value = Number(newTotal.toFixed(2));
-    } else {
-        amountPaid.value = '';
-    }
-});
-
-const handleProofFileChange = (e: Event) => {
-    const target = e.target as HTMLInputElement;
-    if (target.files && target.files.length > 0) {
-        proofOfPaymentFile.value = target.files[0];
-        proofFileName.value = target.files[0].name;
-    } else {
-        proofOfPaymentFile.value = null;
-        proofFileName.value = '';
-    }
-};
-
-const clearProofFile = () => {
-    proofOfPaymentFile.value = null;
-    proofFileName.value = '';
-};
-
-// Mirrors the server rule: payment must cover the full total (compared in cents).
-const isUnderpaid = computed(
-    () => amountPaid.value !== '' && Math.round(Number(amountPaid.value) * 100) < Math.round(cartTotal.value * 100),
-);
-
-const canComplete = computed(() => {
-    return (
-        cart.value.length > 0 &&
-        currentCustomer.value.trim().length > 0 &&
-        paymentReference.value.trim().length > 0 &&
-        amountPaid.value !== '' &&
-        Number(amountPaid.value) > 0 &&
-        !isUnderpaid.value &&
-        Boolean(paymentDate.value) &&
-        !isSubmitting.value
-    );
-});
-
 // Action Confirmation Modal State
 interface ConfirmActionOptions {
     title: string;
@@ -281,6 +228,7 @@ interface ConfirmActionOptions {
 }
 
 const showConfirmModal = ref(false);
+const confirmDeleteInput = ref('');
 const confirmOptions = ref<ConfirmActionOptions>({
     title: 'Confirm Action',
     description: 'Are you sure you want to proceed?',
@@ -291,6 +239,7 @@ const confirmOptions = ref<ConfirmActionOptions>({
 });
 
 const openConfirmModal = (options: ConfirmActionOptions) => {
+    confirmDeleteInput.value = '';
     confirmOptions.value = {
         confirmText: 'Confirm & Record',
         variant: 'brand',
@@ -300,88 +249,39 @@ const openConfirmModal = (options: ConfirmActionOptions) => {
 };
 
 const handleConfirmedAction = () => {
+    if (confirmOptions.value.variant === 'danger' && confirmDeleteInput.value !== 'YES') {
+        return;
+    }
     showConfirmModal.value = false;
     confirmOptions.value.action();
-};
-
-const promptCompleteTransaction = () => {
-    if (!canComplete.value) return;
-
-    const itemCount = cart.value.reduce((s, i) => s + i.qty, 0);
-
-    openConfirmModal({
-        title: 'Confirm Counter Sale',
-        description: `Are you sure you want to finalize and record this sale for "${currentCustomer.value.trim()}"?`,
-        details: [
-            { label: 'Customer Name', value: currentCustomer.value.trim() },
-            { label: 'Payment Method', value: paymentMethod.value },
-            { label: 'Payment Reference', value: paymentReference.value.trim() },
-            { label: 'Amount Paid', value: formatCurrency(Number(amountPaid.value)) },
-            { label: 'Payment Date', value: paymentDate.value },
-            { label: 'Proof of Payment', value: proofFileName.value ? proofFileName.value : 'None attached' },
-            { label: 'Items in Order', value: `${cart.value.length} distinct items (${itemCount} units)` },
-            { label: 'Total Amount', value: formatCurrency(cartTotal.value) },
-        ],
-        confirmText: 'Complete Sale',
-        action: completeTransaction,
-    });
-};
-
-const isSubmitting = ref(false);
-const completeTransaction = () => {
-    if (!canComplete.value) return;
-
-    isSubmitting.value = true;
-    router.post(
-        `/${teamSlug.value}/sales`,
-        {
-            customer: currentCustomer.value.trim(),
-            payment_method: paymentMethod.value,
-            payment_reference: paymentReference.value.trim(),
-            amount_paid: Number(amountPaid.value),
-            payment_date: paymentDate.value,
-            notes: notes.value || undefined,
-            proof_of_payment: proofOfPaymentFile.value || undefined,
-            items: cart.value.map(item => ({
-                product_id: item.product_id,
-                qty: item.qty,
-            })),
-        },
-        {
-            preserveScroll: true,
-            forceFormData: true,
-            onSuccess: () => {
-                isSubmitting.value = false;
-                closePosModal();
-            },
-            onError: () => {
-                isSubmitting.value = false;
-            },
-        }
-    );
 };
 
 const saleToDelete = ref<Sale | null>(null);
 
 const promptDeleteSale = (sale: Sale) => {
     saleToDelete.value = sale;
+    const isCompleted = sale.status === 'completed';
     openConfirmModal({
-        title: 'Archive Cancelled Order',
-        description: `Archive cancelled order "${sale.order_number}" for ${sale.client_name}? Its stock was already handled when it was cancelled; it can be restored from the Recycle Bin.`,
+        title: isCompleted ? 'Move Sale Transaction to Recycle Bin' : 'Archive Cancelled Order',
+        description: isCompleted
+            ? `Move completed order "${sale.order_number}" for ${sale.client_name} to the Recycle Bin? Its items will be returned to stock while archived, and an Admin can restore or permanently delete it from the Recycle Bin. Unrelated active sessions and trusted devices are not affected.`
+            : `Archive cancelled order "${sale.order_number}" for ${sale.client_name}? Its stock was already handled when it was cancelled; it can be restored or permanently deleted from the Recycle Bin. Unrelated active sessions and trusted devices are not affected.`,
         details: [
             { label: 'Order #', value: sale.order_number },
             { label: 'Customer', value: sale.client_name },
             { label: 'Grand Total', value: formatCurrency(Number(sale.grand_total)) },
         ],
-        confirmText: 'Archive Order',
+        confirmText: 'Move to Recycle Bin',
         variant: 'danger',
         action: () => deleteSale(sale),
     });
 };
 
 const deleteSale = (sale: Sale) => {
+    if (confirmDeleteInput.value !== 'YES') return;
     isSubmitting.value = true;
     router.delete(`/${teamSlug.value}/sales/${sale.id}`, {
+        data: { confirmation: confirmDeleteInput.value },
         preserveScroll: true,
         onFinish: () => {
             isSubmitting.value = false;
@@ -397,14 +297,14 @@ const deleteSale = (sale: Sale) => {
 
     <div class="workspace-page">
         <!-- Header -->
-        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
+        <div class="page-header">
             <div>
                 <h1 class="page-title">Sales Orders</h1>
-                <p class="page-subtitle">Orders from accepted quotations and counter sales: payments, invoices and delivery in one place.</p>
+                <p class="page-subtitle">Orders from accepted quotations: payments, invoices and delivery in one place.</p>
             </div>
-            <SpecularButton variant="brand" size="md" :radius="12" @click="openPosModal" class="w-full sm:w-auto">
+            <SpecularButton variant="brand" size="md" :radius="12" @click="openOrderModal" class="w-full sm:w-auto">
                 <Plus class="w-4 h-4" />
-                Counter Sale
+                New Sales Order
             </SpecularButton>
         </div>
 
@@ -476,7 +376,7 @@ const deleteSale = (sale: Sale) => {
                     <tbody class="divide-y divide-gray-100">
                         <tr v-if="!sales.data.length">
                             <td colspan="8" class="py-10 text-center text-gray-500">
-                                No orders match. Orders are created from accepted quotations, or with Counter Sale.
+                                No orders match. Create one from an accepted quotation with New Sales Order.
                             </td>
                         </tr>
                         <tr v-for="sale in sales.data" :key="sale.id">
@@ -507,7 +407,7 @@ const deleteSale = (sale: Sale) => {
                             <td class="whitespace-nowrap text-right">
                                 <div class="inline-flex items-center gap-1.5">
                                     <a :href="`/${teamSlug}/sales/${sale.id}`" class="secondary-button min-h-8 px-3 text-xs">Open</a>
-                                    <button v-if="canDelete && sale.status === 'cancelled'" type="button" title="Archive cancelled order"
+                                    <button v-if="canDelete && ['cancelled', 'completed'].includes(sale.status)" type="button" title="Move to Recycle Bin"
                                             class="rounded-lg p-1.5 text-gray-400 hover:bg-rose-50 hover:text-rose-600" @click="promptDeleteSale(sale)">
                                         <Trash2 class="size-4" />
                                     </button>
@@ -537,308 +437,140 @@ const deleteSale = (sale: Sale) => {
                 </div>
             </div>
         </div>
-        <!-- POS Modal -->
-        <div v-if="posModalOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-            <div class="bg-white border border-gray-200 rounded-xl shadow-xl w-full max-w-6xl flex flex-col md:flex-row h-[90vh] overflow-hidden">
-                
-                <!-- Left: Catalog -->
-                <div class="w-full md:w-7/12 border-r border-gray-200 flex flex-col h-full overflow-hidden">
-                    <div class="p-4 border-b border-gray-200 bg-gray-50 shrink-0">
-                        <h2 class="text-lg font-semibold text-gray-900 mb-2">Select Products</h2>
-                        <div class="relative">
-                            <Search class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-                            <input
-                                v-model="productSearch"
-                                type="text"
-                                placeholder="Search by name, SKU or category..."
-                                class="w-full pl-9 pr-3 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 focus:border-gray-400 focus:outline-none"
-                            />
-                        </div>
+        <!-- New Sales Order (from an accepted quotation) -->
+        <div v-if="orderModalOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" @click.self="closeOrderModal">
+            <form class="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-gray-200 bg-white shadow-xl" role="dialog" aria-modal="true" aria-labelledby="so-title" novalidate @submit.prevent="createSalesOrder">
+                <div class="flex items-start justify-between gap-3 border-b border-gray-100 px-6 py-4">
+                    <div>
+                        <h2 id="so-title" class="text-lg font-semibold text-gray-900">New Sales Order</h2>
+                        <p class="text-xs text-gray-500">From a quotation the customer accepted. Products, quantities and agreed prices are taken from it as they are.</p>
                     </div>
-                    
-                    <div class="p-4 flex-1 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 auto-rows-max">
-                        <div
-                            v-for="p in filteredProducts"
-                            :key="p.id"
-                            @click="addToCart(p)"
-                            class="bg-white border border-gray-200 hover:border-[#F8B803] rounded-xl p-3.5 cursor-pointer transition-colors flex flex-col justify-between h-32 group"
-                        >
-                            <div>
-                                <span class="text-xs text-gray-400 font-mono block">{{ p.sku }}</span>
-                                <h4 class="text-gray-900 font-semibold text-sm leading-snug line-clamp-2 mt-0.5 group-hover:text-[#F8B803] transition-colors">{{ p.name }}</h4>
-                            </div>
-                            <div class="flex justify-between items-baseline pt-2 border-t border-gray-50">
-                                <span class="text-xs text-gray-500">Stock: <strong class="text-gray-700">{{ p.stock }}</strong></span>
-                                <span class="text-[#F8B803] font-semibold text-sm">{{ formatCurrency(Number(p.price)) }}</span>
-                            </div>
-                        </div>
-                    </div>
+                    <button type="button" class="text-xl font-semibold text-gray-400 hover:text-gray-600" aria-label="Close" @click="closeOrderModal">&times;</button>
                 </div>
 
-                <!-- Right: Cart & Checkout -->
-                <div class="w-full md:w-5/12 flex flex-col bg-gray-50 h-full overflow-hidden">
-                    <div class="p-3.5 border-b border-gray-200 bg-white flex justify-between items-center shrink-0">
-                        <div class="flex items-center gap-2">
-                            <ShoppingCart class="w-5 h-5 text-gray-700" />
-                            <h2 class="text-base font-semibold text-gray-900">Current Order</h2>
-                        </div>
-                        <button @click="closePosModal" class="text-gray-400 hover:text-gray-600 text-xl font-semibold">&times;</button>
+                <div class="flex-1 space-y-4 overflow-y-auto px-6 py-4">
+                    <div v-if="!(quotations ?? []).length" class="rounded-xl border border-dashed border-gray-200 px-4 py-6 text-center text-sm text-gray-500">
+                        No accepted quotations are waiting for a Sales Order. Record the customer's acceptance in Quotations first.
                     </div>
-
-                    <!-- Scrollable Form & Cart Section -->
-                    <div class="flex-1 overflow-y-auto p-4 space-y-3.5">
-                        <!-- Customer Name Input -->
-                        <div class="relative">
-                            <input
-                                id="pos_customer"
-                                v-model="currentCustomer"
-                                type="text"
-                                placeholder=" "
-                                class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm font-medium"
-                                required
-                            />
-                            <label
-                                for="pos_customer"
-                                class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                :class="currentCustomer ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''"
-                            >
-                                Customer Name
-                            </label>
+                    <template v-else>
+                        <!-- Search (long lists only) -->
+                        <div v-if="showQuotationSearch" class="relative">
+                            <Search class="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                            <input id="so-quotation-search" v-model="quotationSearch" type="search" placeholder="Search quotation number or customer" aria-label="Search quotations" class="field-control w-full pl-9" />
                         </div>
 
-                        <!-- Select payment method -->
+                        <!-- Select Quotation (floating label) -->
                         <div>
-                            <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                                Select payment method
-                            </label>
-                            <div class="grid grid-cols-2 gap-2">
-                                <button
-                                    type="button"
-                                    @click="paymentMethod = 'Bank Transfer'"
-                                    :class="[
-                                        'flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl border text-xs font-semibold transition-colors cursor-pointer',
-                                        paymentMethod === 'Bank Transfer'
-                                            ? 'border-[#4b5320] bg-[#4b5320] text-white ring-2 ring-[#4b5320]/20'
-                                            : 'border-gray-200 bg-white text-gray-700 hover:border-gray-300 hover:bg-gray-50'
-                                    ]"
-                                >
-                                    <Building2 class="w-4 h-4 shrink-0" />
-                                    <span>Bank Transfer</span>
-                                </button>
-
-                                <button
-                                    type="button"
-                                    @click="paymentMethod = 'GCash'"
-                                    :class="[
-                                        'flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl border text-xs font-semibold transition-colors cursor-pointer',
-                                        paymentMethod === 'GCash'
-                                            ? 'border-[#007DFE] bg-[#007DFE] text-white ring-2 ring-[#007DFE]/20'
-                                            : 'border-gray-200 bg-white text-gray-700 hover:border-gray-300 hover:bg-gray-50'
-                                    ]"
-                                >
-                                    <Smartphone class="w-4 h-4 shrink-0" />
-                                    <span>GCash</span>
-                                </button>
-                            </div>
-                        </div>
-
-                        <!-- Enter payment details -->
-                        <div class="rounded-xl border border-gray-200 bg-white p-3.5 space-y-3">
-                            <div class="flex items-center justify-between border-b border-gray-100 pb-2">
-                                <span class="text-xs font-semibold text-gray-900 flex items-center gap-1.5">
-                                    <Receipt class="w-3.5 h-3.5 text-[#4b5320]" />
-                                    Enter payment details
-                                </span>
-                                <span class="text-[11px] font-semibold text-gray-500 bg-gray-100 px-2 py-0.5 rounded-md">
-                                    {{ paymentMethod }}
-                                </span>
-                            </div>
-
-                            <!-- Payment reference number -->
                             <div class="relative">
-                                <input
-                                    id="pos_ref"
-                                    v-model="paymentReference"
-                                    type="text"
-                                    placeholder=" "
-                                    class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none font-mono sm:text-sm"
-                                    required
-                                />
-                                <label
-                                    for="pos_ref"
-                                    class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                    :class="paymentReference ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''"
-                                >
-                                    Payment reference number
-                                </label>
+                                <select id="so-quotation" v-model="selectedQuotationId" required
+                                        :class="['peer block w-full rounded-xl border bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm', quotationError ? 'border-rose-400' : 'border-gray-200', selectedQuotationId === null && !quotationFocus ? 'text-transparent' : '']"
+                                        :aria-invalid="!!quotationError" :aria-describedby="quotationError ? 'so-quotation-error' : undefined"
+                                        @focus="quotationFocus = true" @blur="quotationFocus = false">
+                                    <option :value="null" disabled>Select Quotation</option>
+                                    <option v-for="q in quotationChoices" :key="q.id" :value="q.id" class="text-gray-900">{{ q.quotation_number }} — {{ q.client_name }}</option>
+                                </select>
+                                <label for="so-quotation"
+                                       :class="['pointer-events-none absolute top-3.5 left-3.5 origin-[0] transform text-xs font-semibold duration-200 sm:text-sm', selectedQuotationId !== null || quotationFocus ? '-translate-y-2.5 scale-75 text-[#4b5320]' : 'text-gray-500']">Select Quotation</label>
                             </div>
+                            <p v-if="quotationError" id="so-quotation-error" class="mt-1 text-xs text-rose-600">{{ quotationError }}</p>
+                            <p v-else-if="showQuotationSearch && quotationSearch && !quotationChoices.length" class="mt-1 text-xs text-gray-500">No accepted quotation matches "{{ quotationSearch }}".</p>
+                        </div>
 
-                            <!-- Amount paid & Payment date -->
-                            <div class="grid grid-cols-2 gap-2">
-                                <div>
-                                    <label for="pos_amount" class="block text-xs font-semibold text-gray-700 mb-1">
-                                        Amount paid (USD)
+                        <!-- Auto-filled, read-only -->
+                        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                            <div class="relative">
+                                <input id="so-customer" :value="selectedQuotation?.client_name ?? ''" type="text" readonly tabindex="-1" placeholder=" "
+                                       class="peer block w-full cursor-default rounded-xl border border-gray-200 bg-gray-50 px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:outline-none sm:text-sm" />
+                                <label for="so-customer" :class="['pointer-events-none absolute top-3.5 left-3.5 origin-[0] transform text-xs font-semibold duration-200 sm:text-sm', selectedQuotation ? '-translate-y-2.5 scale-75 text-[#4b5320]' : 'text-gray-500']">Customer Name</label>
+                            </div>
+                            <div class="relative">
+                                <input id="so-quotation-number" :value="selectedQuotation?.quotation_number ?? ''" type="text" readonly tabindex="-1" placeholder=" "
+                                       class="peer block w-full cursor-default rounded-xl border border-gray-200 bg-gray-50 px-3.5 pt-5 pb-2 font-mono text-xs text-gray-900 focus:outline-none sm:text-sm" />
+                                <label for="so-quotation-number" :class="['pointer-events-none absolute top-3.5 left-3.5 origin-[0] transform text-xs font-semibold duration-200 sm:text-sm', selectedQuotation ? '-translate-y-2.5 scale-75 text-[#4b5320]' : 'text-gray-500']">Quotation Number</label>
+                            </div>
+                        </div>
+
+                        <!-- Sales Order Summary -->
+                        <section aria-labelledby="so-summary-title">
+                            <h3 id="so-summary-title" class="mb-2 text-sm font-semibold text-gray-900">Sales Order Summary</h3>
+                            <div class="overflow-x-auto rounded-xl border border-gray-200">
+                                <table class="w-full text-left text-sm">
+                                    <thead class="bg-gray-50 text-xs text-gray-600">
+                                        <tr>
+                                            <th scope="col" class="px-3 py-2 font-semibold">Product Description</th>
+                                            <th scope="col" class="px-3 py-2 text-right font-semibold whitespace-nowrap">QTY Ordered</th>
+                                            <th scope="col" class="px-3 py-2 font-semibold">Unit</th>
+                                            <th scope="col" class="px-3 py-2 text-right font-semibold whitespace-nowrap">Unit Price</th>
+                                            <th scope="col" class="px-3 py-2 text-right font-semibold">Amount</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-gray-100">
+                                        <tr v-if="!selectedQuotation">
+                                            <td colspan="5" class="px-3 py-6 text-center text-xs text-gray-400">Select a quotation to see its products.</td>
+                                        </tr>
+                                        <tr v-for="line in selectedQuotation?.items ?? []" :key="line.id">
+                                            <td class="px-3 py-2">
+                                                <div class="text-gray-900">{{ line.description }}</div>
+                                                <div v-if="line.sku" class="font-mono text-[11px] text-gray-500">{{ line.sku }}</div>
+                                            </td>
+                                            <td class="px-3 py-2 text-right font-mono">{{ line.quantity }}</td>
+                                            <td class="px-3 py-2 text-gray-700">{{ line.unit || '—' }}</td>
+                                            <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{{ formatCurrency(line.unit_price) }}</td>
+                                            <td class="px-3 py-2 text-right font-mono whitespace-nowrap">{{ formatCurrency(line.amount) }}</td>
+                                        </tr>
+                                    </tbody>
+                                    <tfoot v-if="selectedQuotation" class="border-t border-gray-200 text-sm">
+                                        <tr v-if="selectedQuotation.discount > 0 || selectedQuotation.tax_amount > 0">
+                                            <td colspan="4" class="px-3 pt-2 text-right text-xs text-gray-500">Subtotal</td>
+                                            <td class="px-3 pt-2 text-right font-mono whitespace-nowrap">{{ formatCurrency(selectedQuotation.subtotal) }}</td>
+                                        </tr>
+                                        <tr v-if="selectedQuotation.discount > 0">
+                                            <td colspan="4" class="px-3 text-right text-xs text-gray-500">Discount</td>
+                                            <td class="px-3 text-right font-mono whitespace-nowrap">-{{ formatCurrency(selectedQuotation.discount) }}</td>
+                                        </tr>
+                                        <tr v-if="selectedQuotation.tax_amount > 0">
+                                            <td colspan="4" class="px-3 text-right text-xs text-gray-500">VAT ({{ selectedQuotation.tax_rate }}%)</td>
+                                            <td class="px-3 text-right font-mono whitespace-nowrap">{{ formatCurrency(selectedQuotation.tax_amount) }}</td>
+                                        </tr>
+                                        <tr>
+                                            <td colspan="4" class="px-3 py-2 text-right font-semibold text-gray-900">Total Amount</td>
+                                            <td id="so-total" class="px-3 py-2 text-right font-mono text-base font-semibold whitespace-nowrap text-gray-900">{{ formatCurrency(selectedQuotation.grand_total) }}</td>
+                                        </tr>
+                                    </tfoot>
+                                </table>
+                            </div>
+                            <p v-if="conversionNote" class="mt-1 text-[11px] text-gray-500">{{ conversionNote }}</p>
+                        </section>
+
+                        <!-- How the order reaches the customer (Outbound Delivery uses it) -->
+                        <div v-if="selectedQuotation" class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                            <fieldset class="sm:col-span-1">
+                                <legend class="field-label">Fulfillment</legend>
+                                <div class="grid grid-cols-2 gap-2 sm:grid-cols-1">
+                                    <label v-for="opt in [{ v: 'delivery', l: 'Delivery' }, { v: 'pickup', l: 'Customer pickup' }]" :key="opt.v"
+                                           :class="fulfillmentType === opt.v ? 'border-[#4b5320] bg-[#4b5320]/5' : 'border-gray-200'"
+                                           class="flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-2 text-sm">
+                                        <input v-model="fulfillmentType" type="radio" name="so-fulfillment" :value="opt.v" class="accent-[#4b5320]" />
+                                        {{ opt.l }}
                                     </label>
-                                    <div class="relative">
-                                        <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 text-xs font-semibold">$</span>
-                                        <input
-                                             id="pos_amount"
-                                            v-model.number="amountPaid"
-                                            type="number"
-                                            step="0.01"
-                                            min="0"
-                                            placeholder="0.00"
-                                            class="block w-full rounded-lg border border-gray-200 bg-white pl-6 pr-2.5 py-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none font-semibold"
-                                            required
-                                        />
-                                    </div>
                                 </div>
-
-                                <div>
-                                    <label for="pos_date" class="block text-xs font-semibold text-gray-700 mb-1">
-                                        Payment date
-                                    </label>
-                                    <input
-                                        id="pos_date"
-                                        v-model="paymentDate"
-                                        type="date"
-                                        class="block w-full rounded-lg border border-gray-200 bg-white px-2.5 py-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none"
-                                        required
-                                    />
-                                </div>
-                            </div>
-
-                            <!-- Proof of Payment -->
-                            <div>
-                                <label class="block text-xs font-semibold text-gray-700 mb-1">
-                                    Proof of Payment
-                                </label>
-                                <div v-if="!proofOfPaymentFile" class="relative">
-                                    <input
-                                        id="pos_proof"
-                                        type="file"
-                                        accept="image/*,application/pdf"
-                                        @change="handleProofFileChange"
-                                        class="sr-only"
-                                    />
-                                    <label
-                                        for="pos_proof"
-                                        class="flex items-center justify-center gap-2 w-full px-3 py-2 border border-dashed border-gray-300 rounded-lg bg-gray-50/50 hover:bg-gray-50 cursor-pointer text-xs text-gray-600 transition-colors"
-                                    >
-                                        <span>Upload receipt / transfer screenshot</span>
-                                    </label>
-                                </div>
-                                <div v-else class="flex items-center justify-between px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-xs">
-                                    <div class="flex items-center gap-2 truncate text-gray-700">
-                                        <FileText class="w-3.5 h-3.5 text-[#4b5320] shrink-0" />
-                                        <span class="truncate font-medium">{{ proofFileName }}</span>
-                                    </div>
-                                    <button
-                                        type="button"
-                                        @click="clearProofFile"
-                                        class="text-gray-400 hover:text-red-500 ml-2 p-0.5 cursor-pointer"
-                                        title="Remove file"
-                                    >
-                                        <X class="w-3.5 h-3.5" />
-                                    </button>
-                                </div>
+                            </fieldset>
+                            <div v-if="fulfillmentType === 'delivery'" class="sm:col-span-2">
+                                <label class="field-label" for="so-address">Delivery address</label>
+                                <textarea id="so-address" v-model="deliveryAddress" rows="3" maxlength="500" class="field-control w-full"></textarea>
                             </div>
                         </div>
 
-                        <!-- Optional Notes -->
-                        <div>
-                            <label for="pos_notes" class="block text-xs font-semibold text-gray-700 mb-1">
-                                Order Notes <span class="text-gray-400 font-normal">(Optional)</span>
-                            </label>
-                            <input
-                                id="pos_notes"
-                                v-model="notes"
-                                type="text"
-                                placeholder="Add any special instructions or remarks..."
-                                class="block w-full rounded-xl border border-gray-200 bg-white px-3.5 py-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none placeholder:text-gray-400"
-                            />
-                        </div>
-
-                        <!-- Cart Items -->
-                        <div class="space-y-2 pt-1">
-                            <div class="flex items-center justify-between">
-                                <span class="text-xs font-semibold text-gray-700">
-                                    Cart Items ({{ cart.length }})
-                                </span>
-                                <span v-if="cart.length > 0" class="text-xs text-gray-500">
-                                    {{ cart.reduce((s, i) => s + i.qty, 0) }} total units
-                                </span>
-                            </div>
-
-                            <div v-if="cart.length === 0" class="text-gray-400 text-center py-6 text-xs bg-white rounded-xl border border-dashed border-gray-200">
-                                <ShoppingCart class="w-6 h-6 mx-auto mb-1 text-gray-300" />
-                                Cart is empty. Click products on the left to add items.
-                            </div>
-
-                            <div
-                                v-for="(item, idx) in cart"
-                                :key="item.product_id"
-                                class="flex justify-between items-center bg-white border border-gray-200 p-2.5 rounded-xl"
-                            >
-                                <div class="flex-1 pr-2">
-                                    <div class="text-xs font-semibold text-gray-900 line-clamp-1">{{ item.name }}</div>
-                                    <div class="text-[11px] text-gray-500">{{ formatCurrency(item.price) }} each</div>
-                                </div>
-                                <div class="flex items-center gap-2">
-                                    <div class="flex items-center border border-gray-200 rounded-lg overflow-hidden bg-white">
-                                        <button @click="updateQty(idx, item.qty - 1)" class="px-2 py-0.5 text-gray-600 hover:bg-gray-100 text-xs font-semibold cursor-pointer">-</button>
-                                        <span class="px-2 text-xs font-semibold text-gray-900">{{ item.qty }}</span>
-                                        <button @click="updateQty(idx, item.qty + 1)" class="px-2 py-0.5 text-gray-600 hover:bg-gray-100 text-xs font-semibold cursor-pointer">+</button>
-                                    </div>
-                                    <span class="text-xs font-semibold text-gray-900 w-16 text-right">
-                                        {{ formatCurrency(item.price * item.qty) }}
-                                    </span>
-                                    <button @click="removeFromCart(idx)" class="text-gray-400 hover:text-red-500 ml-1 cursor-pointer">
-                                        <X class="w-3.5 h-3.5" />
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Total & Checkout Footer -->
-                    <div class="p-4 bg-white border-t border-gray-200 shrink-0">
-                        <div class="flex justify-between text-gray-500 text-xs mb-1">
-                            <span>Subtotal</span>
-                            <span>{{ formatCurrency(cartTotal) }}</span>
-                        </div>
-                        <div class="flex justify-between text-gray-500 text-xs mb-2.5">
-                            <span>Payment Method</span>
-                            <span class="font-semibold text-gray-800">{{ paymentMethod }}</span>
-                        </div>
-                        <div class="flex justify-between items-baseline text-gray-900 text-lg font-semibold mb-3">
-                            <span>Total</span>
-                            <span class="text-[#F8B803] text-2xl">{{ formatCurrency(cartTotal) }}</span>
-                        </div>
-                        
-                        <div v-if="!canComplete && cart.length > 0" class="mb-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1">
-                            <span v-if="!currentCustomer.trim()">Enter Customer Name to proceed.</span>
-                            <span v-else-if="!paymentReference.trim()">Enter Payment Reference Number.</span>
-                            <span v-else-if="!amountPaid || Number(amountPaid) <= 0">Enter valid Amount Paid.</span>
-                            <span v-else-if="isUnderpaid">Amount Paid is less than the total due ({{ formatCurrency(cartTotal) }}).</span>
-                        </div>
-
-                        <SpecularButton
-                            variant="brand"
-                            size="lg"
-                            :radius="10"
-                            class="w-full"
-                            :disabled="!canComplete || isSubmitting"
-                            @click="promptCompleteTransaction"
-                        >
-                            {{ isSubmitting ? 'Recording...' : 'Record Counter Sale' }}
-                        </SpecularButton>
-                    </div>
+                        <p class="text-xs text-gray-500">The order starts as Pending payment. Record the customer's payment on the order page; stock is reserved when the order is confirmed and taken out by Outbound Delivery.</p>
+                    </template>
                 </div>
 
-            </div>
+                <div class="flex flex-col-reverse gap-2 border-t border-gray-100 bg-gray-50/50 px-6 py-3 sm:flex-row sm:justify-end">
+                    <button type="button" class="secondary-button" @click="closeOrderModal">Cancel</button>
+                    <button type="submit" class="brand-button" :disabled="isSubmitting || !(quotations ?? []).length">{{ isSubmitting ? 'Creating…' : 'Create Sales Order' }}</button>
+                </div>
+            </form>
         </div>
-
     </div>
 
     <!-- Action Confirmation Modal -->
@@ -867,6 +599,19 @@ const deleteSale = (sale: Sale) => {
                 </div>
             </div>
 
+            <div v-if="confirmOptions.variant === 'danger'" class="mt-4 mb-6">
+                <label class="block text-xs font-semibold text-gray-700 mb-1.5">
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm deletion:
+                </label>
+                <input
+                    v-model="confirmDeleteInput"
+                    type="text"
+                    placeholder="Type YES here"
+                    class="w-full px-3 py-2 text-sm font-mono rounded-xl border border-gray-300 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                    @keyup.enter="confirmDeleteInput === 'YES' && handleConfirmedAction()"
+                />
+            </div>
+
             <div class="flex justify-end gap-3">
                 <SpecularButton
                     type="button"
@@ -883,7 +628,7 @@ const deleteSale = (sale: Sale) => {
                     size="md"
                     :radius="10"
                     @click="handleConfirmedAction"
-                    :disabled="isSubmitting"
+                    :disabled="isSubmitting || (confirmOptions.variant === 'danger' && confirmDeleteInput !== 'YES')"
                 >
                     <Trash2 v-if="confirmOptions.variant === 'danger'" class="w-4 h-4 mr-1.5 inline" />
                     <Check v-else class="w-4 h-4 mr-1.5 inline" />

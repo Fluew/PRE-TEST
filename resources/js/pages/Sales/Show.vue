@@ -141,7 +141,7 @@ const props = defineProps<{
         } | null;
     };
     deliveryStatusLabel?: string | null;
-    notifications: { id: number; category: string; type: string; recipient?: string | null; subject?: string | null; status: string; attempts: number; error?: string | null; sent_at?: string | null; created_at: string }[];
+    notifications: { id: number; category: string; type: string; notifiable_type?: string; notifiable_id?: number; recipient?: string | null; subject?: string | null; status: string; attempts: number; error?: string | null; sent_at?: string | null; created_at: string }[];
     activity: { id: number; event: string; description: string; user_email?: string | null; outcome: string; created_at: string }[];
     paymentMethods: string[];
     can: { verify: boolean; admin: boolean };
@@ -237,6 +237,20 @@ const termsForm = ref({ payment_terms: props.sale.payment_terms, required_down_p
 const submitTerms = () => post(`${base.value}/terms`, termsForm.value, () => (showTerms.value = false));
 
 const retryEmail = (id: number) => post(`${base.value}/notifications/${id}/retry`);
+
+// "Send Commercial Invoice": manual, available once the order is confirmed. Each invoice shows
+// when it was last emailed (from the email log); a second send is an explicit Resend.
+const canSendInvoice = computed(() => props.can.verify && ['confirmed', 'processing', 'completed'].includes(props.sale.status) && !!props.sale.email);
+const invoiceEmails = (inv: Invoice) => props.notifications.filter((n) => n.notifiable_type === 'SalesInvoice' && n.notifiable_id === inv.id && n.type === 'invoice_issued');
+const lastInvoiceSend = (inv: Invoice) => invoiceEmails(inv).find((n) => n.status === 'sent') ?? null;
+const invoiceSending = (inv: Invoice) => invoiceEmails(inv)[0]?.status === 'pending';
+const invoiceSendFailed = (inv: Invoice) => invoiceEmails(inv)[0]?.status === 'failed';
+const sendingInvoice = ref<{ invoice: Invoice; resend: boolean } | null>(null);
+const confirmSendInvoice = () => {
+    if (!sendingInvoice.value) return;
+    const { invoice, resend } = sendingInvoice.value;
+    post(`${base.value}/invoices/${invoice.id}/send`, { resend }, () => (sendingInvoice.value = null));
+};
 </script>
 
 <template>
@@ -405,11 +419,26 @@ const retryEmail = (id: number) => post(`${base.value}/notifications/${id}/retry
                         <div>
                             <a :href="inv.pdf_url" target="_blank" class="inline-flex items-center gap-1 font-mono font-medium text-gray-900 hover:underline"><FileText class="size-4" /> {{ inv.invoice_number }}</a>
                             <div class="text-xs text-gray-500">{{ fmtDate(inv.issued_at) }} · {{ formatMoney(inv.grand_total) }}<template v-if="inv.status === 'cancelled'"> · cancelled: {{ inv.cancellation_reason }}</template></div>
+                            <div v-if="inv.status === 'issued'" class="mt-0.5 text-xs">
+                                <span v-if="invoiceSending(inv)" class="text-amber-700">Sending…</span>
+                                <span v-else-if="lastInvoiceSend(inv)" class="text-emerald-700">Emailed {{ fmtDateTime(lastInvoiceSend(inv)!.sent_at) }} to {{ lastInvoiceSend(inv)!.recipient }}</span>
+                                <span v-else class="text-gray-500">Not emailed to the customer yet</span>
+                                <span v-if="invoiceSendFailed(inv)" class="text-rose-600"> · last attempt failed</span>
+                            </div>
                         </div>
-                        <div class="flex items-center gap-2">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <StatusBadge v-if="inv.status === 'issued' && lastInvoiceSend(inv)" status="Sent" />
                             <StatusBadge :status="inv.status === 'issued' ? 'Issued' : 'Cancelled'" />
+                            <template v-if="canSendInvoice && inv.status === 'issued'">
+                                <button v-if="!lastInvoiceSend(inv)" type="button" class="brand-button" :disabled="busy || invoiceSending(inv)" @click="sendingInvoice = { invoice: inv, resend: false }">
+                                    Send Commercial Invoice
+                                </button>
+                                <button v-else type="button" class="secondary-button" :disabled="busy || invoiceSending(inv)" @click="sendingInvoice = { invoice: inv, resend: true }">
+                                    Resend
+                                </button>
+                            </template>
                             <button v-if="can.admin && inv.status === 'issued'" type="button" class="text-xs font-medium text-rose-600 hover:underline"
-                                    @click="ask({ title: `Cancel invoice ${inv.invoice_number}`, help: 'Issued invoices are never edited. Cancel it with a reason; a corrected replacement can be issued and emailed.', confirm: 'Cancel invoice', danger: true, url: `${base}/invoices/${inv.id}/cancel`, reissue: true })">Cancel</button>
+                                    @click="ask({ title: `Cancel invoice ${inv.invoice_number}`, help: 'Issued invoices are never edited. Cancel it with a reason; a corrected replacement can be issued, then sent with Send Commercial Invoice.', confirm: 'Cancel invoice', danger: true, url: `${base}/invoices/${inv.id}/cancel`, reissue: true })">Cancel</button>
                         </div>
                     </li>
                 </ul>
@@ -604,7 +633,7 @@ const retryEmail = (id: number) => post(`${base.value}/notifications/${id}/retry
             <label class="field-label mt-4" for="reason">Reason</label>
             <textarea id="reason" v-model="reason" rows="3" maxlength="500" required class="field-control"></textarea>
             <label v-if="reasonPrompt.reissue" class="mt-3 flex items-center gap-2 text-sm text-gray-700">
-                <input v-model="reissue" type="checkbox" class="accent-[#4b5320]" /> Issue a corrected replacement and email it
+                <input v-model="reissue" type="checkbox" class="accent-[#4b5320]" /> Issue a corrected replacement (send it afterwards with Send Commercial Invoice)
             </label>
             <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
                 <button type="button" class="secondary-button" @click="reasonPrompt = null">Back</button>
@@ -612,6 +641,23 @@ const retryEmail = (id: number) => post(`${base.value}/notifications/${id}/retry
                         :class="reasonPrompt.danger ? 'inline-flex min-h-10 items-center justify-center rounded-xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white hover:bg-rose-700 disabled:opacity-50' : 'brand-button'">
                     {{ reasonPrompt.confirm }}
                 </button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Send / resend the commercial invoice -->
+    <div v-if="sendingInvoice" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" @keydown.esc="sendingInvoice = null">
+        <form class="w-full max-w-md rounded-xl border border-gray-200 bg-white p-6 shadow-xl" role="dialog" aria-modal="true" aria-labelledby="send-invoice-title" @submit.prevent="confirmSendInvoice">
+            <h3 id="send-invoice-title" class="text-lg font-semibold text-gray-900">
+                {{ sendingInvoice.resend ? 'Resend' : 'Send' }} commercial invoice {{ sendingInvoice.invoice.invoice_number }}
+            </h3>
+            <p class="mt-1 text-sm text-gray-600">
+                The invoice PDF is emailed to <strong class="text-gray-900">{{ sale.email }}</strong>.
+                <template v-if="sendingInvoice.resend"> It was already emailed {{ fmtDateTime(lastInvoiceSend(sendingInvoice.invoice)?.sent_at) }}; the customer receives it again.</template>
+            </p>
+            <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
+                <button type="button" class="secondary-button" @click="sendingInvoice = null">Back</button>
+                <button type="submit" class="brand-button" :disabled="busy">{{ busy ? 'Sending…' : sendingInvoice.resend ? 'Send again' : 'Send invoice' }}</button>
             </div>
         </form>
     </div>

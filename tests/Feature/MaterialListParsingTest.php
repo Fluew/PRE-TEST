@@ -1,7 +1,10 @@
 <?php
 
+use App\Enums\TeamRole;
 use App\Models\Product;
+use App\Models\Quotation;
 use App\Models\Team;
+use App\Models\User;
 use App\Services\MaterialList\ExtractionException;
 use App\Services\MaterialList\FileReader;
 use App\Services\MaterialList\HeaderMapper;
@@ -284,4 +287,59 @@ it('removes page numbers and running headers but keeps real lines', function () 
     ]);
 
     expect($lines)->toBe(['5 rolls THHN 3.5mm', '2 pcs Panel board 12-way']);
+});
+
+it('allows staff to manually correct OCR mistakes in the material list preview before creating the quotation', function () {
+    $admin = User::factory()->create([
+        'role' => 'admin',
+        'current_team_id' => $this->team->id,
+        'password_changed_at' => now(),
+    ]);
+    $this->team->members()->attach($admin, ['role' => TeamRole::Owner->value]);
+    $cookies = createTrustedDeviceFor($admin)['cookies'];
+
+    $csv = csvFile("Item Description,Qty,Unit\nCircuit Breaker BRK-60A-SCH,abc,pcs\n");
+
+    // 1. Preview shows 0 valid items and 1 invalid item because Qty is "abc"
+    $preview = $this->actingAs($admin)->withCookies($cookies)
+        ->post("/{$this->team->slug}/quotations/import-materials", [
+            'file' => $csv,
+            'client_name' => 'BuildCorp Solutions',
+            'execute' => false,
+        ], ['Accept' => 'application/json']);
+
+    // Since all items are invalid on raw read, the controller returns 422 unless valid items exist;
+    // now test with 1 valid + 1 OCR-misread item that the user corrects before executing:
+    $csv2 = csvFile("Item Description,Qty,Unit\nTHHN Wire 3.5mm,2,roll\nCircuit Breaker BRK-60A-SCH,abc,pcs\n");
+    $preview2 = $this->actingAs($admin)->withCookies($cookies)
+        ->post("/{$this->team->slug}/quotations/import-materials", [
+            'file' => $csv2,
+            'client_name' => 'BuildCorp Solutions',
+            'execute' => false,
+        ], ['Accept' => 'application/json'])
+        ->assertOk()
+        ->json();
+
+    expect($preview2['valid_count'])->toBe(1)
+        ->and($preview2['invalid_count'])->toBe(1);
+
+    // 2. Staff corrects the second row's quantity from null ("abc") to 6 in the preview and submits execute=1
+    $correctedItems = [
+        ['description' => 'THHN Wire THHN-35', 'quantity' => 2, 'unit' => 'roll', 'brand' => 'Phelps Dodge', 'skip' => false],
+        ['description' => 'Circuit Breaker BRK-60A-SCH', 'quantity' => 6, 'unit' => 'pcs', 'brand' => 'Schneider', 'skip' => false],
+    ];
+
+    $this->actingAs($admin)->withCookies($cookies)
+        ->post("/{$this->team->slug}/quotations/import-materials", [
+            'file' => csvFile("Item Description,Qty,Unit\nTHHN Wire 3.5mm,2,roll\nCircuit Breaker BRK-60A-SCH,abc,pcs\n"),
+            'client_name' => 'BuildCorp Solutions',
+            'execute' => true,
+            'items' => json_encode($correctedItems),
+        ])
+        ->assertRedirect();
+
+    $quotation = Quotation::where('team_id', $this->team->id)->where('client_name', 'BuildCorp Solutions')->sole();
+    expect($quotation->items)->toHaveCount(2)
+        ->and($quotation->items->pluck('quantity')->all())->toEqual([2, 6])
+        ->and($quotation->items->pluck('sku')->all())->toContain('BRK-60A-SCH', 'THHN-35');
 });

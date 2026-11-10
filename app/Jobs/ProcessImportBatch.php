@@ -3,18 +3,23 @@
 namespace App\Jobs;
 
 use App\Models\ImportBatch;
+use App\Services\Import\ImportFailure;
 use App\Services\Import\ImportService;
 use App\Services\MaterialList\ExtractionException;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Queue\Jobs\SyncJob;
+use Illuminate\Queue\TimeoutExceededException;
+use RuntimeException;
 use Throwable;
 
 /**
  * Reads one uploaded document into preview rows (OCR can take minutes for long scans).
  * A problem with the file itself (unsupported, damaged, password-protected, no text) fails at
  * once with a message for staff. Other errors are retried; after the last attempt the batch is
- * marked failed. Each attempt replaces the rows of the previous one, so retries never duplicate.
+ * marked failed with a plain message (never the raw error). Each attempt replaces the rows of
+ * the previous one, so retries never duplicate.
  */
 class ProcessImportBatch implements ShouldBeUnique, ShouldQueue
 {
@@ -49,15 +54,36 @@ class ProcessImportBatch implements ShouldBeUnique, ShouldQueue
             $imports->process($batch);
         } catch (ExtractionException $e) {
             // The file cannot be read as it is; trying again would give the same result.
-            $imports->markFailed($batch, $e->getMessage());
+            $imports->markFailed($batch, $e->getMessage(), ImportFailure::READING, $e);
         }
     }
 
     public function failed(?Throwable $e): void
     {
-        $batch = ImportBatch::find($this->batchId);
-        if ($batch && $batch->status !== ImportBatch::COMPLETED) {
-            app(ImportService::class)->markFailed($batch, 'Processing failed after '.$this->tries.' attempts. Try uploading the file again. ('.mb_substr((string) $e?->getMessage(), 0, 300).')');
+        try {
+            $batch = ImportBatch::find($this->batchId);
+        } catch (Throwable $dbError) {
+            report($dbError);
+
+            return;
         }
+        if (! $batch || in_array($batch->status, [ImportBatch::READY, ImportBatch::IMPORTING, ImportBatch::COMPLETED, ImportBatch::CANCELLED], true)) {
+            return;
+        }
+
+        if ($e instanceof TimeoutExceededException) {
+            $failure = new ImportFailure('Reading the file took too long (long scanned documents are read page by page). Nothing was imported. Try a clearer or shorter file, or split the document.', ImportFailure::READING, null, $e);
+        } else {
+            $failure = ImportFailure::fromThrowable($e ?? new RuntimeException('The import job failed.'), ImportFailure::READING, $batch);
+        }
+
+        // A queued run was tried several times; an inline run (SyncJob) only once.
+        $message = $failure->getMessage();
+        if (! $this->job instanceof SyncJob && ! $e instanceof ExtractionException) {
+            $attempts = $this->job ? $this->job->attempts() : $this->tries;
+            $message = "Processing failed after {$attempts} ".($attempts === 1 ? 'attempt' : 'attempts').'. '.$message;
+        }
+
+        app(ImportService::class)->markFailed($batch, $message, $failure->stage, $failure);
     }
 }

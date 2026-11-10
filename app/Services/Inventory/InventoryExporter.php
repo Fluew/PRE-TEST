@@ -122,7 +122,9 @@ class InventoryExporter
         if ((int) ini_get('memory_limit') !== -1 && $this->bytes(ini_get('memory_limit')) < 768 * 1024 * 1024) {
             ini_set('memory_limit', '768M');
         }
-        set_time_limit(180);
+        if (! app()->runningUnitTests()) { // the timer would also limit the rest of a test run
+            set_time_limit(180);
+        }
 
         $tmp = storage_path('app/private/tmp');
         File::ensureDirectoryExists($tmp);

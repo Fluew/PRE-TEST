@@ -28,7 +28,7 @@ class DocumentExtractor
     {
         $reader = $this->reader->forStaffImports();
         $type = $reader->detectType($path, $originalName);
-        $isHeader = fn (array $cells) => ColumnSchema::headerMap($module, array_map('strval', $cells)) !== null;
+        $isHeader = fn (array $cells, bool $words = false) => ColumnSchema::headerMap($module, array_map('strval', $cells), $words) !== null;
 
         try {
             $read = $reader->readTable($path, $type, $isHeader) ?? $reader->read($path, $type);

@@ -36,8 +36,9 @@ class SalesOrderService
     ) {}
 
     /**
-     * Create a Sales Order from an accepted quotation, in one transaction. The quotation is kept
-     * as it was (it only becomes "converted" and links to the order). Stock is checked, not taken.
+     * Create a Sales Order from an accepted quotation, in one transaction. The quotation stays
+     * Accepted and links to the order (converted_to_sale_id), so a second order can never be made
+     * from it (also enforced by the database). Stock is checked, not taken.
      *
      * @param  array{fulfillment_type?: string, address?: ?string, delivery_instructions?: ?string}  $options
      * @return array{0: Sale, 1: list<string>} the order and stock warnings
@@ -47,7 +48,7 @@ class SalesOrderService
         return DB::transaction(function () use ($quotation, $user, $options) {
             $quotation = Quotation::with('items')->whereKey($quotation->id)->lockForUpdate()->firstOrFail();
 
-            if ($quotation->converted_to_sale_id || $quotation->status === QuotationStatus::Converted) {
+            if ($quotation->converted_to_sale_id || Sale::withTrashed()->where('quotation_id', $quotation->id)->exists()) {
                 throw new WorkflowException('This quotation was already converted to a Sales Order.');
             }
             if ($quotation->status !== QuotationStatus::Accepted) {
@@ -110,7 +111,6 @@ class SalesOrderService
             }
 
             $quotation->update([
-                'status' => QuotationStatus::Converted,
                 'converted_to_sale_id' => $sale->id,
                 'converted_at' => now(),
                 'converted_by_id' => $user->id,
@@ -119,7 +119,8 @@ class SalesOrderService
             AuditLogger::record('quotation.converted', "Quotation {$quotation->quotation_number} converted to Sales Order {$sale->order_number} by {$user->name}.", $quotation, ['sale_id' => $sale->id], $user);
             AuditLogger::record('sales_order.created', "Sales Order {$sale->order_number} created from quotation {$quotation->quotation_number} (\$".number_format($total, 2).', pending payment).'.($warnings ? ' Stock warnings: '.implode(' ', $warnings) : ''), $sale, ['quotation_id' => $quotation->id, 'stock_warnings' => $warnings], $user);
 
-            $this->notifier->notify('sales_order_created', $sale, "sales_order_created:{$sale->id}");
+            // No "sales order created" email: it was removed at the business's request (2026-11-09).
+            // The customer's next email is the payment/order confirmation.
 
             return [$sale, $warnings];
         });
@@ -190,7 +191,7 @@ class SalesOrderService
 
     /**
      * Confirmed: reserve stock, issue the sales invoice, start the delivery record at
-     * order_confirmed, and email the customer (after the transaction commits).
+     * Pending, and email the customer (after the transaction commits).
      */
     public function confirm(Sale $sale, ?User $user = null): void
     {
@@ -213,7 +214,8 @@ class SalesOrderService
             $fulfillment = $this->fulfillment->initialize($sale, $user);
 
             if ($sale->channel === Sale::CHANNEL_COUNTER && $user) {
-                // Counter sale: the goods were handed over when sold.
+                // Counter sale recorded before counter sales were removed (2026-11-10): the goods were
+                // handed over when sold, so verifying its payment completes it.
                 $this->fulfillment->counterHandover($sale, $user);
                 $this->complete($sale->fresh(), $user, automatic: true);
 
@@ -272,7 +274,7 @@ class SalesOrderService
                 throw new WorkflowException('Part of this order was already delivered. Cancel the remaining quantities instead.');
             }
             $fulfillment = $sale->fulfillment;
-            if ($fulfillment && $fulfillment->status && in_array($fulfillment->status, [DeliveryStatus::OutForDelivery, DeliveryStatus::DeliveryAttemptFailed], true)) {
+            if ($fulfillment && $fulfillment->status && ($fulfillment->status === DeliveryStatus::InTransit || $fulfillment->goodsOnTruck())) {
                 throw new WorkflowException('Goods for this order are on the road. Record the return to the warehouse first.');
             }
             if ($open = $fulfillment?->openRelease()) {

@@ -3,7 +3,9 @@
 namespace App\Http\Controllers;
 
 use App\Enums\DeliveryStatus;
+use App\Enums\EmailStatus;
 use App\Enums\PaymentStatus;
+use App\Enums\QuotationStatus;
 use App\Enums\SalesOrderStatus;
 use App\Exceptions\WorkflowException;
 use App\Models\AuditLog;
@@ -11,19 +13,22 @@ use App\Models\NotificationLog;
 use App\Models\Payment;
 use App\Models\PaymentReceipt;
 use App\Models\Product;
+use App\Models\Quotation;
 use App\Models\Sale;
 use App\Models\SalesInvoice;
+use App\Models\StockMovement;
+use App\Services\AuditLogger;
 use App\Services\Documents\DocumentPdf;
 use App\Services\Inventory\StockLedger;
 use App\Services\Notifications\CustomerNotifier;
-use App\Services\Sales\CounterSaleService;
 use App\Services\Sales\InvoiceService;
 use App\Services\Sales\PaymentService;
 use App\Services\Sales\SalesOrderService;
+use Carbon\CarbonInterface;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response as HttpResponse;
-use Illuminate\Support\Facades\DB;z
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
 use Inertia\Inertia;
@@ -31,7 +36,7 @@ use Inertia\Response;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 /**
- * Sales Orders: the list (with the sales counter), the order page, payments and their
+ * Sales Orders: the list (new orders are created from accepted quotations), the order page, payments and their
  * verification, receipts, invoices and the order actions (terms, hold, cancel, complete).
  * Routes: Admin and Sales staff only (role:admin,staff_sales).
  */
@@ -100,67 +105,90 @@ class SaleController extends Controller
             'outstanding' => (float) Sale::where('team_id', $team->id)->whereNotIn('status', [SalesOrderStatus::Cancelled->value])->sum('outstanding_balance'),
         ];
 
-        // Products for the sales counter (stock not reserved for other orders - batch resolved).
-        $rawProducts = Product::where('team_id', $team->id)
-            ->where('is_active', true)
-            ->where('stock', '>', 0)
-            ->orderBy('name')
-            ->get(['id', 'sku', 'name', 'price', 'stock', 'category']);
-
-        $reservedMap = Product::batchReservedQuantities($rawProducts->pluck('id')->all());
-
-        $products = $rawProducts
-            ->map(function (Product $p) use ($reservedMap) {
-                $reserved = $reservedMap[$p->id] ?? 0;
-                $p->setAttribute('precomputed_reserved_quantity', $reserved);
-                $available = max(0, (int) $p->stock - $reserved);
-
-                return ['id' => $p->id, 'sku' => $p->sku, 'name' => $p->name, 'price' => $p->price, 'category' => $p->category, 'stock' => $available];
-            })
-            ->filter(fn ($p) => $p['stock'] > 0)
+        // "New Sales Order": accepted quotations without a Sales Order yet, with their agreed lines.
+        // Draft, sent, rejected and expired quotations, and converted ones, are never listed.
+        $quotations = Quotation::where('team_id', $team->id)
+            ->where('status', QuotationStatus::Accepted->value)
+            ->whereNull('converted_to_sale_id')
+            // Also not when an order (even an archived one) already points at it.
+            ->whereNotIn('id', Sale::withTrashed()->whereNotNull('quotation_id')->select('quotation_id'))
+            ->whereHas('items')
+            ->with(['items.product:id,unit'])
+            ->latest('customer_decision_at')
+            ->latest('id')
+            ->get()
+            ->map(fn (Quotation $q) => [
+                'id' => $q->id,
+                'quotation_number' => $q->quotation_number,
+                'client_name' => $q->client_name,
+                'address' => $q->address,
+                'quotation_date' => $q->quotation_date instanceof CarbonInterface ? $q->quotation_date->toDateString() : (string) $q->quotation_date,
+                'accepted_on' => $q->customer_decision_at?->toDateString(),
+                'subtotal' => (float) $q->subtotal,
+                'discount' => (float) $q->discount,
+                'tax_rate' => (float) $q->tax_rate,
+                'tax_amount' => (float) $q->tax_amount,
+                'grand_total' => (float) $q->grand_total,
+                'items' => $q->items->map(fn ($item) => [
+                    'id' => $item->id,
+                    'sku' => $item->sku,
+                    'description' => $item->product_name,
+                    'quantity' => (int) $item->quantity,
+                    // The quotation has no unit column: it is the linked product's unit, when there is one.
+                    'unit' => $item->product?->unit,
+                    // Agreed price per unit after the quoted line discount; amount = the quoted line subtotal.
+                    'unit_price' => max(0, round((float) $item->unit_price - (float) $item->discount, 2)),
+                    'amount' => (float) $item->subtotal,
+                ])->values()->all(),
+            ])
             ->values();
 
         return Inertia::render('Sales/Index', [
             'sales' => $sales,
             'filters' => $filters,
             'metrics' => $metrics,
-            'products' => $products,
+            'quotations' => $quotations,
             'options' => $this->statusOptions(),
         ]);
     }
 
-    /** Sales counter: a walk-in customer pays and takes the goods. */
+    /**
+     * New Sales Order from an accepted quotation. The quotation is the only source: customer,
+     * products, quantities and agreed prices are copied from it and it is not changed (it is only
+     * marked converted). Eligibility is checked again here, in one locked transaction, so an order
+     * is never created twice. No stock moves and no payment is recorded: stock is reserved on
+     * confirmation and taken out by Outbound Delivery; payments are recorded on the order page.
+     */
     public function store(Request $request): RedirectResponse
     {
         $team = $request->user()->currentTeam;
         abort_if(! $team, 403, 'No active team selected.');
-
-        if (is_string($request->input('items'))) {
-            $decoded = json_decode($request->input('items'), true);
-            if (is_array($decoded)) {
-                $request->merge(['items' => $decoded]);
-            }
+        if ($request->filled('fulfillment_type')) {
+            $request->merge(['fulfillment_type' => strtolower((string) $request->input('fulfillment_type'))]);
         }
 
         $validated = $request->validate([
-            'customer' => ['required', 'string', 'max:255'],
-            'payment_method' => ['required', 'string', Rule::in(Payment::METHODS)],
-            'payment_reference' => ['required', 'string', 'max:100'],
-            'amount_paid' => ['required', 'numeric', 'min:0.01'],
-            'payment_date' => ['required', 'date'],
-            'proof_of_payment' => ['nullable', 'file', 'mimes:jpg,jpeg,png,webp,pdf', 'max:5120'],
-            'notes' => ['nullable', 'string', 'max:1000'],
-            'items' => ['required', 'array', 'min:1'],
-            'items.*.product_id' => ['required', 'integer', Rule::exists('products', 'id')->where('team_id', $team->id)],
-            'items.*.qty' => ['required', 'integer', 'min:1'],
+            'quotation_id' => ['required', 'integer', Rule::exists('quotations', 'id')->where('team_id', $team->id)->whereNull('deleted_at')],
+            'fulfillment_type' => ['nullable', Rule::in(['delivery', 'pickup'])],
+            'delivery_address' => ['nullable', 'string', 'max:500'],
+            'delivery_instructions' => ['nullable', 'string', 'max:1000'],
+        ], [
+            'quotation_id.required' => 'Select a quotation.',
+            'quotation_id.exists' => 'The selected quotation was not found.',
         ]);
 
         return $this->runWorkflow(function () use ($team, $validated, $request) {
-            $sale = app(CounterSaleService::class)->record($team->id, $validated, $request->file('proof_of_payment'), $request->user());
+            $quotation = Quotation::where('team_id', $team->id)->findOrFail($validated['quotation_id']);
+            [$sale, $warnings] = app(SalesOrderService::class)->createFromQuotation($quotation, $request->user(), [
+                'fulfillment_type' => $validated['fulfillment_type'] ?? 'delivery',
+                'address' => $validated['delivery_address'] ?? null,
+                'delivery_instructions' => $validated['delivery_instructions'] ?? null,
+            ]);
+            if ($warnings) {
+                session()->flash('warning', 'Stock check: '.implode(' ', $warnings));
+            }
 
-            return $sale->status === SalesOrderStatus::Completed
-                ? "Counter sale {$sale->order_number} completed. Invoice {$sale->invoice_number}."
-                : "Counter sale {$sale->order_number} recorded. The attached payment proof must be verified before the sale is completed.";
+            return "Sales Order {$sale->order_number} created from quotation {$quotation->quotation_number} (pending payment). Record the customer's payment on the order page.";
         });
     }
 
@@ -194,7 +222,7 @@ class SaleController extends Controller
                 ->orWhere(fn ($qq) => $qq->where('notifiable_type', 'Payment')->whereIn('notifiable_id', $paymentIds))
                 ->orWhere(fn ($qq) => $qq->where('notifiable_type', 'SalesInvoice')->whereIn('notifiable_id', $sale->invoices->pluck('id')))
                 ->when($sale->fulfillment, fn ($qq) => $qq->orWhere(fn ($q3) => $q3->where('notifiable_type', 'OrderFulfillment')->where('notifiable_id', $sale->fulfillment->id)));
-        })->latest('id')->get(['id', 'category', 'type', 'recipient', 'subject', 'status', 'attempts', 'error', 'last_attempt_at', 'sent_at', 'created_at']);
+        })->latest('id')->get(['id', 'category', 'type', 'notifiable_type', 'notifiable_id', 'recipient', 'subject', 'status', 'attempts', 'error', 'last_attempt_at', 'sent_at', 'created_at']);
 
         $activity = AuditLog::where('subject_type', 'Sale')->where('subject_id', $sale->id)
             ->latest('id')->limit(200)
@@ -424,7 +452,24 @@ class SaleController extends Controller
         return $this->runWorkflow(function () use ($invoice, $validated, $request) {
             $new = app(InvoiceService::class)->cancel($invoice, $validated['reason'], $request->user(), (bool) ($validated['reissue'] ?? false));
 
-            return $new ? "Invoice {$invoice->invoice_number} cancelled and replaced by {$new->invoice_number}." : "Invoice {$invoice->invoice_number} cancelled.";
+            return $new ? "Invoice {$invoice->invoice_number} cancelled and replaced by {$new->invoice_number}. Use Send Commercial Invoice to email it." : "Invoice {$invoice->invoice_number} cancelled.";
+        });
+    }
+
+    /** "Send Commercial Invoice" / "Resend": email the issued invoice PDF to the customer now (never automatic). */
+    public function sendInvoice(Request $request, mixed $current_team = null, mixed $sale = null, mixed $invoice = null): RedirectResponse
+    {
+        $sale = $this->authorizedSale($request, $sale, $current_team);
+        $invoice = SalesInvoice::where('sale_id', $sale->id)->findOrFail((int) ($invoice ?? $request->route('invoice')));
+        $request->validate(['resend' => ['sometimes', 'boolean']]);
+
+        return $this->runWorkflow(function () use ($invoice, $request) {
+            $log = app(InvoiceService::class)->send($invoice, $request->user(), $request->boolean('resend'));
+            if ($log->status !== EmailStatus::Sent) {
+                throw new WorkflowException("The email to {$log->recipient} could not be sent".($log->error ? ": {$log->error}" : '.').' The invoice was not marked as sent. Try again.');
+            }
+
+            return "Commercial invoice {$invoice->invoice_number} was emailed to {$log->recipient}.";
         });
     }
 
@@ -460,19 +505,71 @@ class SaleController extends Controller
     }
 
     /**
-     * Archive an order. Only cancelled orders can be archived: cancelling is what releases the
-     * stock, so archiving never changes inventory and transaction history is kept.
+     * Archive a cancelled or completed order into the Recycle Bin.
+     *
+     * Cancelled orders already had their stock released on cancellation. Completed orders return
+     * their line item quantities to inventory when archived so that restoring them from the
+     * Recycle Bin can deduct them again cleanly.
      */
     public function destroy(Request $request, mixed $current_team = null, mixed $sale = null): RedirectResponse
     {
+        abort_unless($request->user()?->isAdmin(), 403, 'Only administrators can delete records.');
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
+        }
         $sale = $this->authorizedSale($request, $sale, $current_team);
-        if ($sale->status !== SalesOrderStatus::Cancelled) {
-            return back()->withErrors(['error' => "Cancel order {$sale->order_number} first. Only cancelled orders can be archived."]);
+        if (! in_array($sale->status, [SalesOrderStatus::Cancelled, SalesOrderStatus::Completed], true)) {
+            return back()->withErrors(['error' => "Cancel order {$sale->order_number} first. Only cancelled or completed orders can be archived."]);
         }
 
-        $sale->delete();
+        DB::transaction(function () use ($sale, $request) {
+            if ($sale->status === SalesOrderStatus::Completed) {
+                $sale->load('items');
 
-        return back()->with('success', "Order {$sale->order_number} archived.");
+                foreach ($sale->items as $item) {
+                    $product = $item->product_id
+                        ? Product::whereKey($item->product_id)->lockForUpdate()->first()
+                        : null;
+
+                    if (! $product) {
+                        continue;
+                    }
+
+                    $previousStock = (int) $product->stock;
+                    $product->increment('stock', (int) $item->quantity);
+
+                    StockMovement::create([
+                        'team_id' => $sale->team_id,
+                        'product_id' => $product->id,
+                        'user_id' => $request->user()?->id,
+                        'type' => 'adjustment',
+                        'quantity' => (int) $item->quantity,
+                        'previous_stock' => $previousStock,
+                        'new_stock' => $previousStock + (int) $item->quantity,
+                        'reference_number' => $sale->invoice_number ?: $sale->order_number,
+                        'reason' => 'Sale '.($sale->invoice_number ?: $sale->order_number).' voided / deleted',
+                        'movement_date' => now(),
+                    ]);
+
+                    $product->refresh();
+                    $product->updateCalculatedStatus();
+                }
+            }
+
+            $sale->delete();
+        });
+
+        AuditLogger::audit(
+            'sale.archived',
+            "Moved sale transaction {$sale->order_number} to the Recycle Bin.",
+            $request->user(),
+            null,
+            ['id' => $sale->id, 'order_number' => $sale->order_number, 'invoice_number' => $sale->invoice_number],
+            'success',
+            $request
+        );
+
+        return back()->with('success', "Order {$sale->order_number} moved to the Recycle Bin.");
     }
 
     // -------------------------------------------------------------------------------- helpers

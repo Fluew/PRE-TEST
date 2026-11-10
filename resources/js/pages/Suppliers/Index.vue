@@ -6,7 +6,7 @@ import SpecularButton from '@/components/ui/SpecularButton.vue';
 import StatusBadge from '@/components/ui/StatusBadge.vue';
 import { type Evaluation } from '@/components/evaluation/ScoreBreakdown.vue';
 import SupplierEvaluationBreakdown from '@/components/evaluation/SupplierEvaluationBreakdown.vue';
-import { Search, Plus, Phone, Mail, Building2, CheckCircle2, Check } from '@lucide/vue';
+import { Search, Plus, Phone, Mail, Building2, CheckCircle2, Check, Trash2 } from '@lucide/vue';
 
 interface Supplier {
     id: number;
@@ -21,6 +21,9 @@ interface Supplier {
 
 interface SupplierEvaluation extends Evaluation {
     period: { from: string; to: string };
+    /** 1 = highest AHP score; null without a complete score. */
+    rank?: number | null;
+    ranked_of?: number;
 }
 
 interface QuoteRecord {
@@ -156,27 +159,35 @@ interface ConfirmActionOptions {
     description: string;
     details?: Array<{ label: string; value: string | number }>;
     confirmText?: string;
+    variant?: 'brand' | 'destructive';
     action: () => void;
 }
 
 const showConfirmModal = ref(false);
+const confirmActionInput = ref('');
 const confirmOptions = ref<ConfirmActionOptions>({
     title: 'Confirm Action',
     description: 'Are you sure you want to proceed?',
     details: [],
     confirmText: 'Confirm & Save',
+    variant: 'brand',
     action: () => {},
 });
 
 const openConfirmModal = (options: ConfirmActionOptions) => {
+    confirmActionInput.value = '';
     confirmOptions.value = {
         confirmText: 'Confirm & Save',
+        variant: 'brand',
         ...options,
     };
     showConfirmModal.value = true;
 };
 
 const handleConfirmedAction = () => {
+    if (confirmOptions.value.variant === 'destructive' && confirmActionInput.value !== 'YES') {
+        return;
+    }
     showConfirmModal.value = false;
     confirmOptions.value.action();
 };
@@ -235,8 +246,9 @@ const submitEdit = () => {
 };
 
 const confirmDelete = () => {
-    if (!selectedSupplier.value) return;
+    if (!selectedSupplier.value || deleteConfirmInput.value !== 'YES') return;
     router.delete(`/${teamSlug.value}/suppliers/${selectedSupplier.value.id}`, {
+        data: { confirmation: deleteConfirmInput.value },
         preserveScroll: true,
         onSuccess: () => {
             showDeleteModal.value = false;
@@ -331,10 +343,15 @@ const verifyRecord = (kind: 'quotes' | 'availability', id: number) =>
     router.post(`/${teamSlug.value}/${kind === 'quotes' ? 'supplier-quotes' : 'supplier-availability'}/${id}/verify`, {}, afterRecordChange);
 const removeRecord = (kind: 'quotes' | 'availability', id: number) =>
     openConfirmModal({
-        title: kind === 'quotes' ? 'Remove quote' : 'Remove availability record',
-        description: 'The record is removed and the evaluation is recalculated without it. This is logged.',
-        confirmText: 'Remove',
-        action: () => router.delete(`/${teamSlug.value}/${kind === 'quotes' ? 'supplier-quotes' : 'supplier-availability'}/${id}`, afterRecordChange),
+        title: 'Are you sure you want to permanently delete this record?',
+        description: `This action cannot be undone. Related active sessions, registered trusted devices, or dependent records must only be revoked or removed when explicitly required by the operation. The ${kind === 'quotes' ? 'price quote' : 'product availability'} record will be permanently removed and supplier evaluation recalculated.`,
+        confirmText: 'Permanently Delete',
+        variant: 'destructive',
+        action: () =>
+            router.delete(`/${teamSlug.value}/${kind === 'quotes' ? 'supplier-quotes' : 'supplier-availability'}/${id}`, {
+                ...afterRecordChange,
+                data: { confirmation: 'YES' },
+            }),
     });
 const money = (amount: number, currency: string) =>
     new Intl.NumberFormat(currency === 'PHP' ? 'en-PH' : 'en-US', { style: 'currency', currency }).format(amount);</script>
@@ -344,12 +361,12 @@ const money = (amount: number, currency: string) =>
 
     <div class="workspace-page">
         <!-- Header -->
-        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-4">
+        <div class="page-header">
             <div>
                 <h1 class="page-title">Supplier Management</h1>
                 <p class="page-subtitle">Supplier contacts and record-based performance evaluations.</p>
             </div>
-            <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
+            <div class="page-actions">
                 <SpecularButton
                     variant="brand"
                     size="md"
@@ -363,7 +380,7 @@ const money = (amount: number, currency: string) =>
         </div>
 
         <!-- Filter Bar -->
-        <div class="flex flex-wrap items-center gap-3 mb-4">
+        <div class="flex flex-wrap items-center gap-3 rounded-xl border border-gray-200 bg-white p-4">
             <div class="relative flex-1 min-w-[240px] max-w-md">
                 <Search class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
                 <input
@@ -371,7 +388,7 @@ const money = (amount: number, currency: string) =>
                     @input="applySearch"
                     type="text"
                     placeholder="Search by supplier name, contact, phone..."
-                    class="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 focus:outline-none focus:border-[#F8B803]"
+                    class="field-control w-full pl-10 pr-4"
                 />
             </div>
 
@@ -379,7 +396,7 @@ const money = (amount: number, currency: string) =>
                 <select
                     v-model="selectedStatus"
                     @change="applyFilter"
-                    class="w-full py-2 px-3 bg-white border border-gray-200 rounded-xl text-sm font-medium text-gray-900 focus:outline-none focus:border-[#F8B803] cursor-pointer"
+                    class="field-control w-full font-medium cursor-pointer"
                 >
                     <option value="All">All Statuses</option>
                     <option value="Active">Active</option>
@@ -391,7 +408,7 @@ const money = (amount: number, currency: string) =>
                 <select
                     v-model="selectedSort"
                     @change="applyFilter"
-                    class="w-full py-2 px-3 bg-white border border-gray-200 rounded-xl text-sm font-medium text-gray-900 focus:outline-none focus:border-[#F8B803] cursor-pointer"
+                    class="field-control w-full font-medium cursor-pointer"
                 >
                     <option value="score_desc">Highest evaluation score</option>
                     <option value="name_asc">Name (A-Z)</option>
@@ -402,10 +419,15 @@ const money = (amount: number, currency: string) =>
 
         <!-- Suppliers Table -->
         <div class="flex-1 rounded-xl bg-white border border-gray-200 p-6">
+            <p class="mb-3 text-xs text-gray-500">
+                AHP score = Delivery Performance × {{ Math.round(weights.delivery * 100) }}% + Price Competitiveness × {{ Math.round(weights.price * 100) }}% + Product Quality × {{ Math.round(weights.quality * 100) }}%,
+                from the last {{ periodMonths }} months of inbound deliveries, inspections and purchase order costs. The ranking helps you choose; the system never selects or orders from a supplier.
+            </p>
             <div class="overflow-x-auto">
                 <table class="w-full text-left border-collapse">
                     <thead>
                         <tr class="border-b border-gray-200 text-gray-500 text-sm">
+                            <th class="pb-3 font-medium">Rank</th>
                             <th class="pb-3 font-medium">Company Name</th>
                             <th class="pb-3 font-medium">Contact Person</th>
                             <th class="pb-3 font-medium">Phone & Email</th>
@@ -416,11 +438,15 @@ const money = (amount: number, currency: string) =>
                     </thead>
                     <tbody class="text-sm">
                         <tr v-if="!suppliers.data.length">
-                            <td colspan="6" class="py-8 text-center text-gray-500">
+                            <td colspan="7" class="py-8 text-center text-gray-500">
                                 No suppliers found. Click "+ Add Supplier" to register your first supplier.
                             </td>
                         </tr>
                         <tr v-for="supplier in suppliers.data" :key="supplier.id" class="border-b border-gray-100 hover:bg-gray-50 transition-colors group">
+                            <td class="py-4 pr-3 font-mono text-sm" :title="supplier.evaluation?.rank ? `Rank ${supplier.evaluation.rank} of ${supplier.evaluation.ranked_of} scored suppliers` : 'Not ranked: insufficient data'">
+                                <span v-if="supplier.evaluation?.rank" class="font-semibold text-gray-900">#{{ supplier.evaluation.rank }}</span>
+                                <span v-else class="text-gray-400">—</span>
+                            </td>
                             <td class="py-4 text-gray-900 font-semibold flex items-center gap-2">
                                 <Building2 class="w-4 h-4 text-gray-400" />
                                 {{ supplier.name }}
@@ -650,18 +676,22 @@ const money = (amount: number, currency: string) =>
     <!-- Delete Confirmation Modal -->
     <div v-if="showDeleteModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
         <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl">
-            <h3 class="text-xl font-semibold text-gray-900 mb-2">Confirm Delete</h3>
-            <p class="text-gray-600 text-sm mb-4">Are you sure you want to delete <span class="font-semibold text-gray-900">{{ selectedSupplier?.name }}</span>? This will permanently remove the supplier record.</p>
+            <h3 class="text-xl font-semibold text-gray-900 mb-2">Delete Supplier</h3>
+            <p class="text-gray-600 text-sm mb-2">Move supplier <span class="font-semibold text-gray-900">{{ selectedSupplier?.name }}</span> to the Recycle Bin?</p>
+            <p class="text-gray-500 text-xs mb-4">
+                An Admin can restore or permanently delete this record from the Recycle Bin. Unrelated active sessions and trusted devices are not affected.
+            </p>
             
             <div class="mt-4 mb-6">
                 <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm deletion:
                 </label>
                 <input
                     v-model="deleteConfirmInput"
                     type="text"
                     placeholder="Type YES here"
                     class="w-full px-3 py-2 text-sm font-mono rounded-xl border border-gray-300 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                    @keyup.enter="deleteConfirmInput === 'YES' && confirmDelete()"
                 />
             </div>
 
@@ -679,7 +709,7 @@ const money = (amount: number, currency: string) =>
                     size="md"
                     :radius="10"
                     @click="confirmDelete"
-                    :disabled="deleteConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="deleteConfirmInput !== 'YES'"
                 >
                     Delete Supplier
                 </SpecularButton>
@@ -700,7 +730,9 @@ const money = (amount: number, currency: string) =>
                 <div class="flex items-start gap-3">
                     <div v-if="evalSupplier.evaluation" class="text-right">
                         <div class="text-xl font-semibold text-gray-900">{{ evalSupplier.evaluation.complete ? `${scoreLabel(evalSupplier.evaluation)} / 100` : 'Insufficient data' }}</div>
-                        <div class="text-xs text-gray-500">{{ evalSupplier.evaluation.classification ?? 'Not classified' }}</div>
+                        <div class="text-xs text-gray-500">
+                            {{ evalSupplier.evaluation.classification ?? 'Not classified' }}<template v-if="evalSupplier.evaluation.rank"> · rank {{ evalSupplier.evaluation.rank }} of {{ evalSupplier.evaluation.ranked_of }}</template>
+                        </div>
                     </div>
                     <button type="button" class="text-xl text-gray-400 hover:text-gray-600" aria-label="Close" @click="evalSupplier = null">&times;</button>
                 </div>
@@ -774,7 +806,9 @@ const money = (amount: number, currency: string) =>
                     </form>
                     <p class="mt-2 text-xs text-gray-500">Quotes are compared only with other suppliers' quotes for the same product, unit, currency and tax basis. Expired and unverified quotes are not counted.</p>
 
-                    <table v-if="quotes.length" class="mt-4 w-full text-left text-sm">
+                    <div v-if="quotes.length" class="mt-4 overflow-x-auto">
+
+                    <table class="w-full text-left text-sm">
                         <thead><tr class="text-xs text-gray-500"><th class="py-1">Product</th><th class="text-right">Price</th><th>Terms</th><th>Dates</th><th>Status</th><th></th></tr></thead>
                         <tbody>
                             <tr v-for="q in quotes" :key="q.id" class="border-t border-gray-100">
@@ -790,11 +824,12 @@ const money = (amount: number, currency: string) =>
                                 </td>
                                 <td class="whitespace-nowrap text-right">
                                     <button v-if="canVerify && !q.verified_at" type="button" class="text-xs font-medium text-[#4b5320] underline" @click="verifyRecord('quotes', q.id)">Verify</button>
-                                    <button v-if="canVerify || !q.verified_at" type="button" class="ml-2 text-xs text-rose-600 underline" @click="removeRecord('quotes', q.id)">Remove</button>
+                                    <button v-if="canDelete" type="button" class="ml-2 text-xs text-rose-600 underline" @click="removeRecord('quotes', q.id)">Remove</button>
                                 </td>
                             </tr>
                         </tbody>
                     </table>
+                    </div>
                     <p v-else-if="!recordsLoading" class="mt-4 text-sm text-gray-500">No quotes recorded for this supplier.</p>
                 </template>
 
@@ -825,7 +860,9 @@ const money = (amount: number, currency: string) =>
                     </form>
                     <p class="mt-2 text-xs text-gray-500">Used by AHP Product Prioritization (Supplier Availability) once an administrator verifies it. Changing a record needs verifying again.</p>
 
-                    <table v-if="availability.length" class="mt-4 w-full text-left text-sm">
+                    <div v-if="availability.length" class="mt-4 overflow-x-auto">
+
+                    <table class="w-full text-left text-sm">
                         <thead><tr class="text-xs text-gray-500"><th class="py-1">Product</th><th>Can supply</th><th>Status</th><th></th></tr></thead>
                         <tbody>
                             <tr v-for="a in availability" :key="a.id" class="border-t border-gray-100">
@@ -837,11 +874,12 @@ const money = (amount: number, currency: string) =>
                                 </td>
                                 <td class="whitespace-nowrap text-right">
                                     <button v-if="canVerify && !a.verified_at" type="button" class="text-xs font-medium text-[#4b5320] underline" @click="verifyRecord('availability', a.id)">Verify</button>
-                                    <button v-if="canVerify || !a.verified_at" type="button" class="ml-2 text-xs text-rose-600 underline" @click="removeRecord('availability', a.id)">Remove</button>
+                                    <button v-if="canDelete" type="button" class="ml-2 text-xs text-rose-600 underline" @click="removeRecord('availability', a.id)">Remove</button>
                                 </td>
                             </tr>
                         </tbody>
                     </table>
+                    </div>
                     <p v-else-if="!recordsLoading" class="mt-4 text-sm text-gray-500">No availability recorded for this supplier.</p>
                 </template>
             </div>
@@ -851,8 +889,16 @@ const money = (amount: number, currency: string) =>
     <!-- Action Confirmation Modal -->
     <div v-if="showConfirmModal" class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4">
         <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl animate-in fade-in duration-150">
-            <div class="w-11 h-11 rounded-full bg-amber-50 text-[#F8B803] flex items-center justify-center mb-4 border border-amber-100">
-                <CheckCircle2 class="w-6 h-6" />
+            <div
+                :class="[
+                    'w-11 h-11 rounded-full flex items-center justify-center mb-4 border',
+                    confirmOptions.variant === 'destructive'
+                        ? 'bg-rose-50 text-rose-600 border-rose-100'
+                        : 'bg-amber-50 text-[#F8B803] border-amber-100'
+                ]"
+            >
+                <Trash2 v-if="confirmOptions.variant === 'destructive'" class="w-6 h-6" />
+                <CheckCircle2 v-else class="w-6 h-6" />
             </div>
             <h3 class="text-xl font-semibold text-gray-900 mb-1.5">{{ confirmOptions.title }}</h3>
             <p class="text-gray-600 text-sm mb-4 leading-relaxed">
@@ -864,6 +910,19 @@ const money = (amount: number, currency: string) =>
                     <span class="text-gray-500 font-medium">{{ item.label }}</span>
                     <span class="font-semibold text-gray-900 text-right">{{ item.value }}</span>
                 </div>
+            </div>
+
+            <div v-if="confirmOptions.variant === 'destructive'" class="mt-4 mb-6">
+                <label class="block text-xs font-semibold text-gray-700 mb-1.5">
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm permanent deletion:
+                </label>
+                <input
+                    v-model="confirmActionInput"
+                    type="text"
+                    placeholder="Type YES here"
+                    class="w-full px-3 py-2 text-sm font-mono rounded-xl border border-gray-300 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                    @keyup.enter="confirmActionInput === 'YES' && handleConfirmedAction()"
+                />
             </div>
 
             <div class="flex justify-end gap-3">
@@ -878,13 +937,14 @@ const money = (amount: number, currency: string) =>
                 </SpecularButton>
                 <SpecularButton
                     type="button"
-                    variant="brand"
+                    :variant="confirmOptions.variant === 'destructive' ? 'destructive' : 'brand'"
                     size="md"
                     :radius="10"
                     @click="handleConfirmedAction"
-                    :disabled="form.processing"
+                    :disabled="form.processing || (confirmOptions.variant === 'destructive' && confirmActionInput !== 'YES')"
                 >
-                    <Check class="w-4 h-4 mr-1.5" />
+                    <Trash2 v-if="confirmOptions.variant === 'destructive'" class="w-4 h-4 mr-1.5" />
+                    <Check v-else class="w-4 h-4 mr-1.5" />
                     <span>{{ confirmOptions.confirmText || 'Confirm & Save' }}</span>
                 </SpecularButton>
             </div>

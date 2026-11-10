@@ -5,6 +5,9 @@ import { showToast } from '@/composables/useFlashToast';
 import { ref, computed, watch } from 'vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
 import PurchaseOrderWorkspace from '@/components/procurement/PurchaseOrderWorkspace.vue';
+import InboundDeliveryRecorder from '@/components/deliveries/InboundDeliveryRecorder.vue';
+import InboundDeliveryDetails from '@/components/deliveries/InboundDeliveryDetails.vue';
+import type { DeliveryFull, ReceivableOrder } from '@/types/inboundDelivery';
 import { 
     Search, 
     Plus, 
@@ -35,7 +38,8 @@ import {
     UserCheck,
     Navigation,
     ShieldAlert,
-    ExternalLink
+    ExternalLink,
+    Pencil
 } from '@lucide/vue';
 
 interface AttemptLogItem {
@@ -65,6 +69,10 @@ interface OutboundDeliveryItem {
     status_label?: string;
     allowed_actions?: string[];
     status_choices?: StatusChoice[];
+    /** Three failed attempts and not yet rescheduled by an admin. */
+    needs_reschedule?: boolean;
+    /** Why an admin cannot delete this delivery yet (null = deletable). */
+    delete_blocked_reason?: string | null;
     open_release?: ReleaseItem | null;
     releases?: ReleaseItem[];
     attempt_count: number;
@@ -134,36 +142,20 @@ interface ReleaseItem {
     items: { id: number; sale_item_id: number; quantity: number; delivered_quantity: number; returned_quantity: number; sale_item?: { sku: string; product_name: string } | null }[];
 }
 
+/** One inbound P.O. delivery record (Delivery Date, Delivery #); its products are opened with View. */
 interface InboundDeliveryItem {
     id: number;
     delivery_date: string;
     delivery_number: string;
     purchase_order_number?: string | null;
-    purchase_order_id?: number | null;
-    quantity: number;
-    unit: string;
-    description: string;
-    supplier_id?: number | null;
-    received_by_id?: number | null;
-    status: string;
-    notes?: string | null;
-    supplier?: { id: number; name: string };
-    purchase_order?: { id: number; po_number: string; promised_delivery_date?: string | null };
-    received_by?: { id: number; name: string };
-    accepted_quantity?: number | null;
-    rejected_quantity?: number | null;
-    inspection_result?: 'accepted' | 'partially_accepted' | 'rejected' | null;
-    inspected_on?: string | null;
-    inspection_remarks?: string | null;
-    rejection_reason?: string | null;
-    rejection_category?: string | null;
-    damaged_quantity?: number | null;
-    defective_quantity?: number | null;
-    inspected_by?: { id: number; name: string } | null;
-    inspection_status?: string;
-    posted_at?: string | null;
-    posted_quantity?: number | null;
-    invoices?: { id: number; invoice_number: string; status: string }[];
+    status: 'confirmed' | 'cancelled';
+    supplier?: { id: number; name: string } | null;
+    confirmed_by?: { id: number; name: string } | null;
+    items_count: number;
+    received_total?: number | string | null;
+    accepted_total?: number | string | null;
+    rejected_total?: number | string | null;
+    quality_status: string;
 }
 
 interface ProductItem {
@@ -172,6 +164,8 @@ interface ProductItem {
     sku: string;
     cost_price: number;
     stock: number;
+    unit?: string | null;
+    is_active?: boolean;
 }
 
 interface SupplierItem {
@@ -229,6 +223,8 @@ const props = defineProps<{
     products?: ProductItem[];
     suppliers?: SupplierItem[];
     purchaseOrders?: PurchaseOrderItem[];
+    receivableOrders?: ReceivableOrder[];
+    productCategories?: string[];
     filters?: {
         tab?: string;
         search?: string;
@@ -481,50 +477,61 @@ const openStartDelivery = (item: OutboundDeliveryItem) => {
 };
 const startDeliveryForm = useForm({});
 
-// Goods-receipt inspection of an inbound supplier delivery (used by Supplier Evaluation).
-const inspectingDelivery = ref<InboundDeliveryItem | null>(null);
-const inspectionForm = useForm({ accepted_quantity: 0, rejected_quantity: 0, inspected_on: '', inspection_remarks: '', rejection_reason: '', rejection_category: '', damaged_quantity: 0, defective_quantity: 0 });
-// Workflow errors that are not about one field (e.g. "already inspected") arrive under "inspection".
-const inspectionError = computed(() => (inspectionForm.errors as Record<string, string | undefined>).inspection);
-// Rejected units not explained as damaged or defective need a category.
-const otherRejected = computed(() => Math.max(0, inspectionForm.rejected_quantity - inspectionForm.damaged_quantity - inspectionForm.defective_quantity));
-const rejectionCategories = ['defective', 'damaged', 'incorrect_item', 'nonconforming_spec', 'shortage_in_pack', 'other'];
-// Accepted units go into stock only once the delivery's supplier invoice is verified (checked again by the server).
+// Inbound P.O. deliveries: View (details), Correct (admin and staff), Delete (admin: cancels and reverses stock).
 const workspacePoId = ref<number | null>(null);
-const postingId = ref<number | null>(null);
-const postToInventory = (item: InboundDeliveryItem) => {
-    postingId.value = item.id;
-    router.post(`/${teamSlug.value}/deliveries/${item.id}/post-inventory`, {}, {
+const viewingDeliveryId = ref<number | null>(null);
+const detailsReloadKey = ref(0);
+const correctingDelivery = ref<DeliveryFull | null>(null);
+const showRecorder = ref(false);
+const openRecorder = () => {
+    correctingDelivery.value = null;
+    showRecorder.value = true;
+};
+const openCorrection = (d: DeliveryFull) => {
+    correctingDelivery.value = d;
+    showRecorder.value = true;
+};
+const loadingCorrectionId = ref<number | null>(null);
+const openCorrectionById = async (id: number) => {
+    loadingCorrectionId.value = id;
+    try {
+        const res = await fetch(`/${teamSlug.value}/deliveries/inbound/${id}`, { headers: { Accept: 'application/json' } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        openCorrection(await res.json());
+    } catch {
+        showToast('The delivery could not be loaded. Please try again.', 'error');
+    } finally {
+        loadingCorrectionId.value = null;
+    }
+};
+const closeRecorder = () => {
+    showRecorder.value = false;
+    correctingDelivery.value = null;
+};
+const onRecorderSaved = () => {
+    closeRecorder();
+    detailsReloadKey.value++;
+};
+// Accepted units go into stock automatically at inspection; this fallback posts deliveries inspected before that.
+const postToInventory = (itemId: number, number: string) => {
+    router.post(`/${teamSlug.value}/deliveries/${itemId}/post-inventory`, {}, {
         preserveScroll: true,
         onError: (errors) => showToast(Object.values(errors).join(' '), 'error'),
-        onSuccess: () => showToast(`Accepted units of ${item.delivery_number} added to inventory.`, 'success'),
-        onFinish: () => { postingId.value = null; },
+        onSuccess: () => {
+            showToast(`Accepted units of ${number} added to inventory.`, 'success');
+            detailsReloadKey.value++;
+        },
     });
 };
-const canPost = (item: InboundDeliveryItem) => !item.posted_at && (item.accepted_quantity ?? 0) > 0 && (item.invoices ?? []).some((i) => i.status === 'Verified');
-const inspectionLabels: Record<string, string> = { accepted: 'All accepted', partially_accepted: 'Partially accepted', rejected: 'Rejected' };
-const openInspection = (item: InboundDeliveryItem) => {
-    inspectingDelivery.value = item;
-    inspectionForm.clearErrors();
-    inspectionForm.accepted_quantity = item.accepted_quantity ?? item.quantity;
-    inspectionForm.rejected_quantity = item.rejected_quantity ?? 0;
-    inspectionForm.inspected_on = item.inspected_on?.slice(0, 10) ?? new Date().toISOString().slice(0, 10);
-    inspectionForm.inspection_remarks = item.inspection_remarks ?? '';
-    inspectionForm.rejection_reason = item.rejection_reason ?? '';
-    inspectionForm.rejection_category = item.rejection_category ?? '';
-    inspectionForm.damaged_quantity = item.damaged_quantity ?? 0;
-    inspectionForm.defective_quantity = item.defective_quantity ?? 0;
+const inboundQualityClass: Record<string, string> = {
+    Passed: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    'Partially Passed': 'border-amber-200 bg-amber-50 text-amber-800',
+    Failed: 'border-rose-200 bg-rose-50 text-rose-700',
+    'Pending Inspection': 'border-amber-200 bg-amber-50 text-amber-800',
+    Cancelled: 'border-gray-200 bg-gray-50 text-gray-500',
 };
-const submitInspection = () => {
-    if (!inspectingDelivery.value) return;
-    inspectionForm
-        .transform((d) => ({ ...d, inspection_remarks: d.inspection_remarks || null, rejection_reason: d.rejected_quantity > 0 ? d.rejection_reason : null, rejection_category: d.rejected_quantity > 0 && d.rejection_category ? d.rejection_category : null, damaged_quantity: d.rejected_quantity > 0 ? d.damaged_quantity : null, defective_quantity: d.rejected_quantity > 0 ? d.defective_quantity : null }))
-        .post(`/${teamSlug.value}/deliveries/${inspectingDelivery.value.id}/inspection`, {
-            preserveScroll: true,
-            onSuccess: () => {
-                inspectingDelivery.value = null;
-            },
-        });
+const goToInboundPage = (pageNumber: number) => {
+    router.get(window.location.pathname, { ...(props.filters ?? {}), tab: 'inbound', inbound_page: pageNumber }, { preserveScroll: true, preserveState: true, only: ['inboundDeliveries'] });
 };
 const confirmStartDelivery = () => {
     if (!selectedFulfillment.value) return;
@@ -672,46 +679,54 @@ const openProofViewer = (url: string, title: string) => {
     showProofViewerModal.value = true;
 };
 
-// ==========================================
-// INBOUND SUPPLIER RECEIVING LOGIC (Preserved)
-// ==========================================
-const showCreateInboundModal = ref(false);
-const inboundForm = useForm({
-    purchase_order_id: null as number | null,
-    delivery_date: new Date().toISOString().slice(0, 10),
-    quantity: 1,
-    supplier_document_number: '',
-    over_receipt_reason: '',
-    notes: '',
-});
-const selectedInboundPo = computed(() => (props.purchaseOrders ?? []).find((p) => p.id === inboundForm.purchase_order_id) ?? null);
-const submitInboundDelivery = () => {
-    if (!inboundForm.purchase_order_id) return;
-    inboundForm.post(`/${teamSlug.value}/deliveries/purchase-orders/${inboundForm.purchase_order_id}/receive`, {
+// Delete an inbound delivery (admin only): kept as Cancelled with the reason; its stock is taken back out.
+const deliveryToDelete = ref<{ id: number; delivery_number: string } | null>(null);
+const deleteInboundConfirmInput = ref('');
+const deleteInboundReason = ref('');
+const deletingInbound = ref(false);
+const confirmDeleteInbound = (d: { id: number; delivery_number: string }) => {
+    deliveryToDelete.value = d;
+    deleteInboundConfirmInput.value = '';
+    deleteInboundReason.value = '';
+};
+const executeDeleteInbound = () => {
+    if (!deliveryToDelete.value || deleteInboundConfirmInput.value !== 'YES' || !deleteInboundReason.value.trim()) return;
+    deletingInbound.value = true;
+    router.delete(`/${teamSlug.value}/deliveries/inbound/${deliveryToDelete.value.id}`, {
+        data: { confirmation: 'YES', reason: deleteInboundReason.value.trim() },
         preserveScroll: true,
         onSuccess: () => {
-            showCreateInboundModal.value = false;
-            inboundForm.reset();
-            showToast('Inbound delivery record saved.', 'success');
-        }
+            deliveryToDelete.value = null;
+            detailsReloadKey.value++;
+        },
+        onError: (errors) => showToast(Object.values(errors).join(' '), 'error'),
+        onFinish: () => {
+            deletingInbound.value = false;
+        },
     });
 };
 
-const showDeleteConfirm = ref(false);
-const deleteTargetId = ref<number | null>(null);
-const confirmDeleteInbound = (id: number) => {
-    deleteTargetId.value = id;
-    showDeleteConfirm.value = true;
+// Customer (outbound) delivery deletion: admin only, moves the record to the Recycle Bin.
+const outboundToDelete = ref<{ id: number; fulfillment_number: string; recipient_name?: string } | null>(null);
+const deleteOutboundConfirmInput = ref('');
+const deletingOutbound = ref(false);
+const confirmDeleteOutbound = (item: { id: number; fulfillment_number: string; recipient_name?: string }) => {
+    outboundToDelete.value = item;
+    deleteOutboundConfirmInput.value = '';
 };
-const executeDeleteInbound = () => {
-    if (!deleteTargetId.value) return;
-    router.delete(`/${teamSlug.value}/deliveries/${deleteTargetId.value}`, {
+const executeDeleteOutbound = () => {
+    if (!outboundToDelete.value || deleteOutboundConfirmInput.value !== 'YES') return;
+    deletingOutbound.value = true;
+    router.delete(`/${teamSlug.value}/deliveries/fulfillments/${outboundToDelete.value.id}`, {
+        data: { confirmation: deleteOutboundConfirmInput.value },
         preserveScroll: true,
         onSuccess: () => {
-            showDeleteConfirm.value = false;
-            deleteTargetId.value = null;
-            showToast('Delivery record deleted.', 'success');
-        }
+            outboundToDelete.value = null;
+            deleteOutboundConfirmInput.value = '';
+        },
+        onFinish: () => {
+            deletingOutbound.value = false;
+        },
     });
 };
 </script>
@@ -721,7 +736,7 @@ const executeDeleteInbound = () => {
 
     <div class="workspace-page">
         <!-- Top Header & Role Indicator -->
-        <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div class="page-header">
             <div class="min-w-0">
                 <h1 class="page-title">
                     {{ isDeliveryStaff ? 'Delivery Staff Dashboard' : 'Deliveries & Logistics' }}
@@ -766,7 +781,7 @@ const executeDeleteInbound = () => {
                     v-for="card in [
                         { label: isDeliveryStaff ? 'Assigned to you' : 'Total assigned', value: outboundMetrics?.totalAssigned ?? 0, alert: '' },
                         { label: 'To prepare', value: outboundMetrics?.pending ?? 0, alert: 'text-amber-600' },
-                        { label: 'Out for delivery', value: outboundMetrics?.inTransit ?? 0, alert: '' },
+                        { label: 'In transit', value: outboundMetrics?.inTransit ?? 0, alert: '' },
                         { label: 'Delivered', value: outboundMetrics?.delivered ?? 0, alert: '' },
                         { label: 'Attempt failed', value: outboundMetrics?.failed ?? 0, alert: 'text-rose-600' },
                         { label: 'Attempts left', value: outboundMetrics?.attemptsRemaining ?? 0, alert: '' },
@@ -871,7 +886,7 @@ const executeDeleteInbound = () => {
                                             {{ item.status_label ?? item.status }}
                                         </span>
                                         <!-- Attempt Counter Badge (0/3, 1/3, 2/3, 3/3) -->
-                                        <span v-if="item.fulfillment_type !== 'pickup' && ['out_for_delivery', 'delivery_attempt_failed'].includes(item.status)" class="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs" :class="getAttemptBadgeClass(item.attempt_count)">
+                                        <span v-if="item.fulfillment_type !== 'pickup' && (item.status === 'in_transit' || (item.status === 'ready_for_delivery' && item.attempt_count > 0))" class="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs" :class="getAttemptBadgeClass(item.attempt_count)">
                                             <RotateCcw class="size-3" />
                                             Attempt: {{ item.attempts_display }}
                                         </span>
@@ -925,7 +940,7 @@ const executeDeleteInbound = () => {
                                 <span class="font-mono font-semibold">{{ item.open_release.release_number }}</span> · {{ releaseStatusText[item.open_release.status] ?? item.open_release.status }}:
                                 {{ item.open_release.items.map((i) => `${i.sale_item?.product_name} × ${i.quantity}`).join(', ') }}
                             </div>
-                            <p v-if="outstanding(item).length && !['cancelled', 'completed'].includes(item.status)" class="mt-2 text-xs text-muted-foreground">
+                            <p v-if="outstanding(item).length && !['cancelled', 'delivered'].includes(item.status)" class="mt-2 text-xs text-muted-foreground">
                                 Still owed: {{ outstanding(item).map((l) => `${l.product_name} × ${l.remaining_quantity}`).join(', ') }}
                             </p>
 
@@ -962,7 +977,7 @@ const executeDeleteInbound = () => {
                                 <span v-if="item.sale?.hold_reason" class="inline-flex h-8 items-center gap-1.5 whitespace-nowrap rounded-lg border border-amber-200 bg-amber-50 px-3 text-xs font-semibold text-amber-700" :title="item.sale.hold_reason">
                                     Order on hold
                                 </span>
-                                <span v-if="item.status === 'delivery_attempt_failed' && item.attempt_count >= 3"
+                                <span v-if="item.needs_reschedule"
                                       class="inline-flex h-8 items-center gap-1.5 whitespace-nowrap rounded-lg border border-rose-200 bg-rose-50 px-3 text-xs font-semibold text-rose-600">
                                     <ShieldAlert class="size-3.5" />
                                     3/3 attempts: admin must reschedule
@@ -976,6 +991,19 @@ const executeDeleteInbound = () => {
                                         class="inline-flex h-8 items-center gap-1.5 whitespace-nowrap rounded-lg bg-brand px-3 text-xs font-semibold text-white transition-colors hover:bg-[#3b4219]">
                                     <RotateCcw class="size-3.5" />
                                     Update status
+                                </button>
+                                <!-- Admin only (the server also refuses staff). Unfinished deliveries cannot be deleted. -->
+                                <button
+                                    v-if="canDelete"
+                                    type="button"
+                                    @click="confirmDeleteOutbound(item)"
+                                    :disabled="!!item.delete_blocked_reason"
+                                    :title="item.delete_blocked_reason ? `Cannot delete: ${item.delete_blocked_reason}` : 'Delete this delivery record (moves it to the Recycle Bin)'"
+                                    :aria-label="`Delete delivery ${item.fulfillment_number}`"
+                                    class="inline-flex h-8 items-center gap-1.5 whitespace-nowrap rounded-lg border border-rose-200 bg-rose-50 px-3 text-xs font-semibold text-rose-600 transition-colors hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-rose-50"
+                                >
+                                    <Trash2 class="size-3.5" />
+                                    Delete
                                 </button>
                             </div>
                         </div>
@@ -1012,90 +1040,72 @@ const executeDeleteInbound = () => {
         <template v-else-if="!isDeliveryStaff && currentTab === 'inbound'">
             <!-- Inbound Action Bar -->
             <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <p class="text-sm text-muted-foreground">Receiving log for supplier purchase order shipments into the main warehouse.</p>
+                <p class="text-sm text-muted-foreground">Supplier purchase order deliveries received into the warehouse. Accepted units are added to inventory when a delivery is confirmed.</p>
                 <div class="flex shrink-0 items-center gap-2">
                     <button
                         type="button"
-                        @click="showCreateInboundModal = true"
+                        @click="openRecorder"
                         class="brand-button w-full sm:w-auto"
+                        data-test="record-inbound"
                     >
                         <Plus class="size-4" />
-                        Record Inbound PO Delivery
+                        Record Inbound P.O. Delivery
                     </button>
                 </div>
             </div>
 
-            <!-- Inbound Deliveries Table -->
+            <!-- Inbound Deliveries Table: one row per delivery record -->
             <div class="overflow-hidden rounded-xl border border-gray-200 bg-white">
                 <div class="overflow-x-auto">
-                    <table class="w-full text-left text-sm">
+                    <table class="w-full text-left text-sm" data-test="inbound-table">
                         <thead class="border-b border-gray-200 bg-gray-50 text-xs font-semibold text-muted-foreground">
                             <tr>
                                 <th class="whitespace-nowrap px-4 py-3">Delivery Date</th>
                                 <th class="whitespace-nowrap px-4 py-3">Delivery #</th>
-                                <th class="whitespace-nowrap px-4 py-3">PO #</th>
+                                <th class="whitespace-nowrap px-4 py-3">PO No.</th>
                                 <th class="whitespace-nowrap px-4 py-3">Supplier</th>
-                                <th class="whitespace-nowrap px-4 py-3">Description</th>
-                                <th class="whitespace-nowrap px-4 py-3 text-right">Qty</th>
-                                <th class="whitespace-nowrap px-4 py-3">Status</th>
-                                <th class="whitespace-nowrap px-4 py-3">Inspection</th>
+                                <th class="whitespace-nowrap px-4 py-3 text-right">Products</th>
+                                <th class="whitespace-nowrap px-4 py-3 text-right">Received</th>
+                                <th class="whitespace-nowrap px-4 py-3">Quality</th>
                                 <th class="whitespace-nowrap px-4 py-3 text-right">Actions</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-gray-100">
                             <tr v-if="!inboundDeliveries?.data || inboundDeliveries.data.length === 0">
-                                <td colspan="9" class="p-8 text-center text-sm text-muted-foreground">No inbound supplier delivery records found.</td>
+                                <td colspan="8" class="p-8 text-center text-sm text-muted-foreground">No inbound supplier delivery records found.</td>
                             </tr>
-                            <tr v-for="item in inboundDeliveries?.data" :key="item.id" class="hover:bg-gray-50">
+                            <tr v-for="item in inboundDeliveries?.data" :key="item.id" class="hover:bg-gray-50" :class="item.status === 'cancelled' ? 'text-gray-400' : ''">
                                 <td class="whitespace-nowrap px-4 py-3 text-xs">{{ formatDate(item.delivery_date) }}</td>
-                                <td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold text-foreground">{{ item.delivery_number }}</td>
+                                <td class="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold" :class="item.status === 'cancelled' ? 'line-through' : 'text-foreground'">{{ item.delivery_number }}</td>
                                 <td class="whitespace-nowrap px-4 py-3 font-mono text-xs text-brand">{{ item.purchase_order_number || '—' }}</td>
                                 <td class="px-4 py-3 text-xs">{{ item.supplier?.name || '—' }}</td>
-                                <td class="min-w-48 px-4 py-3 text-xs text-muted-foreground">{{ item.description }}</td>
-                                <td class="whitespace-nowrap px-4 py-3 text-right text-xs font-semibold">{{ item.quantity }} {{ item.unit }}</td>
-                                <td class="px-4 py-3 text-xs">
-                                    <span class="inline-flex items-center rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-600">
-                                        {{ item.status }}
-                                    </span>
+                                <td class="whitespace-nowrap px-4 py-3 text-right text-xs">{{ item.items_count }}</td>
+                                <td class="whitespace-nowrap px-4 py-3 text-right text-xs">
+                                    <span class="font-semibold">{{ Number(item.received_total ?? 0) }}</span>
+                                    <div class="text-muted-foreground">{{ Number(item.accepted_total ?? 0) }} accepted · {{ Number(item.rejected_total ?? 0) }} rejected</div>
                                 </td>
                                 <td class="px-4 py-3 text-xs">
-                                    <span class="font-medium" :class="item.inspection_status === 'Pending Inspection' ? 'text-amber-700' : ''">{{ item.inspection_status ?? (item.inspection_result ? inspectionLabels[item.inspection_result] : 'Pending Inspection') }}</span>
-                                    <div v-if="item.inspection_result" class="text-muted-foreground">{{ item.accepted_quantity }} accepted · {{ item.rejected_quantity }} rejected</div>
-                                    <div v-if="item.posted_at" class="text-emerald-700">{{ item.posted_quantity }} in stock</div>
-                                    <div v-else-if="item.inspection_result && (item.accepted_quantity ?? 0) > 0" class="text-muted-foreground">
-                                        {{ (item.invoices ?? []).some((i) => i.status === 'Verified') ? 'Invoice verified · ready to post' : 'Awaiting verified invoice' }}
-                                    </div>
+                                    <span class="inline-flex items-center rounded-md border px-2 py-0.5 font-medium" :class="inboundQualityClass[item.quality_status] ?? inboundQualityClass.Cancelled">{{ item.quality_status }}</span>
                                 </td>
                                 <td class="whitespace-nowrap px-4 py-3 text-right">
-                                    <button
-                                        v-if="canPost(item)"
-                                        type="button"
-                                        class="mr-1 rounded-lg border border-[#4b5320] px-2 py-1 text-xs font-medium text-[#4b5320] hover:bg-gray-50"
-                                        :disabled="postingId === item.id"
-                                        @click="postToInventory(item)"
-                                    >
-                                        Post {{ item.accepted_quantity }} to inventory
+                                    <button type="button" class="mr-1 inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1 text-xs font-medium hover:bg-gray-50" :data-test="`view-delivery-${item.id}`" @click="viewingDeliveryId = item.id">
+                                        <Eye class="size-3.5" /> View
                                     </button>
                                     <button
-                                        v-if="item.purchase_order_id"
+                                        v-if="item.status !== 'cancelled'"
                                         type="button"
-                                        class="mr-1 rounded-lg border border-gray-200 px-2 py-1 text-xs font-medium hover:bg-gray-50"
-                                        @click="workspacePoId = item.purchase_order_id ?? null"
+                                        class="mr-1 inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1 text-xs font-medium hover:bg-gray-50"
+                                        :disabled="loadingCorrectionId === item.id"
+                                        @click="openCorrectionById(item.id)"
                                     >
-                                        Open PO
+                                        <Pencil class="size-3.5" /> {{ item.quality_status === 'Pending Inspection' ? 'Inspect' : 'Correct' }}
                                     </button>
                                     <button
-                                        v-if="!item.posted_at && (!item.inspection_result || isAdmin)"
+                                        v-if="canDelete && isAdmin && item.status !== 'cancelled'"
                                         type="button"
-                                        class="mr-1 rounded-lg border border-gray-200 px-2 py-1 text-xs font-medium hover:bg-gray-50"
-                                        @click="openInspection(item)"
-                                    >
-                                        {{ item.inspection_result ? 'Correct inspection' : 'Inspect' }}
-                                    </button>
-                                    <button
-                                        v-if="canDelete"
-                                        @click="confirmDeleteInbound(item.id)"
                                         class="rounded-lg p-1 text-muted-foreground hover:bg-rose-50 hover:text-rose-600"
+                                        :aria-label="`Delete delivery ${item.delivery_number}`"
+                                        @click="confirmDeleteInbound(item)"
                                     >
                                         <Trash2 class="size-4" />
                                     </button>
@@ -1103,6 +1113,13 @@ const executeDeleteInbound = () => {
                             </tr>
                         </tbody>
                     </table>
+                </div>
+                <div v-if="(inboundDeliveries?.last_page ?? 1) > 1" class="flex items-center justify-between border-t border-gray-200 px-4 py-3 text-xs text-muted-foreground">
+                    <span>Page {{ inboundDeliveries?.current_page }} of {{ inboundDeliveries?.last_page }} · {{ inboundDeliveries?.total }} deliveries</span>
+                    <div class="flex gap-2">
+                        <button type="button" class="secondary-button min-h-8 px-3 py-1 text-xs" :disabled="(inboundDeliveries?.current_page ?? 1) <= 1" @click="goToInboundPage((inboundDeliveries?.current_page ?? 1) - 1)">Previous</button>
+                        <button type="button" class="secondary-button min-h-8 px-3 py-1 text-xs" :disabled="(inboundDeliveries?.current_page ?? 1) >= (inboundDeliveries?.last_page ?? 1)" @click="goToInboundPage((inboundDeliveries?.current_page ?? 1) + 1)">Next</button>
+                    </div>
                 </div>
             </div>
         </template>
@@ -1115,7 +1132,7 @@ const executeDeleteInbound = () => {
         <div class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-gray-200 bg-card p-6 shadow-xl">
             <div class="flex items-center gap-3 text-blue-600">
                 <Navigation class="size-6 shrink-0" />
-                <h3 class="text-lg font-semibold text-foreground">{{ selectedFulfillment?.status === 'delivery_failed' || selectedFulfillment?.status === 'delivery_rescheduled' ? 'Dispatch again' : 'Dispatch release' }}</h3>
+                <h3 class="text-lg font-semibold text-foreground">{{ selectedFulfillment?.status === 'ready_for_delivery' && (selectedFulfillment?.attempt_count ?? 0) > 0 ? 'Dispatch again' : 'Dispatch release' }}</h3>
             </div>
             <p class="mt-3 text-sm text-muted-foreground leading-relaxed">
                 Confirm that <strong class="text-foreground">{{ selectedFulfillment?.open_release?.release_number ?? selectedFulfillment?.fulfillment_number }}</strong> is leaving for <strong class="text-foreground">{{ selectedFulfillment?.recipient_name }}</strong>.
@@ -1705,7 +1722,7 @@ const executeDeleteInbound = () => {
                     <textarea id="su-remarks" v-model="statusForm.remarks" rows="2" maxlength="1000" :required="statusChoice.needs === 'attempt'" class="field-control"></textarea>
                 </div>
 
-                <p v-if="statusChoice.status && ['ready_for_delivery', 'out_for_delivery', 'delivered', 'delivery_attempt_failed', 'cancelled'].includes(statusChoice.status)" class="text-xs text-muted-foreground">
+                <p v-if="statusChoice.status && ['ready_for_delivery', 'in_transit', 'delivered', 'cancelled'].includes(statusChoice.status)" class="text-xs text-muted-foreground">
                     The customer is emailed about this change.
                 </p>
             </div>
@@ -1765,128 +1782,91 @@ const executeDeleteInbound = () => {
     </div>
 
     <!-- ========================================================= -->
-    <!-- MODAL 8: CREATE INBOUND PO RECORD (Preserved)             -->
+    <!-- INBOUND P.O. DELIVERY: record / correct, view, delete      -->
     <!-- ========================================================= -->
-    <div v-if="showCreateInboundModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-        <div class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-gray-200 bg-card p-6 shadow-xl">
-            <h3 class="text-lg font-semibold text-foreground">Record Inbound Supplier Delivery</h3>
-            <p class="mt-1 text-xs text-muted-foreground">Goods are received only against a purchase order sent to the supplier. Enter what actually arrived; stock changes only after inspection and invoice verification.</p>
-            <form @submit.prevent="submitInboundDelivery" class="mt-4 space-y-4">
-                <div>
-                    <label class="field-label" for="ib-po">Purchase order</label>
-                    <select id="ib-po" v-model="inboundForm.purchase_order_id" required class="field-control">
-                        <option :value="null" disabled>Select an open purchase order</option>
-                        <option v-for="po in purchaseOrders ?? []" :key="po.id" :value="po.id">{{ po.po_number }} · {{ po.description }} · {{ po.remaining }} of {{ po.quantity }} still owed</option>
-                    </select>
-                    <p v-if="!(purchaseOrders ?? []).length" class="mt-1 text-xs text-amber-700">No purchase order is waiting for goods.</p>
-                </div>
-                <div class="grid grid-cols-2 gap-3">
-                    <div>
-                        <label class="field-label" for="ib-date">Delivery date</label>
-                        <input id="ib-date" v-model="inboundForm.delivery_date" type="date" :max="new Date().toISOString().slice(0, 10)" required class="field-control" />
-                    </div>
-                    <div>
-                        <label class="field-label" for="ib-qty">Delivered quantity</label>
-                        <input id="ib-qty" v-model.number="inboundForm.quantity" type="number" min="1" required class="field-control" />
-                    </div>
-                </div>
-                <div>
-                    <label class="field-label" for="ib-doc">Supplier delivery document no.</label>
-                    <input id="ib-doc" v-model="inboundForm.supplier_document_number" type="text" class="field-control" />
-                </div>
-                <div v-if="selectedInboundPo && inboundForm.quantity > (selectedInboundPo.remaining ?? 0)">
-                    <label class="field-label" for="ib-over">Reason for receiving more than is owed (administrator only)</label>
-                    <input id="ib-over" v-model="inboundForm.over_receipt_reason" type="text" class="field-control" />
-                </div>
-                <div>
-                    <label class="field-label" for="ib-notes">Remarks / discrepancies</label>
-                    <input id="ib-notes" v-model="inboundForm.notes" type="text" class="field-control" />
-                </div>
-                <p v-for="(e, k) in inboundForm.errors" :key="k" class="text-xs text-rose-600">{{ e }}</p>
-                <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:items-center sm:justify-end">
-                    <button @click="showCreateInboundModal = false" type="button" class="secondary-button">Cancel</button>
-                    <button type="submit" :disabled="inboundForm.processing" class="brand-button">Save Delivery</button>
-                </div>
-            </form>
-        </div>
-    </div>
+    <InboundDeliveryRecorder
+        :open="showRecorder"
+        :team-slug="teamSlug"
+        :is-admin="!!isAdmin"
+        :orders="receivableOrders ?? []"
+        :products="products ?? []"
+        :categories="productCategories ?? []"
+        :delivery="correctingDelivery"
+        @close="closeRecorder"
+        @saved="onRecorderSaved"
+    />
+    <InboundDeliveryDetails
+        :delivery-id="viewingDeliveryId"
+        :team-slug="teamSlug"
+        :reload-key="detailsReloadKey"
+        @close="viewingDeliveryId = null"
+        @correct="openCorrection"
+        @delete="confirmDeleteInbound"
+        @open-po="(id) => (workspacePoId = id)"
+        @post="postToInventory"
+    />
 
-    <!-- ========================================================= -->
-    <!-- MODAL 9: DELETE INBOUND CONFIRMATION                      -->
-    <!-- ========================================================= -->
-    <div v-if="showDeleteConfirm" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-        <div class="max-h-[90vh] w-full max-w-sm overflow-y-auto rounded-xl border border-rose-200 bg-card p-6 shadow-xl">
-            <h3 class="text-base font-semibold text-foreground">Delete Delivery Record?</h3>
-            <p class="mt-2 text-xs text-muted-foreground">Are you sure you want to delete this delivery record? This action cannot be undone.</p>
+    <!-- Delete (cancel) an inbound delivery: admin only -->
+    <div v-if="deliveryToDelete" class="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4" @click.self="deliveryToDelete = null">
+        <form class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-rose-200 bg-card p-6 shadow-xl" role="dialog" aria-modal="true" aria-labelledby="delete-inbound-title" @submit.prevent="executeDeleteInbound">
+            <h3 id="delete-inbound-title" class="text-base font-semibold text-foreground">Delete delivery {{ deliveryToDelete.delivery_number }}</h3>
+            <p class="mt-2 text-xs leading-relaxed text-muted-foreground">
+                The record is kept as Cancelled for the audit trail. The units it added to inventory are taken back out and the purchase order's receiving status is recalculated.
+                It is refused if those units were already used (stock would go negative).
+            </p>
+            <label for="delete-inbound-reason" class="field-label mt-4">Reason</label>
+            <textarea id="delete-inbound-reason" v-model="deleteInboundReason" rows="2" maxlength="500" required class="field-control"></textarea>
+            <label for="delete-inbound-confirm" class="mt-3 mb-1.5 block text-xs font-semibold text-gray-700">
+                Type <span class="rounded border border-rose-200 bg-rose-50 px-1.5 py-0.5 font-mono font-semibold text-rose-600">YES</span> to confirm:
+            </label>
+            <input id="delete-inbound-confirm" v-model="deleteInboundConfirmInput" type="text" placeholder="Type YES here" autocomplete="off"
+                   class="w-full rounded-xl border border-gray-300 px-3 py-2 font-mono text-sm focus:border-rose-500 focus:outline-none focus:ring-1 focus:ring-rose-500" />
             <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:items-center sm:justify-end">
-                <button @click="showDeleteConfirm = false" type="button" class="secondary-button">Cancel</button>
-                <button @click="executeDeleteInbound" type="button" class="inline-flex min-h-10 items-center justify-center rounded-xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-rose-700">Delete</button>
-            </div>
-        </div>
-    </div>
-    <!-- Goods-receipt inspection -->
-    <div v-if="inspectingDelivery" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" @click.self="inspectingDelivery = null">
-        <form class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-gray-200 bg-card p-6" role="dialog" aria-modal="true" aria-labelledby="inspect-title" @submit.prevent="submitInspection">
-            <h3 id="inspect-title" class="text-lg font-semibold text-foreground">Inspect delivery {{ inspectingDelivery.delivery_number }}</h3>
-            <p class="mt-1 text-sm text-muted-foreground">
-                {{ inspectingDelivery.quantity }} {{ inspectingDelivery.unit }} received from {{ inspectingDelivery.supplier?.name || 'unknown supplier' }}.
-                Record what was accepted and rejected; the result is worked out from these numbers.
-            </p>
-            <div class="mt-4 grid grid-cols-2 gap-3">
-                <div>
-                    <label class="field-label" for="insp-accepted">Accepted</label>
-                    <input id="insp-accepted" v-model.number="inspectionForm.accepted_quantity" type="number" min="0" :max="inspectingDelivery.quantity" class="field-control" required />
-                </div>
-                <div>
-                    <label class="field-label" for="insp-rejected">Rejected</label>
-                    <input id="insp-rejected" v-model.number="inspectionForm.rejected_quantity" type="number" min="0" :max="inspectingDelivery.quantity" class="field-control" required />
-                </div>
-            </div>
-            <p class="mt-1 text-xs" :class="inspectionForm.accepted_quantity + inspectionForm.rejected_quantity === inspectingDelivery.quantity ? 'text-muted-foreground' : 'text-rose-600'">
-                Accepted + rejected must equal {{ inspectingDelivery.quantity }} (now {{ inspectionForm.accepted_quantity + inspectionForm.rejected_quantity }}).
-            </p>
-            <p v-if="inspectionForm.errors.accepted_quantity" class="mt-1 text-xs text-rose-600">{{ inspectionForm.errors.accepted_quantity }}</p>
-            <div class="mt-3">
-                <label class="field-label" for="insp-date">Inspection date</label>
-                <input id="insp-date" v-model="inspectionForm.inspected_on" type="date" :min="inspectingDelivery.delivery_date.slice(0, 10)" :max="new Date().toISOString().slice(0, 10)" class="field-control" required />
-                <p v-if="inspectionForm.errors.inspected_on" class="mt-1 text-xs text-rose-600">{{ inspectionForm.errors.inspected_on }}</p>
-            </div>
-            <div v-if="inspectionForm.rejected_quantity > 0" class="mt-3 grid grid-cols-2 gap-3">
-                <div>
-                    <label class="field-label" for="insp-dmg">of which damaged</label>
-                    <input id="insp-dmg" v-model.number="inspectionForm.damaged_quantity" type="number" min="0" :max="inspectionForm.rejected_quantity" class="field-control" />
-                </div>
-                <div>
-                    <label class="field-label" for="insp-def">of which defective</label>
-                    <input id="insp-def" v-model.number="inspectionForm.defective_quantity" type="number" min="0" :max="inspectionForm.rejected_quantity" class="field-control" />
-                </div>
-                <p class="col-span-2 text-xs text-muted-foreground">{{ otherRejected }} rejected for another reason. Rejected units are held and never added to stock.</p>
-                <p v-if="inspectionForm.errors.damaged_quantity" class="col-span-2 text-xs text-rose-600">{{ inspectionForm.errors.damaged_quantity }}</p>
-            </div>
-            <div v-if="inspectionForm.rejected_quantity > 0" class="mt-3">
-                <label class="field-label" for="insp-cat">Rejection category{{ otherRejected === 0 ? ' (optional)' : '' }}</label>
-                <select id="insp-cat" v-model="inspectionForm.rejection_category" class="field-control" :required="otherRejected > 0">
-                    <option value="">{{ otherRejected === 0 ? 'From the breakdown' : 'Choose…' }}</option>
-                    <option v-for="c in rejectionCategories" :key="c" :value="c">{{ c.replace(/_/g, ' ') }}</option>
-                </select>
-                <p v-if="inspectionForm.errors.rejection_category" class="mt-1 text-xs text-rose-600">{{ inspectionForm.errors.rejection_category }}</p>
-            </div>
-            <div v-if="inspectionForm.rejected_quantity > 0" class="mt-3">
-                <label class="field-label" for="insp-reason">Defect or rejection reason</label>
-                <textarea id="insp-reason" v-model="inspectionForm.rejection_reason" rows="2" maxlength="1000" class="field-control" required></textarea>
-                <p v-if="inspectionForm.errors.rejection_reason" class="mt-1 text-xs text-rose-600">{{ inspectionForm.errors.rejection_reason }}</p>
-            </div>
-            <div class="mt-3">
-                <label class="field-label" for="insp-remarks">Remarks (optional)</label>
-                <textarea id="insp-remarks" v-model="inspectionForm.inspection_remarks" rows="2" maxlength="1000" class="field-control"></textarea>
-            </div>
-            <p v-if="inspectionError" class="mt-2 text-xs text-rose-600">{{ inspectionError }}</p>
-            <div class="mt-5 flex justify-end gap-2">
-                <button type="button" class="secondary-button" @click="inspectingDelivery = null">Cancel</button>
-                <button type="submit" class="brand-button" :disabled="inspectionForm.processing || inspectionForm.accepted_quantity + inspectionForm.rejected_quantity !== inspectingDelivery.quantity">Save inspection</button>
+                <button type="button" class="secondary-button" @click="deliveryToDelete = null">Cancel</button>
+                <button
+                    type="submit"
+                    :disabled="deleteInboundConfirmInput !== 'YES' || !deleteInboundReason.trim() || deletingInbound"
+                    class="inline-flex min-h-10 items-center justify-center rounded-xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                    {{ deletingInbound ? 'Deleting…' : 'Delete' }}
+                </button>
             </div>
         </form>
     </div>
+    <!-- Delete customer delivery confirmation (admin only) -->
+    <div v-if="outboundToDelete" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" @click.self="outboundToDelete = null">
+        <div class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-rose-200 bg-card p-6 shadow-xl" role="dialog" aria-modal="true" aria-labelledby="delete-outbound-title">
+            <h3 id="delete-outbound-title" class="text-base font-semibold text-foreground">Delete Customer Delivery</h3>
+            <p class="mt-2 text-xs text-muted-foreground leading-relaxed">
+                Move delivery <span class="font-mono font-semibold text-foreground">{{ outboundToDelete.fulfillment_number }}</span><template v-if="outboundToDelete.recipient_name"> for {{ outboundToDelete.recipient_name }}</template>
+                to the Recycle Bin? The sales order, its stock records and its status history are kept. An Admin can restore it from the Recycle Bin. The deletion is recorded in the audit trail.
+            </p>
+            <div class="mt-4 mb-5">
+                <label for="delete-outbound-confirm" class="block text-xs font-semibold text-gray-700 mb-1.5">
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm deletion:
+                </label>
+                <input
+                    id="delete-outbound-confirm"
+                    v-model="deleteOutboundConfirmInput"
+                    type="text"
+                    placeholder="Type YES here"
+                    class="w-full px-3 py-2 text-sm font-mono rounded-xl border border-gray-300 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                    @keyup.enter="deleteOutboundConfirmInput === 'YES' && executeDeleteOutbound()"
+                />
+            </div>
+            <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:items-center sm:justify-end">
+                <button @click="outboundToDelete = null" type="button" class="secondary-button">Cancel</button>
+                <button
+                    @click="executeDeleteOutbound"
+                    type="button"
+                    :disabled="deleteOutboundConfirmInput !== 'YES' || deletingOutbound"
+                    class="inline-flex min-h-10 items-center justify-center rounded-xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    {{ deletingOutbound ? 'Deleting...' : 'Delete' }}
+                </button>
+            </div>
+        </div>
+    </div>
 
-    <PurchaseOrderWorkspace :po-id="workspacePoId" :is-admin="!!isAdmin" @close="workspacePoId = null; router.reload({ only: ['inboundDeliveries', 'purchaseOrders', 'inboundMetrics'] })" />
+    <PurchaseOrderWorkspace :po-id="workspacePoId" :is-admin="!!isAdmin" @close="workspacePoId = null; detailsReloadKey++; router.reload({ only: ['inboundDeliveries', 'purchaseOrders', 'receivableOrders', 'inboundMetrics'] })" />
 </template>

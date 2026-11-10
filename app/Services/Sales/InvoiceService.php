@@ -2,7 +2,10 @@
 
 namespace App\Services\Sales;
 
+use App\Enums\EmailStatus;
+use App\Enums\SalesOrderStatus;
 use App\Exceptions\WorkflowException;
+use App\Models\NotificationLog;
 use App\Models\Sale;
 use App\Models\SalesInvoice;
 use App\Models\User;
@@ -69,7 +72,7 @@ class InvoiceService
         return $invoice;
     }
 
-    /** Cancel an issued invoice, optionally issuing a corrected replacement (emailed to the customer). */
+    /** Cancel an issued invoice, optionally issuing a corrected replacement (staff then send it with "Send Commercial Invoice"). */
     public function cancel(SalesInvoice $invoice, string $reason, User $user, bool $reissue): ?SalesInvoice
     {
         if (! $user->isAdmin()) {
@@ -92,11 +95,56 @@ class InvoiceService
                 return null;
             }
 
-            $replacement = $this->issue($sale, "reissue-{$invoice->id}", $user, $invoice);
-            $this->notifier->notify('invoice_issued', $replacement, "invoice_issued:{$replacement->id}");
-
-            return $replacement;
+            return $this->issue($sale, "reissue-{$invoice->id}", $user, $invoice);
         });
+    }
+
+    /** A send still in progress after this long is treated as interrupted, so it can be tried again. */
+    public const SEND_TIMEOUT_MINUTES = 5;
+
+    /**
+     * "Send Commercial Invoice": email the issued invoice (PDF attached) to the customer, now.
+     * Never automatic. Available once the order is confirmed; an invoice already emailed is sent
+     * again only when staff ask for it ($resend). Every attempt is kept in the email log, whose
+     * sent_at is the sending date and time; nothing is marked sent unless the email went out.
+     */
+    public function send(SalesInvoice $invoice, User $user, bool $resend = false): NotificationLog
+    {
+        $log = DB::transaction(function () use ($invoice, $user, $resend) {
+            $invoice = SalesInvoice::whereKey($invoice->id)->lockForUpdate()->firstOrFail();
+            $sale = Sale::whereKey($invoice->sale_id)->firstOrFail();
+
+            if ($invoice->status !== SalesInvoice::ISSUED) {
+                throw new WorkflowException("Invoice {$invoice->invoice_number} is cancelled and cannot be sent.");
+            }
+            if (! in_array($sale->status, [SalesOrderStatus::Confirmed, SalesOrderStatus::Processing, SalesOrderStatus::Completed], true)) {
+                throw new WorkflowException("Order {$sale->order_number} is {$sale->status->label()}: the commercial invoice can be sent once the order is confirmed.");
+            }
+            $email = trim((string) ($sale->email ?: $sale->quotation?->email));
+            if (! filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                throw new WorkflowException("Order {$sale->order_number} has no valid customer email address. Add one to the order first.", 'email');
+            }
+
+            $previous = NotificationLog::where('notifiable_type', 'SalesInvoice')->where('notifiable_id', $invoice->id)->where('type', 'invoice_issued');
+            if ((clone $previous)->where('status', EmailStatus::Pending->value)->where('created_at', '>', now()->subMinutes(self::SEND_TIMEOUT_MINUTES))->exists()) {
+                throw new WorkflowException("Invoice {$invoice->invoice_number} is already being sent. Wait for the result before sending it again.");
+            }
+            $lastSent = (clone $previous)->where('status', EmailStatus::Sent->value)->latest('sent_at')->first();
+            if ($lastSent && ! $resend) {
+                throw new WorkflowException("Invoice {$invoice->invoice_number} was already emailed on ".$lastSent->sent_at?->format('M d, Y h:i A').'. Use Resend to send it again.');
+            }
+
+            $number = $previous->count() + 1;
+            $log = $this->notifier->record('invoice_issued', $invoice, "invoice_issued:{$invoice->id}:send-{$number}", ['send_number' => $number]);
+            AuditLogger::record($lastSent ? 'invoice.resend_requested' : 'invoice.send_requested',
+                "Commercial invoice {$invoice->invoice_number} ".($lastSent ? 'sent again' : 'sent')." to {$email} by {$user->name}.", $sale, ['invoice_id' => $invoice->id, 'to' => $email, 'send_number' => $number], $user);
+
+            return $log;
+        });
+
+        $this->storePdf($invoice); // the attached PDF is the stored, issued one
+
+        return $this->notifier->deliverNow($log);
     }
 
     /** Store the issued PDF once; cancelled invoices are rendered fresh, with the cancellation shown. */

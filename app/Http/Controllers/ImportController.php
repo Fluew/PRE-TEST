@@ -9,13 +9,18 @@ use App\Models\ImportRow;
 use App\Models\Product;
 use App\Models\Team;
 use App\Models\User;
+use App\Services\Import\ColumnSchema;
+use App\Services\Import\ImportFailure;
 use App\Services\Import\ImportService;
 use App\Services\MaterialList\FileReader;
+use Illuminate\Database\QueryException;
+use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
+use PDOException;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 /**
@@ -38,12 +43,14 @@ class ImportController extends Controller
         abort_unless(isset(self::MODULE_ROLE[$module]), 404);
         $this->authorizeModule($request->user(), $module);
 
-        $data = $request->validate([
+        $data = $this->validated($request, [
             'file' => ['required', 'file', 'max:'.(FileReader::STAFF_MAX_BYTES / 1024), 'extensions:csv,txt,xls,xlsx,pdf,png,jpg,jpeg',
                 'mimetypes:text/csv,text/plain,application/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/zip,application/octet-stream,application/x-ole-storage,application/CDFV2,application/pdf,image/png,image/jpeg'],
             'supplier_id' => [Rule::requiredIf($module === ImportBatch::SUPPLIER_QUOTATION), 'nullable', 'integer', Rule::exists('suppliers', 'id')->where('team_id', $team->id)],
-            'quoted_on' => [Rule::requiredIf($module === ImportBatch::SUPPLIER_QUOTATION), 'nullable', 'date', 'before_or_equal:today'],
-            'valid_until' => ['nullable', 'date', 'after_or_equal:quoted_on'],
+            // Optional: left blank, the quotation date is read from the document (and must be
+            // confirmed in the review when it is missing or cannot be read reliably).
+            'quoted_on' => ['nullable', 'date_format:Y-m-d', 'before_or_equal:today'],
+            'valid_until' => ['nullable', 'date_format:Y-m-d', ...($request->filled('quoted_on') ? ['after_or_equal:quoted_on'] : [])],
             'currency' => ['nullable', 'string', 'size:3'],
             'tax_inclusive' => ['nullable', 'boolean'],
             'reference' => ['nullable', 'string', 'max:100'],
@@ -51,11 +58,13 @@ class ImportController extends Controller
             'file.max' => 'The file is larger than 25 MB.',
             'file.extensions' => 'Upload a CSV, Excel (.xls/.xlsx), PDF, PNG or JPG file.',
             'file.mimetypes' => 'The file content does not match a CSV, Excel, PDF, PNG or JPG file.',
+            'quoted_on.date_format' => 'The quotation date must be a valid date (YYYY-MM-DD).',
+            'valid_until.date_format' => 'The validity date must be a valid date (YYYY-MM-DD).',
         ]);
 
         $meta = $module === ImportBatch::SUPPLIER_QUOTATION ? [
             'supplier_id' => (int) $data['supplier_id'],
-            'quoted_on' => $data['quoted_on'],
+            'quoted_on' => $data['quoted_on'] ?? null,
             'valid_until' => $data['valid_until'] ?? null,
             'currency' => strtoupper($data['currency'] ?? 'USD'),
             'tax_inclusive' => (bool) ($data['tax_inclusive'] ?? false),
@@ -64,11 +73,17 @@ class ImportController extends Controller
 
         try {
             $batch = $this->imports->upload($team, $request->user(), $module, $request->file('file'), $meta);
+
+            return response()->json($this->present($batch->fresh()), 201);
         } catch (WorkflowException $e) {
             return response()->json(['message' => $e->getMessage(), 'errors' => [$e->field => [$e->getMessage()]]], 422);
-        }
+        } catch (ImportFailure $e) {
+            return $this->serverProblem($e->getMessage());
+        } catch (QueryException|PDOException $e) {
+            report($e);
 
-        return response()->json($this->present($batch->fresh()), 201);
+            return $this->serverProblem(ImportFailure::fromThrowable($e, ImportFailure::UPLOAD)->getMessage());
+        }
     }
 
     public function index(Request $request, mixed $current_team, string $module): JsonResponse
@@ -86,14 +101,21 @@ class ImportController extends Controller
     public function show(Request $request): JsonResponse
     {
         $batch = $this->batch($request);
-        $data = $request->validate(['status' => ['nullable', Rule::in(['all', 'attention', ImportRow::READY, ImportRow::NEEDS_REVIEW, ImportRow::DUPLICATE, ImportRow::EXISTING, ImportRow::SKIPPED, ImportRow::IMPORTED])], 'per_page' => ['nullable', 'integer', 'min:10', 'max:200']]);
+        $data = $this->validated($request, ['status' => ['nullable', Rule::in(['all', 'attention', ImportRow::READY, ImportRow::NEEDS_REVIEW, ImportRow::DUPLICATE, ImportRow::EXISTING, ImportRow::SKIPPED, ImportRow::IMPORTED])], 'per_page' => ['nullable', 'integer', 'min:10', 'max:200']]);
 
-        $rows = $batch->rows()->with('matchedProduct:id,name,sku,unit')
-            ->when(($data['status'] ?? 'all') === 'attention', fn ($q) => $q->whereIn('status', [ImportRow::NEEDS_REVIEW, ImportRow::DUPLICATE]))
-            ->when(! in_array($data['status'] ?? 'all', ['all', 'attention'], true), fn ($q) => $q->where('status', $data['status']))
-            ->orderBy('row_number')->paginate($data['per_page'] ?? 50);
+        return $this->json(function () use ($batch, $data) {
+            if ($batch->status === ImportBatch::QUEUED) {
+                // Not taken by a queue worker yet: read it now (a failure is stored on the batch).
+                $this->imports->processNow($batch);
+                $batch = $batch->fresh(['uploadedBy:id,name', 'importedBy:id,name']) ?? $batch;
+            }
+            $rows = $batch->rows()->with('matchedProduct:id,name,sku,unit')
+                ->when(($data['status'] ?? 'all') === 'attention', fn ($q) => $q->whereIn('status', [ImportRow::NEEDS_REVIEW, ImportRow::DUPLICATE]))
+                ->when(! in_array($data['status'] ?? 'all', ['all', 'attention'], true), fn ($q) => $q->where('status', $data['status']))
+                ->orderBy('row_number')->paginate($data['per_page'] ?? 50);
 
-        return response()->json(['batch' => $this->present($batch), 'rows' => $rows]);
+            return ['batch' => $this->present($batch), 'rows' => $rows];
+        });
     }
 
     public function updateRow(Request $request): JsonResponse
@@ -103,7 +125,7 @@ class ImportController extends Controller
         $fields = $batch->module === ImportBatch::INVENTORY
             ? ['sku', 'name', 'category', 'brand', 'unit', 'cost_price', 'price']
             : ['description', 'item_code', 'unit', 'quantity', 'unit_price', 'amount'];
-        $data = $request->validate([
+        $data = $this->validated($request, [
             'values' => ['nullable', 'array'],
             'values.*' => ['nullable', 'string', 'max:1000'],
             'product_id' => ['nullable', 'integer'],
@@ -117,17 +139,66 @@ class ImportController extends Controller
     public function bulk(Request $request): JsonResponse
     {
         $batch = $this->batch($request);
-        $data = $request->validate(['action' => ['required', Rule::in(['skip_problems', 'restore'])]]);
+        $data = $this->validated($request, ['action' => ['required', Rule::in(['skip_problems', 'restore'])]]);
 
         return $this->json(fn () => ['changed' => $this->imports->bulkSkip($batch, $request->user(), $data['action'] === 'restore' ? 'restore' : 'skip')]);
+    }
+
+    /** Set or correct the quotation dates of a supplier quotation import during review. */
+    public function updateDates(Request $request): JsonResponse
+    {
+        $batch = $this->batch($request);
+        $data = $this->validated($request, [
+            'quoted_on' => ['required', 'date_format:Y-m-d', 'before_or_equal:today'],
+            'valid_until' => ['nullable', 'date_format:Y-m-d', 'after_or_equal:quoted_on'],
+        ], [
+            'quoted_on.required' => 'Enter the quotation date.',
+            'quoted_on.date_format' => 'The quotation date must be a valid date (YYYY-MM-DD).',
+            'quoted_on.before_or_equal' => 'The quotation date cannot be in the future.',
+            'valid_until.date_format' => 'The validity date must be a valid date (YYYY-MM-DD).',
+            'valid_until.after_or_equal' => 'The validity date cannot be before the quotation date.',
+        ]);
+
+        return $this->json(fn () => ['batch' => $this->present($this->imports->updateQuoteDates($batch, $request->user(), $data['quoted_on'], $data['valid_until'] ?? null))]);
     }
 
     public function confirm(Request $request): JsonResponse
     {
         $batch = $this->batch($request);
-        $data = $request->validate(['ocr_checked' => ['nullable', 'boolean']]);
+        $data = $this->validated($request, ['ocr_checked' => ['nullable', 'boolean']]);
 
         return $this->json(fn () => $this->imports->confirm($batch, $request->user(), (bool) ($data['ocr_checked'] ?? false)) + ['batch' => $this->present($batch->fresh())]);
+    }
+
+    /**
+     * The extracted table, for choosing the header row and columns by hand (see
+     * ImportService::table()).
+     */
+    public function table(Request $request): JsonResponse
+    {
+        $batch = $this->batch($request);
+
+        return $this->json(fn () => $this->imports->table($batch));
+    }
+
+    /** Rebuild the preview rows with the header row and columns chosen by staff. */
+    public function remap(Request $request): JsonResponse
+    {
+        $batch = $this->batch($request);
+        $data = $this->validated($request, [
+            'header_row' => ['nullable', 'integer', 'min:0'],
+            'columns' => ['required', 'array'],
+            'columns.*' => ['nullable', 'integer', 'min:0', 'max:'.(FileReader::MAX_COLS - 1)],
+        ], [
+            'columns.required' => 'Choose the column of each field.',
+            'columns.*.integer' => 'Choose one of the columns shown.',
+            'columns.*.min' => 'Choose one of the columns shown.',
+            'columns.*.max' => 'Choose one of the columns shown.',
+        ]);
+        $columns = array_map(fn ($c) => $c === null ? null : (int) $c, array_intersect_key($data['columns'], ColumnSchema::FIELDS[$batch->module]));
+        $headerRow = isset($data['header_row']) ? (int) $data['header_row'] : null;
+
+        return $this->json(fn () => ['batch' => $this->present($this->imports->remap($batch, $request->user(), $headerRow, $columns))]);
     }
 
     public function cancel(Request $request): JsonResponse
@@ -163,20 +234,62 @@ class ImportController extends Controller
 
     private function present(ImportBatch $b): array
     {
-        return $b->only(['id', 'module', 'status', 'original_filename', 'file_type', 'file_size', 'extraction_method', 'page_count', 'meta', 'summary', 'error', 'attempts', 'processed_at', 'imported_at', 'created_at']) + [
+        return $b->only(['id', 'module', 'status', 'original_filename', 'file_type', 'file_size', 'extraction_method', 'page_count', 'meta', 'summary', 'error', 'attempts', 'processed_at', 'imported_at', 'completed_at', 'created_at']) + [
             'uses_ocr' => $b->usedOcr(),
+            'date_issues' => $b->module === ImportBatch::SUPPLIER_QUOTATION && in_array($b->status, [ImportBatch::READY, ImportBatch::COMPLETED], true)
+                ? $this->imports->quoteDateIssues($b)
+                : [],
             'uploaded_by' => $b->uploadedBy?->name,
             'imported_by' => $b->importedBy?->name,
         ];
     }
 
+    /**
+     * A business rule (422) or a server problem (503) as a message staff can read. Database
+     * errors are logged, never shown.
+     */
     private function json(callable $fn): JsonResponse
     {
         try {
             return response()->json($fn());
         } catch (WorkflowException $e) {
             return response()->json(['message' => $e->getMessage(), 'errors' => [$e->field => [$e->getMessage()]]], 422);
+        } catch (ImportFailure $e) {
+            return $this->serverProblem($e->getMessage());
+        } catch (QueryException|PDOException $e) {
+            report($e);
+            $code = ImportFailure::sqlStateOf($e);
+
+            return $this->serverProblem('This change could not be saved because of a database problem. Nothing was changed.'
+                .(ImportFailure::isSchemaError($e)
+                    ? ' The database structure is out of date: ask an administrator to run "php artisan migrate", then try again.'
+                    : ' Try again; if it keeps failing, ask an administrator to check the server logs.')
+                .($code !== null ? " (database error {$code})" : ''));
         }
+    }
+
+    private function serverProblem(string $message): JsonResponse
+    {
+        return response()->json(['message' => $message, 'errors' => ['error' => [$message]]], 503);
+    }
+
+    /**
+     * Validate the request and answer invalid input with JSON (422): these endpoints are called
+     * by the import preview with fetch, and the app renders validation errors as JSON only for
+     * api/* routes (bootstrap/app.php), which would turn them into redirects here.
+     *
+     * @param  array<string, mixed>  $rules
+     * @param  array<string, string>  $messages
+     * @return array<string, mixed>
+     */
+    private function validated(Request $request, array $rules, array $messages = []): array
+    {
+        $validator = Validator::make($request->all(), $rules, $messages);
+        if ($validator->fails()) {
+            throw new HttpResponseException(response()->json(['message' => $validator->errors()->first(), 'errors' => $validator->errors()], 422));
+        }
+
+        return $validator->validated();
     }
 
     private function batch(Request $request): ImportBatch

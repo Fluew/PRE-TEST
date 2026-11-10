@@ -153,7 +153,7 @@ const promptDeleteDevice = (device: DeviceItem) => {
 
         <div class="workspace-page">
             <!-- Header Section -->
-            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <div class="page-header">
                 <div>
                     <h1 class="page-title">
                         Trusted Devices
@@ -207,17 +207,17 @@ const promptDeleteDevice = (device: DeviceItem) => {
                     <table class="w-full text-left text-sm text-gray-600">
                         <thead class="bg-gray-50/80 border-b border-gray-200 text-xs font-semibold text-gray-700">
                             <tr>
-                                <th class="px-6 py-4">Device & Workstation</th>
-                                <th v-if="isAdmin" class="px-6 py-4">Account Owner</th>
-                                <th class="px-6 py-4">IP Address</th>
-                                <th class="px-6 py-4">Status</th>
-                                <th class="px-6 py-4">Last Active</th>
-                                <th class="px-6 py-4 text-right">Actions</th>
+                                <th class="px-4 py-3">Device & Workstation</th>
+                                <th v-if="isAdmin" class="px-4 py-3">Account Owner</th>
+                                <th class="px-4 py-3">IP Address</th>
+                                <th class="px-4 py-3">Status</th>
+                                <th class="px-4 py-3">Last Active</th>
+                                <th class="px-4 py-3 text-right">Actions</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-gray-100">
                             <tr v-for="d in devices" :key="d.id" class="hover:bg-gray-50/60 transition-colors">
-                                <td class="px-6 py-4">
+                                <td class="px-4 py-3">
                                     <div class="flex items-center gap-3">
                                         <div class="flex size-9 shrink-0 items-center justify-center rounded-lg bg-gray-100 text-gray-600">
                                             <Laptop class="size-4" />
@@ -237,16 +237,16 @@ const promptDeleteDevice = (device: DeviceItem) => {
                                     </div>
                                 </td>
 
-                                <td v-if="isAdmin" class="px-6 py-4">
+                                <td v-if="isAdmin" class="px-4 py-3">
                                     <div class="font-medium text-gray-900">{{ d.user.name }}</div>
                                     <div class="text-xs text-gray-400">{{ d.user.email }} ({{ d.user.role }})</div>
                                 </td>
 
-                                <td class="px-6 py-4 font-mono text-xs text-gray-700">
+                                <td class="px-4 py-3 font-mono text-xs text-gray-700">
                                     {{ d.ip_address || '—' }}
                                 </td>
 
-                                <td class="px-6 py-4">
+                                <td class="px-4 py-3">
                                     <span
                                         v-if="d.status === 'approved'"
                                         class="inline-flex items-center gap-1.5 rounded-full bg-green-50 px-2.5 py-1 text-xs font-semibold text-green-700 border border-green-200"
@@ -267,11 +267,11 @@ const promptDeleteDevice = (device: DeviceItem) => {
                                     </span>
                                 </td>
 
-                                <td class="px-6 py-4 text-xs text-gray-500">
+                                <td class="px-4 py-3 text-xs text-gray-500">
                                     {{ d.last_used_at }}
                                 </td>
 
-                                <td class="px-6 py-4 text-right">
+                                <td class="px-4 py-3 text-right">
                                     <div class="flex items-center justify-end gap-2">
                                         <button
                                             v-if="isAdmin && d.status !== 'approved'"
@@ -305,7 +305,7 @@ const promptDeleteDevice = (device: DeviceItem) => {
                             </tr>
 
                             <tr v-if="devices.length === 0">
-                                <td :colspan="isAdmin ? 6 : 5" class="px-6 py-12 text-center text-gray-400">
+                                <td :colspan="isAdmin ? 6 : 5" class="px-4 py-12 text-center text-gray-400">
                                     No registered trusted devices found.
                                 </td>
                             </tr>

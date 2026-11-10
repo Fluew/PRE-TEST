@@ -29,6 +29,8 @@ export interface Evaluation {
     criteria: EvaluationCriterion[];
     final_formula: string | null;
     calculated_at: string;
+    /** 1–5 AHP priority scale (product prioritization only). */
+    scale?: { score: number; min: number; max: number; range: string; action: string | null; formula: string } | null;
 }
 
 defineProps<{ evaluation: Evaluation }>();
@@ -100,6 +102,9 @@ const pct = (w: number) => `${Math.round(w * 100)}%`;
         <div class="rounded-xl bg-gray-50 px-3 py-2 font-mono text-xs text-gray-700">
             <template v-if="evaluation.complete">Final: {{ evaluation.final_formula }}</template>
             <template v-else>Final: not calculated (incomplete data)</template>
+            <template v-if="evaluation.complete && evaluation.scale">
+                <br />1–5 priority scale: {{ evaluation.scale.formula }} → {{ evaluation.classification }} ({{ evaluation.scale.range }}){{ evaluation.scale.action ? ` — ${evaluation.scale.action}` : '' }}
+            </template>
         </div>
         <p class="text-xs text-gray-500">Calculated {{ new Date(evaluation.calculated_at).toLocaleString() }} from the current records.</p>
     </div>

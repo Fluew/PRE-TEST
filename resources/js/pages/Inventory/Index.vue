@@ -3,12 +3,9 @@ import { Head, router, usePage } from '@inertiajs/vue3';
 import { useCanDelete } from '@/composables/useCanDelete';
 import { useCurrency } from '@/composables/useCurrency';
 import { showToast } from '@/composables/useFlashToast';
-import { ref, computed, watch } from 'vue';
+import { ref, computed, watch, defineAsyncComponent } from 'vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
 import GlideSelect from '@/components/vue-bits/GlideSelect.vue';
-import ProductPriorityBreakdown, { type ProductPriority } from '@/components/evaluation/ProductPriorityBreakdown.vue';
-import PurchaseRequestCreator, { type PrCandidate } from '@/components/procurement/PurchaseRequestCreator.vue';
-import ImportWizard from '@/components/import/ImportWizard.vue';
 import {
     Upload, 
     Download, 
@@ -32,6 +29,9 @@ import {
     Building2,
     Layers
 } from '@lucide/vue';
+
+// The import wizard is a modal: it downloads after the page renders, not before.
+const ImportWizard = defineAsyncComponent(() => import('@/components/import/ImportWizard.vue'));
 
 interface Supplier {
     id: number;
@@ -101,7 +101,8 @@ interface PaginatedProducts {
     links: PaginationLink[];
 }
 
-type InventoryView = 'table' | 'prioritization' | 'history';
+// Product Catalog or Product Movement. (AHP Product Prioritization is in Reports and Analytics.)
+type InventoryView = 'table' | 'history';
 
 
 const props = defineProps<{
@@ -117,7 +118,6 @@ const props = defineProps<{
     categories: string[];
     suppliers: Supplier[];
     recent_movements: StockMovement[];
-    priorities: ProductPriority[];
     filters: {
         search?: string;
         category?: string;
@@ -134,47 +134,9 @@ const teamSlug = computed(() => (page.props as any).currentTeam?.slug || (page.p
 const searchQuery = ref(props.filters?.search || '');
 const selectedCategory = ref(props.filters?.category || 'All Categories');
 const selectedStatus = ref(props.filters?.status || 'All');
-const activeView = ref<InventoryView>(props.filters?.view || 'table');
-
-const priorityById = computed(() => new Map(props.priorities.map((p) => [p.product.id, p])));
-const veryHighCount = computed(() => props.priorities.filter((p) => p.classification === 'Very High Priority').length);
-const incompleteCount = computed(() => props.priorities.filter((p) => !p.complete).length);
-const selectedPriority = ref<ProductPriority | null>(null);
-
-// Reorder recommendations → Purchase Request. Staff choose; nothing is ordered automatically.
-const reorderRecommendations = computed(() => props.priorities.filter((p) => p.reorder.needed));
-const selectedForRequest = ref<number[]>([]);
-const showPrCreator = ref(false);
-const prCandidates = computed<PrCandidate[]>(() =>
-    props.priorities
-        .filter((p) => selectedForRequest.value.includes(p.product.id))
-        .map((p) => ({
-            product_id: p.product.id,
-            name: p.product.name,
-            sku: p.product.sku,
-            unit: p.product.unit,
-            current_stock: p.criteria.find((c) => c.key === 'stock')?.inputs?.available ?? null,
-            forecast: p.reorder.forecast,
-            ahp_score: p.score,
-            classification: p.classification,
-            recommended_quantity: p.reorder.needed ? p.reorder.suggested_quantity : null,
-        })),
-);
-const onRequestsSubmitted = () => {
-    showPrCreator.value = false;
-    selectedForRequest.value = [];
-};
-const priorityBadgeClass = (p: ProductPriority) => {
-    switch (p.classification) {
-        case 'Very High Priority': return 'border-rose-200 bg-rose-50 text-rose-700';
-        case 'High Priority': return 'border-amber-200 bg-amber-50 text-amber-700';
-        case 'Moderate Priority': return 'border-blue-200 bg-blue-50 text-blue-700';
-        case 'Low Priority':
-        case 'Very Low Priority': return 'border-gray-200 bg-gray-50 text-gray-700';
-        default: return 'border-dashed border-amber-300 bg-white text-amber-700';
-    }
-};
-const priorityInput = (p: ProductPriority, key: string) => p.criteria.find((c) => c.key === key)?.inputs ?? {};
+// An old link may still carry ?view=prioritization: anything but Product Movement opens the catalog.
+const viewOrCatalog = (view?: string | null): InventoryView => (view === 'history' ? 'history' : 'table');
+const activeView = ref<InventoryView>(viewOrCatalog(props.filters?.view));
 
 // Flash toasts are handled globally by useFlashToast in AppSidebarLayout
 
@@ -194,6 +156,8 @@ const triggerNavigation = () => {
             preserveState: true,
             preserveScroll: true,
             replace: true,
+            // Reload only what the filters change.
+            only: ['products', 'summary', 'recent_movements', 'filters'],
         }
     );
 };
@@ -217,6 +181,16 @@ const changeView = (view: InventoryView) => {
     activeView.value = view;
     triggerNavigation();
 };
+
+// Movement history: the change is always new − previous stock (types store the quantity differently).
+const movementLabels: Record<string, string> = {
+    stock_in: 'Stock In', stock_out: 'Stock Out', sale: 'Counter Sale', sale_release: 'Delivered', return: 'Returned', adjustment: 'Adjustment',
+};
+const movementLabel = (m: any) => movementLabels[m.type] ?? String(m.type).replace(/_/g, ' ');
+const movementChange = (m: any) => Number(m.new_stock) - Number(m.previous_stock);
+const movementChangeText = (m: any) => (movementChange(m) > 0 ? '+' : '') + movementChange(m);
+const movementClass = (m: any) => (m.type === 'adjustment' ? 'text-purple-700' : movementChange(m) >= 0 ? 'text-emerald-600' : 'text-amber-700');
+const movementBadgeClass = (m: any) => (m.type === 'adjustment' ? 'bg-purple-50 text-purple-700 border-purple-200' : movementChange(m) >= 0 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-amber-50 text-amber-700 border-amber-200');
 
 // Filtered movements based on active filters
 const filteredMovements = computed(() => {
@@ -270,7 +244,7 @@ watch(() => props.filters, (newFilters) => {
         if (newFilters.status !== undefined) selectedStatus.value = newFilters.status || 'All';
         if (newFilters.category !== undefined) selectedCategory.value = newFilters.category || 'All Categories';
         if (newFilters.search !== undefined) searchQuery.value = newFilters.search || '';
-        if (newFilters.view !== undefined) activeView.value = newFilters.view || 'table';
+        if (newFilters.view !== undefined) activeView.value = viewOrCatalog(newFilters.view);
     }
 }, { deep: true });
 
@@ -371,6 +345,43 @@ const formProduct = ref({
 const formErrors = ref<Record<string, string>>({});
 const isSubmitting = ref(false);
 
+// SKU: generated by the server from the category (BRK-000001, …). A new product shows the next
+// one for its category (assigned when saved); an existing product's SKU never changes.
+const skuLoading = ref(false);
+const skuCopied = ref(false);
+const loadNextSku = async () => {
+    if (isEditing.value || !formProduct.value.category) return;
+    skuLoading.value = true;
+    try {
+        const res = await fetch(`/${teamSlug.value}/inventory/next-sku?category=${encodeURIComponent(formProduct.value.category)}`, { headers: { Accept: 'application/json' } });
+        if (res.ok) formProduct.value.sku = (await res.json()).sku ?? '';
+    } catch {
+        formProduct.value.sku = '';
+    } finally {
+        skuLoading.value = false;
+    }
+};
+watch(() => formProduct.value.category, () => {
+    if (showAddEditModal.value && !isEditing.value) loadNextSku();
+});
+const copySku = async () => {
+    const sku = formProduct.value.sku;
+    if (!sku) return;
+    try {
+        await navigator.clipboard.writeText(sku);
+    } catch {
+        // Clipboard API needs HTTPS or localhost; fall back for the office network.
+        const el = document.createElement('textarea');
+        el.value = sku;
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        el.remove();
+    }
+    skuCopied.value = true;
+    setTimeout(() => (skuCopied.value = false), 1500);
+};
+
 // Stock In Form
 const formStockIn = ref({
     product_id: null as number | null,
@@ -386,7 +397,7 @@ const formStockOut = ref({
     product_id: null as number | null,
     quantity: 1,
     reference_number: '',
-    reason: 'Client Project Deployment',
+    reason: 'Internal Use',
     movement_date: new Date().toISOString().slice(0, 10),
     remarks: '',
 });
@@ -410,7 +421,7 @@ const openAddModal = () => {
     isSubmitting.value = false;
     formProduct.value = {
         name: '',
-        sku: `SKU-${Date.now().toString().slice(-5)}`,
+        sku: '',
         category: props.categories[0] || 'Breakers',
         brand: '',
         unit: 'pcs',
@@ -423,6 +434,7 @@ const openAddModal = () => {
         supplier_id: props.suppliers[0]?.id || null,
     };
     showAddEditModal.value = true;
+    loadNextSku();
 };
 
 const openEditModal = (product: Product) => {
@@ -453,10 +465,7 @@ const promptSaveProduct = () => {
         formErrors.value.name = 'Product name is required.';
         return;
     }
-    if (!formProduct.value.sku || !formProduct.value.sku.trim()) {
-        formErrors.value.sku = 'SKU is required.';
-        return;
-    }
+
     if (formProduct.value.price === null || formProduct.value.price === undefined || formProduct.value.price === ('' as any) || Number(formProduct.value.price) < 0) {
         formErrors.value.price = 'Selling price must be greater than or equal to 0.';
         return;
@@ -483,7 +492,7 @@ const promptSaveProduct = () => {
             description: `Are you sure you want to add this new product to the inventory catalog?`,
             details: [
                 { label: 'Product Name', value: formProduct.value.name },
-                { label: 'SKU', value: formProduct.value.sku },
+                { label: 'SKU', value: formProduct.value.sku ? `${formProduct.value.sku} (assigned when saved)` : 'Assigned when saved' },
                 { label: 'Category', value: formProduct.value.category },
                 { label: 'Selling Price', value: formatPrice(formProduct.value.price) },
                 { label: 'Initial Stock', value: `${formProduct.value.stock ?? 0} ${formProduct.value.unit || 'pcs'}` },
@@ -549,9 +558,10 @@ const openDeleteModal = (product: Product) => {
 };
 
 const deleteProduct = () => {
-    if (!selectedProduct.value) return;
+    if (!selectedProduct.value || deleteConfirmInput.value !== 'YES') return;
     isSubmitting.value = true;
     router.delete(`/${teamSlug.value}/inventory/products/${selectedProduct.value.id}`, {
+        data: { confirmation: deleteConfirmInput.value },
         onSuccess: () => {
             showDeleteModal.value = false;
             selectedProduct.value = null;
@@ -647,7 +657,7 @@ const openStockOutModal = (product?: Product) => {
         product_id: prod?.id || null,
         quantity: 1,
         reference_number: `SO-${Date.now().toString().slice(-4)}`,
-        reason: 'Client Project Deployment',
+        reason: 'Internal Use',
         movement_date: new Date().toISOString().slice(0, 10),
         remarks: '',
     };
@@ -826,20 +836,20 @@ const exportInventory = () => {
 
     <div class="workspace-page relative">
         <!-- Header & Action Controls -->
-        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-4">
+        <div class="page-header">
             <div>
                 <h1 class="page-title">Inventory Management</h1>
                 <p class="page-subtitle">Stock levels, stock movements and reorder status.</p>
             </div>
             
-            <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
+            <div class="page-actions">
                 <!-- Stock Movements Segmented Group -->
                 <div class="inline-flex items-center h-10 rounded-xl border border-gray-200 bg-white p-1">
                     <button
                         type="button"
                         @click="openStockInModal()"
                         class="inline-flex items-center h-full gap-1.5 px-3 text-xs font-medium rounded-lg text-gray-700 hover:bg-gray-100 transition-colors cursor-pointer"
-                        title="Record incoming stock"
+                        title="Manual stock in. Supplier deliveries are added automatically at inspection."
                     >
                         <ArrowDownLeft class="w-3.5 h-3.5 text-gray-500" />
                         <span>Stock In</span>
@@ -851,7 +861,7 @@ const exportInventory = () => {
                         type="button"
                         @click="openStockOutModal()"
                         class="inline-flex items-center h-full gap-1.5 px-3 text-xs font-medium rounded-lg text-gray-700 hover:bg-gray-100 transition-colors cursor-pointer"
-                        title="Record outgoing stock"
+                        title="Manual stock out. Customer deliveries are deducted automatically when delivered."
                     >
                         <ArrowUpRight class="w-3.5 h-3.5 text-gray-500" />
                         <span>Stock Out</span>
@@ -948,20 +958,20 @@ const exportInventory = () => {
         </div>
 
         <!-- Search & Filter Controls -->
-        <div class="flex flex-wrap items-center gap-3">
+        <div class="flex flex-wrap items-center gap-3 rounded-xl border border-gray-200 bg-white p-4">
             <div class="relative flex-1 min-w-[220px] max-w-md">
                 <Search class="w-4 h-4 text-gray-400 absolute left-3 top-3" />
                 <input v-model="searchQuery" 
                        @input="applyFilters"
                        type="text" 
                        placeholder="Search products by name, SKU, specs..." 
-                       class="w-full pl-9 pr-4 py-2 bg-white border border-gray-200 rounded-lg text-sm text-gray-900 focus:border-gray-900 focus:ring-1 focus:ring-gray-900 focus:outline-none transition-colors" />
+                       class="field-control w-full pl-9 pr-4" />
             </div>
 
             <div class="w-48">
                 <select v-model="selectedCategory" 
                         @change="filterByCategory(selectedCategory)"
-                        class="w-full py-2 px-3 bg-white border border-gray-200 rounded-lg text-sm text-gray-900 focus:border-gray-900 focus:ring-1 focus:ring-gray-900 focus:outline-none transition-colors">
+                        class="field-control w-full">
                     <option value="All Categories">All Categories</option>
                     <option v-for="cat in categories" :key="cat" :value="cat">{{ cat }}</option>
                 </select>
@@ -970,56 +980,26 @@ const exportInventory = () => {
             <div class="w-44">
                 <select v-model="selectedStatus" 
                         @change="filterByStatus(selectedStatus)"
-                        class="w-full py-2 px-3 bg-white border border-gray-200 rounded-lg text-sm text-gray-900 focus:border-gray-900 focus:ring-1 focus:ring-gray-900 focus:outline-none transition-colors">
+                        class="field-control w-full">
                     <option value="All">All Statuses</option>
                     <option value="Needs Reorder">Needs Reorder ({{ summary.requiring_reorder }})</option>
-                    <option value="Incomplete">Incomplete imports ({{ summary.incomplete ?? 0 }})</option>
+                    <option value="Incomplete">Incomplete: missing details ({{ summary.incomplete ?? 0 }})</option>
                     <option value="Out of Stock">Out of Stock</option>
                     <option value="Low Stock">Low Stock</option>
                     <option value="In Stock">In Stock</option>
                 </select>
             </div>
 
+            <!-- Inventory view switcher (the module's only navigation): catalog, movements -->
             <div class="w-64">
-                <select v-model="activeView" 
+                <select v-model="activeView"
                         @change="changeView(activeView)"
-                        class="w-full py-2 px-3 bg-white border border-gray-200 rounded-lg text-sm font-medium text-gray-900 focus:border-gray-900 focus:ring-1 focus:ring-gray-900 focus:outline-none transition-colors">
+                        aria-label="Inventory view"
+                        class="field-control w-full">
                     <option value="table">Product Catalog ({{ products.total }})</option>
-                    <option value="prioritization">AHP Product Prioritization ({{ priorities.length }})</option>
-                    <option value="history">Movement History ({{ filteredMovements.length }})</option>
+                    <option value="history">Product Movement ({{ filteredMovements.length }})</option>
                 </select>
             </div>
-        </div>
-
-        <!-- Module Navigation Tabs -->
-        <div class="flex items-center gap-1 border-b border-gray-200 pb-px mb-1 overflow-x-auto text-xs sm:text-sm">
-            <button
-                type="button"
-                @click="changeView('table')"
-                :class="activeView === 'table' ? 'border-[#4b5320] text-[#4b5320] font-semibold bg-white' : 'border-transparent text-gray-500 hover:text-gray-900 hover:border-gray-300'"
-                class="px-3.5 py-2 border-b-2 whitespace-nowrap transition-colors cursor-pointer"
-            >
-                Product Catalog ({{ products.total }})
-            </button>
-            <button
-                type="button"
-                @click="changeView('prioritization')"
-                :class="activeView === 'prioritization' ? 'border-[#4b5320] text-[#4b5320] font-semibold bg-white' : 'border-transparent text-gray-500 hover:text-gray-900 hover:border-gray-300'"
-                class="px-3.5 py-2 border-b-2 whitespace-nowrap transition-colors flex items-center gap-1.5 cursor-pointer"
-            >
-                <span>AHP Product Prioritization</span>
-                <span v-if="veryHighCount > 0" class="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700">
-                    {{ veryHighCount }} Very High
-                </span>
-            </button>
-            <button
-                type="button"
-                @click="changeView('history')"
-                :class="activeView === 'history' ? 'border-[#4b5320] text-[#4b5320] font-semibold bg-white' : 'border-transparent text-gray-500 hover:text-gray-900 hover:border-gray-300'"
-                class="px-3.5 py-2 border-b-2 whitespace-nowrap transition-colors cursor-pointer"
-            >
-                Movement History ({{ filteredMovements.length }})
-            </button>
         </div>
 
         <!-- ========================================================================= -->
@@ -1037,7 +1017,6 @@ const exportInventory = () => {
                             <th class="pb-3 font-semibold text-center">Stock</th>
                             <th class="pb-3 font-semibold">Reorder Level</th>
                             <th class="pb-3 font-semibold">Status</th>
-                            <th class="pb-3 font-semibold text-center">AHP Priority</th>
                             <th class="pb-3 font-semibold text-right">Actions</th>
                         </tr>
                     </thead>
@@ -1074,23 +1053,6 @@ const exportInventory = () => {
                                     {{ product.status }}
                                 </span>
                             </td>
-                            <td class="py-3.5 text-center">
-                                <button
-                                    v-if="priorityById.get(product.id)"
-                                    type="button"
-                                    @click.stop="selectedPriority = priorityById.get(product.id) ?? null"
-                                    :class="priorityBadgeClass(priorityById.get(product.id)!)"
-                                    class="px-2.5 py-0.5 rounded-full text-[11px] font-semibold border inline-flex items-center gap-1 hover:opacity-85 transition-opacity cursor-pointer"
-                                    title="View the AHP calculation"
-                                >
-                                    <template v-if="priorityById.get(product.id)!.complete">
-                                        <span>{{ priorityById.get(product.id)!.classification }}</span>
-                                        <span class="text-[10px] opacity-75 font-mono">{{ priorityById.get(product.id)!.score!.toFixed(2) }}</span>
-                                    </template>
-                                    <span v-else>Incomplete data</span>
-                                </button>
-                                <span v-else class="text-xs text-gray-400">—</span>
-                            </td>
                             <td class="py-3.5 text-right">
                                 <div class="inline-flex items-center gap-1">
                                     <button @click="openViewModal(product)" 
@@ -1122,7 +1084,7 @@ const exportInventory = () => {
                             </td>
                         </tr>
                         <tr v-if="products.data.length === 0">
-                            <td colspan="9" class="py-14 text-center text-gray-400">
+                            <td colspan="8" class="py-14 text-center text-gray-400">
                                 <Package class="w-12 h-12 mx-auto mb-2 opacity-30 text-[#4b5320]" />
                                 <p class="text-base font-semibold text-gray-700">No products found</p>
                                 <p class="text-xs text-gray-400 mt-1">Try clearing your filters or create a new product using the button above.</p>
@@ -1142,7 +1104,7 @@ const exportInventory = () => {
                 <div class="flex items-center gap-1.5">
                     <template v-for="(link, idx) in products.links" :key="idx">
                         <button v-if="link.url"
-                                @click="router.visit(link.url)"
+                                @click="router.visit(link.url, { only: ['products', 'filters'] })"
                                 :class="[
                                     link.active ? 'bg-[#4b5320] text-white font-semibold' : 'bg-white border border-gray-200 text-gray-700 hover:bg-gray-50',
                                     'px-3 py-1.5 rounded-lg text-xs transition-colors'
@@ -1159,93 +1121,12 @@ const exportInventory = () => {
         </div>
 
         <!-- ========================================================================= -->
-        <!-- VIEW 2: AHP PRODUCT PRIORITIZATION -->
-        <!-- ========================================================================= -->
-        <div v-else-if="activeView === 'prioritization'" class="flex-1 space-y-4">
-            <section class="panel p-5">
-                <h2 class="text-base font-semibold text-gray-900">AHP Product Prioritization</h2>
-                <p class="mt-1 text-sm text-gray-500">
-                    Replenishment priority from measurable records: Demand Forecasting 40% (SMA forecast from the Demand Forecasting module),
-                    Current Stock 30%, Product Movement 20%, Supplier Availability 10%. It ranks products; it does not authorize a purchase.
-                </p>
-                <p class="mt-2 font-mono text-xs text-gray-600">Priority Score = (Demand × 0.40) + (Stock × 0.30) + (Movement × 0.20) + (Availability × 0.10)</p>
-                <p class="mt-2 text-xs text-gray-500">
-                    80–100 Very High · 60–79.99 High · 40–59.99 Moderate · 20–39.99 Low · 0–19.99 Very Low.
-                    <span v-if="incompleteCount">{{ incompleteCount }} of {{ priorities.length }} products have incomplete data and are not classified.</span>
-                </p>
-            </section>
-
-            <section class="panel flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between" aria-labelledby="reorder-heading">
-                <div>
-                    <h3 id="reorder-heading" class="text-sm font-semibold text-gray-900">Reorder recommendations ({{ reorderRecommendations.length }})</h3>
-                    <p class="text-xs text-gray-500">Tick products below, then create purchase requests for admin approval. Nothing is ordered and stock does not change until goods are received, inspected and invoiced.</p>
-                </div>
-                <div class="flex gap-2">
-                    <button type="button" class="secondary-button" :disabled="!reorderRecommendations.length" @click="selectedForRequest = reorderRecommendations.map((p) => p.product.id)">Select all recommended</button>
-                    <button type="button" class="brand-button" :disabled="!selectedForRequest.length" @click="showPrCreator = true">Create purchase request ({{ selectedForRequest.length }})</button>
-                </div>
-            </section>
-
-            <section class="panel overflow-x-auto">
-                <table class="w-full text-left">
-                    <thead>
-                        <tr>
-                            <th class="w-8"><span class="sr-only">Select</span></th>
-                            <th>#</th>
-                            <th>Product</th>
-                            <th class="text-right">Available</th>
-                            <th class="text-right">SMA forecast</th>
-                            <th class="text-right">Units moved</th>
-                            <th class="text-right">Suppliers available</th>
-                            <th class="text-right">Score</th>
-                            <th>Priority</th>
-                            <th>Reorder recommendation</th>
-                            <th class="sr-only">Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr v-for="(p, i) in priorities" :key="p.product.id" class="border-t border-gray-100">
-                            <td><input v-model="selectedForRequest" type="checkbox" :value="p.product.id" :aria-label="`Select ${p.product.name}`" class="rounded border-gray-300" /></td>
-                            <td class="text-gray-400">{{ p.complete ? i + 1 : '—' }}</td>
-                            <td>
-                                <div class="font-medium text-gray-900">{{ p.product.name }}</div>
-                                <div class="font-mono text-xs text-gray-500">{{ p.product.sku }}</div>
-                            </td>
-                            <td class="text-right font-mono">{{ priorityInput(p, 'stock').available }}</td>
-                            <td class="text-right font-mono">{{ priorityInput(p, 'demand').forecast ?? '—' }}</td>
-                            <td class="text-right font-mono">{{ p.criteria.find((c) => c.key === 'movement')?.available ? priorityInput(p, 'movement').units : '—' }}</td>
-                            <td class="text-right font-mono">
-                                {{ priorityInput(p, 'supplier_availability').verified ? `${priorityInput(p, 'supplier_availability').available} / ${priorityInput(p, 'supplier_availability').verified}` : '—' }}
-                            </td>
-                            <td class="text-right font-mono">{{ p.complete ? p.score!.toFixed(2) : '—' }}</td>
-                            <td>
-                                <button type="button" :class="priorityBadgeClass(p)" class="rounded-full border px-2.5 py-0.5 text-xs font-semibold" @click="selectedPriority = p">
-                                    {{ p.classification ?? 'Incomplete data' }}
-                                </button>
-                            </td>
-                            <td>
-                                <span v-if="p.reorder.needed" class="text-sm font-medium text-amber-700">Reorder {{ p.reorder.suggested_quantity }} {{ p.product.unit }}</span>
-                                <span v-else class="text-sm text-gray-500">No reorder needed</span>
-                            </td>
-                            <td class="text-right">
-                                <button type="button" class="text-xs font-medium text-[#4b5320] hover:underline" @click="selectedPriority = p">View Calculation</button>
-                            </td>
-                        </tr>
-                        <tr v-if="!priorities.length">
-                            <td colspan="11" class="py-10 text-center text-gray-400">No active products to prioritize.</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </section>
-        </div>
-
-        <!-- ========================================================================= -->
-        <!-- VIEW 4: RECENT MOVEMENTS AUDIT TRAIL -->
+        <!-- VIEW 2: PRODUCT MOVEMENT (AUDIT TRAIL) -->
         <!-- ========================================================================= -->
         <div v-else-if="activeView === 'history'" class="flex-1 rounded-xl bg-white border border-gray-200 p-6 flex flex-col">
             <div class="flex items-center justify-between pb-4 mb-4 border-b border-gray-100">
                 <div>
-                    <h3 class="text-lg font-semibold text-gray-900">Inventory Movement Audit Trail</h3>
+                    <h3 class="text-base font-semibold text-gray-900">Inventory Movement Audit Trail</h3>
                     <p class="text-xs text-gray-500">Chronological history of all stock inflows, deductions, sales, and corrections.</p>
                 </div>
                 <button @click="router.reload()" class="p-2 text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg text-xs flex items-center gap-1">
@@ -1284,22 +1165,12 @@ const exportInventory = () => {
                                 </div>
                             </td>
                             <td class="py-3">
-                                <span v-if="m.type === 'stock_in'" class="px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                    &darr; Stock In
-                                </span>
-                                <span v-else-if="m.type === 'stock_out'" class="px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-50 text-amber-700 border border-amber-200">
-                                    &uarr; Stock Out
-                                </span>
-                                <span v-else-if="m.type === 'sale'" class="px-2 py-0.5 rounded text-[11px] font-semibold bg-blue-50 text-blue-700 border border-blue-200">
-                                    &bull; Sale Deduction
-                                </span>
-                                <span v-else class="px-2 py-0.5 rounded text-[11px] font-semibold bg-purple-50 text-purple-700 border border-purple-200">
-                                    &#8646; Adjustment
+                                <span class="px-2 py-0.5 rounded text-[11px] font-semibold border" :class="movementBadgeClass(m)">
+                                    {{ movementLabel(m) }}
                                 </span>
                             </td>
-                            <td class="py-3 text-center font-semibold" 
-                                :class="m.type === 'stock_in' ? 'text-emerald-600' : m.type === 'stock_out' || m.type === 'sale' ? 'text-amber-700' : 'text-purple-700'">
-                                {{ m.type === 'stock_in' ? '+' : '-' }}{{ m.quantity }}
+                            <td class="py-3 text-center font-semibold" :class="movementClass(m)">
+                                {{ movementChangeText(m) }}
                             </td>
                             <td class="py-3 text-center text-gray-600 font-mono text-[11px]">
                                 {{ m.previous_stock }} &rarr; <strong class="text-gray-900">{{ m.new_stock }}</strong>
@@ -1436,10 +1307,9 @@ const exportInventory = () => {
                             <tbody class="divide-y divide-gray-100 bg-white">
                                 <tr v-for="m in productMovements" :key="m.id" class="hover:bg-gray-50">
                                     <td class="p-2 text-gray-500 whitespace-nowrap">{{ formatDate(m.movement_date) }}</td>
-                                    <td class="p-2 font-semibold capitalize">{{ m.type.replace('_', ' ') }}</td>
-                                    <td class="p-2 text-center font-semibold" 
-                                        :class="m.type === 'stock_in' ? 'text-emerald-600' : 'text-amber-700'">
-                                        {{ m.type === 'stock_in' ? '+' : '-' }}{{ m.quantity }}
+                                    <td class="p-2 font-semibold">{{ movementLabel(m) }}</td>
+                                    <td class="p-2 text-center font-semibold" :class="movementClass(m)">
+                                        {{ movementChangeText(m) }}
                                     </td>
                                     <td class="p-2 text-center text-gray-600 font-mono text-[11px]">
                                         {{ m.previous_stock }} &rarr; {{ m.new_stock }}
@@ -1503,19 +1373,23 @@ const exportInventory = () => {
                 </div>
 
                 <div class="grid grid-cols-2 gap-4">
-                    <!-- SKU / Item Code -->
-                    <div class="relative">
-                        <input id="prod_sku"
-                               v-model="formProduct.sku" 
-                               type="text" 
-                               placeholder=" " 
-                               class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs font-mono text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm" 
-                               required />
-                        <label for="prod_sku"
-                               class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                               :class="formProduct.sku ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                            SKU / Item Code
-                        </label>
+                    <!-- SKU: generated from the category by the server; read-only, can be copied -->
+                    <div>
+                        <div class="relative">
+                            <input id="prod_sku"
+                                   :value="skuLoading ? '' : formProduct.sku"
+                                   type="text"
+                                   readonly
+                                   :placeholder="skuLoading ? 'Generating…' : ' '"
+                                   aria-describedby="prod_sku_hint"
+                                   class="block w-full rounded-xl border border-gray-200 bg-gray-50 px-3.5 pt-5 pb-2 pr-16 text-xs font-mono text-gray-900 focus:outline-none sm:text-sm" />
+                            <label for="prod_sku" class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-[#4b5320]">SKU</label>
+                            <button type="button" class="absolute top-1/2 right-2 -translate-y-1/2 rounded-lg px-2 py-1 text-xs font-medium text-[#4b5320] hover:bg-gray-100 disabled:text-gray-300"
+                                    :disabled="!formProduct.sku || skuLoading" :aria-label="`Copy SKU ${formProduct.sku}`" @click="copySku">
+                                {{ skuCopied ? 'Copied' : 'Copy' }}
+                            </button>
+                        </div>
+                        <p id="prod_sku_hint" class="mt-1 text-[11px] text-gray-500">{{ isEditing ? 'Does not change with the category.' : 'Next for this category; assigned when saved.' }}</p>
                         <span v-if="formErrors.sku" class="text-rose-600 text-xs mt-1 block">{{ formErrors.sku }}</span>
                     </div>
 
@@ -1723,7 +1597,7 @@ const exportInventory = () => {
                     </div>
                     <div>
                         <h3 class="text-lg font-semibold text-gray-900">Record Stock-In Inflow</h3>
-                        <p class="text-xs text-gray-500">Add incoming inventory received from suppliers or factory batches.</p>
+                        <p class="text-xs text-gray-500">Only for stock outside a purchase order. Supplier deliveries are added automatically when inspected.</p>
                     </div>
                 </div>
                 <button @click="showStockInModal = false" class="text-gray-400 hover:text-gray-600">
@@ -1858,7 +1732,7 @@ const exportInventory = () => {
                     </div>
                     <div>
                         <h3 class="text-lg font-semibold text-gray-900">Record Stock-Out Deduction</h3>
-                        <p class="text-xs text-gray-500">Record outgoing electrical supplies with strict quantity checks.</p>
+                        <p class="text-xs text-gray-500">Only for stock leaving outside a sales order. Customer deliveries are deducted automatically when delivered.</p>
                     </div>
                 </div>
                 <button @click="showStockOutModal = false" class="text-gray-400 hover:text-gray-600">
@@ -1916,9 +1790,9 @@ const exportInventory = () => {
                         <select id="stockout_reason"
                                 v-model="formStockOut.reason" 
                                 class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm" required>
-                            <option>Client Project Deployment</option>
-                            <option>Direct Store Sale</option>
-                            <option>Internal Maintenance Usage</option>
+                            <option>Internal Use</option>
+                            <option>Damaged / Write-off</option>
+                            <option>Returned to Supplier</option>
                             <option>Sample / Demo Transfer</option>
                         </select>
                         <label for="stockout_reason"
@@ -2104,7 +1978,7 @@ const exportInventory = () => {
         </div>
     </div>
 
-    <ImportWizard :open="showImportModal" module="inventory" @close="showImportModal = false" @completed="router.reload({ only: ['products', 'summary', 'priorities'] })" />
+    <ImportWizard :open="showImportModal" module="inventory" @close="showImportModal = false" @completed="router.reload({ only: ['products', 'summary'] })" />
 
     <!-- ========================================================================= -->
     <!-- CONFIRM DELETE / ARCHIVE MODAL -->
@@ -2114,20 +1988,23 @@ const exportInventory = () => {
             <div class="w-12 h-12 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center mb-4">
                 <Trash2 class="w-6 h-6" />
             </div>
-            <h3 class="text-xl font-semibold text-gray-900 mb-2">Archive / Delete Product</h3>
-            <p class="text-gray-600 text-sm mb-4 leading-relaxed">
-                Are you sure you want to remove <strong class="text-gray-900">"{{ selectedProduct?.name }}"</strong> (SKU: {{ selectedProduct?.sku }})? 
-                If this item is referenced by quotations or historical sales, it will be safely archived without corrupting transaction records.
+            <h3 class="text-xl font-semibold text-gray-900 mb-2">Are you sure you want to permanently delete this record?</h3>
+            <p class="text-gray-600 text-sm mb-2 leading-relaxed">
+                This action cannot be undone. Related active sessions, registered trusted devices, or dependent records must only be revoked or removed when explicitly required by the operation.
+            </p>
+            <p class="text-gray-600 text-xs mb-4 leading-relaxed">
+                Product: <strong class="text-gray-900">"{{ selectedProduct?.name }}"</strong> (SKU: {{ selectedProduct?.sku }}). If this item is referenced by quotations, stock movements, or historical sales, it will be safely archived without corrupting transaction records.
             </p>
             <div class="mt-4 mb-6">
                 <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm permanent deletion:
                 </label>
                 <input
                     v-model="deleteConfirmInput"
                     type="text"
                     placeholder="Type YES here"
                     class="w-full px-3 py-2 text-sm font-mono rounded-xl border border-gray-300 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                    @keyup.enter="deleteConfirmInput === 'YES' && deleteProduct()"
                 />
             </div>
             <div class="flex justify-end gap-3">
@@ -2146,7 +2023,7 @@ const exportInventory = () => {
                     size="md"
                     :radius="10"
                     @click="deleteProduct"
-                    :disabled="isSubmitting || deleteConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="isSubmitting || deleteConfirmInput !== 'YES'"
                 >
                     Confirm Removal
                 </SpecularButton>
@@ -2199,30 +2076,4 @@ const exportInventory = () => {
             </div>
         </div>
     </div>
-
-    <!-- ========================================================================= -->
-    <!-- AHP PRODUCT CALCULATION BREAKDOWN MODAL -->
-    <!-- ========================================================================= -->
-    <div v-if="selectedPriority" class="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4" @click.self="selectedPriority = null">
-        <div class="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-gray-200 bg-white" role="dialog" aria-modal="true" aria-labelledby="priority-title">
-            <div class="flex items-start justify-between gap-3 border-b border-gray-100 px-6 py-4">
-                <div>
-                    <h3 id="priority-title" class="text-base font-semibold text-gray-900">{{ selectedPriority.product.name }}</h3>
-                    <p class="font-mono text-xs text-gray-500">{{ selectedPriority.product.sku }}</p>
-                </div>
-                <div class="text-right">
-                    <div class="text-xl font-semibold text-gray-900">{{ selectedPriority.complete ? `${selectedPriority.score!.toFixed(2)} / 100` : 'Incomplete' }}</div>
-                    <div class="text-xs text-gray-500">{{ selectedPriority.classification ?? 'Not classified' }}</div>
-                </div>
-            </div>
-            <div class="overflow-y-auto px-6 py-4">
-                <ProductPriorityBreakdown :priority="selectedPriority" />
-            </div>
-            <div class="flex justify-end border-t border-gray-100 bg-gray-50/50 px-6 py-3">
-                <button type="button" class="secondary-button" @click="selectedPriority = null">Close</button>
-            </div>
-        </div>
-    </div>
-
-    <PurchaseRequestCreator :open="showPrCreator" :candidates="prCandidates" @close="showPrCreator = false" @submitted="onRequestsSubmitted" />
 </template>

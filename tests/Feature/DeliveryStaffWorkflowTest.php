@@ -56,7 +56,7 @@ it('allows administrator to view all deliveries and assign delivery to delivery 
         'recipient_name' => 'Engr. Manuel Roxas',
         'contact_number' => '09175554433',
         'delivery_address' => 'Phase 2 Industrial Park, Calamba, Laguna',
-        'status' => 'order_confirmed',
+        'status' => 'pending',
         'handled_by_id' => null,
     ]);
 
@@ -98,19 +98,21 @@ it('scopes dashboard so delivery staff views only their assigned deliveries whil
         'fulfillment_type' => 'delivery',
         'recipient_name' => 'Customer A',
         'contact_number' => '09171111111',
-        'status' => 'order_confirmed',
+        'status' => 'pending',
         'handled_by_id' => $driver1->id,
     ]);
 
-    // Fulfillment 2 assigned to driver 2
+    // Fulfillment 2 assigned to driver 2 (a second order: one delivery record per order)
+    $sale2 = $sale->replicate()->fill(['invoice_number' => 'INV-DEL-SCOPE-2']);
+    $sale2->save();
     $ful2 = OrderFulfillment::create([
         'team_id' => $this->team->id,
-        'sale_id' => $sale->id,
+        'sale_id' => $sale2->id,
         'fulfillment_number' => 'FUL-DRIVER2-02',
         'fulfillment_type' => 'delivery',
         'recipient_name' => 'Customer B',
         'contact_number' => '09172222222',
-        'status' => 'order_confirmed',
+        'status' => 'pending',
         'handled_by_id' => $driver2->id,
     ]);
 
@@ -163,7 +165,7 @@ it('prevents delivery staff from updating another staff members delivery', funct
         'fulfillment_type' => 'delivery',
         'recipient_name' => 'Secret Client',
         'contact_number' => '09173333333',
-        'status' => 'order_confirmed',
+        'status' => 'pending',
         'handled_by_id' => $driver1->id,
     ]);
 
@@ -202,7 +204,7 @@ it('enforces strict three-attempt limit and disables further attempts after 3/3'
     [$driver, $driverCookies] = createDeliveryActor('staff_deliveries', $this->team);
     $fulfillment = dispatchedDelivery($this->team, $driver);
     $base = "/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}";
-    expect($fulfillment->status)->toBe(DeliveryStatus::OutForDelivery);
+    expect($fulfillment->status)->toBe(DeliveryStatus::InTransit);
 
     foreach ([1 => 'Customer unavailable', 2 => 'Customer unreachable', 3 => 'Customer refused delivery'] as $n => $reason) {
         if ($n > 1) {
@@ -213,7 +215,7 @@ it('enforces strict three-attempt limit and disables further attempts after 3/3'
 
         $fulfillment->refresh();
         expect($fulfillment->attempt_count)->toBe($n)
-            ->and($fulfillment->status)->toBe(DeliveryStatus::DeliveryAttemptFailed)
+            ->and($fulfillment->status)->toBe(DeliveryStatus::ReadyForDelivery)
             ->and($fulfillment->remaining_attempts)->toBe(3 - $n);
     }
 
@@ -295,5 +297,5 @@ it('allows administrator to reschedule delivery and reset attempts after limit i
 
     // The driver can go again.
     $this->actingAs($driver)->withCookies($driverCookies)->post("{$base}/start")->assertSessionHasNoErrors();
-    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::OutForDelivery);
+    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::InTransit);
 });

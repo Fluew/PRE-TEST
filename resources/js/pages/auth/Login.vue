@@ -114,9 +114,10 @@ const showPassword = ref(false);
                         :aria-label="
                             showPassword ? 'Hide password' : 'Show password'
                         "
+                        :aria-pressed="showPassword"
                     >
-                        <EyeOff v-if="showPassword" class="size-4" />
-                        <Eye v-else class="size-4" />
+                        <EyeOff v-if="showPassword" class="size-4 shrink-0" />
+                        <Eye v-else class="size-4 shrink-0" />
                     </button>
                 </div>
                 <div class="mt-2 flex items-center justify-between">

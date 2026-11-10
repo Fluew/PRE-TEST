@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\RecycleBinController;
 use App\Http\Controllers\Settings\CurrencyController;
 use App\Http\Controllers\Settings\MaintenanceController;
 use App\Http\Controllers\Settings\ProfileController;
@@ -7,7 +8,9 @@ use App\Http\Controllers\Settings\SecurityController;
 use App\Http\Controllers\Teams\TeamController;
 use App\Http\Controllers\Teams\TeamInvitationController;
 use App\Http\Controllers\Teams\TeamMemberController;
+use App\Http\Controllers\UserController;
 use App\Http\Middleware\EnsureTeamMembership;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
 // Settings and Teams are part of the internal Admin/Staff interface (they render inside the
@@ -54,11 +57,32 @@ Route::middleware(['auth', 'verified', ...$internal, 'no_cache'])->group(functio
         Route::delete('settings/teams/{team}/invitations/{invitation}', [TeamInvitationController::class, 'destroy'])->name('teams.invitations.destroy');
     });
 
-    // Maintenance Mode (Admin only)
+    // System Maintenance section (Admin only)
     Route::middleware(['role:admin'])->group(function () {
         Route::get('settings/maintenance', [MaintenanceController::class, 'index'])->name('settings.maintenance');
         Route::post('settings/maintenance/enable', [MaintenanceController::class, 'enable'])->name('settings.maintenance.enable');
         Route::post('settings/maintenance/disable', [MaintenanceController::class, 'disable'])->name('settings.maintenance.disable');
         Route::match(['GET', 'POST'], 'settings/maintenance/verify', [MaintenanceController::class, 'verify'])->name('settings.maintenance.verify');
+
+        // Recycle Bin under Settings -> System Maintenance
+        Route::get('settings/maintenance/recycle-bin', [RecycleBinController::class, 'index'])->name('settings.maintenance.recycle-bin');
+        Route::post('settings/maintenance/recycle-bin/bulk-restore', [RecycleBinController::class, 'bulkRestore'])->name('settings.maintenance.recycle-bin.bulk-restore');
+        Route::post('settings/maintenance/recycle-bin/bulk-force-delete', [RecycleBinController::class, 'bulkForceDelete'])->name('settings.maintenance.recycle-bin.bulk-force-delete');
+        Route::post('settings/maintenance/recycle-bin/empty', [RecycleBinController::class, 'emptyBin'])->name('settings.maintenance.recycle-bin.empty');
+        Route::post('settings/maintenance/recycle-bin/{type}/{id}/restore', fn (Request $request, string $type, string $id) => app(RecycleBinController::class)->restore($request, null, $type, $id))->name('settings.maintenance.recycle-bin.restore');
+        Route::delete('settings/maintenance/recycle-bin/{type}/{id}/force', fn (Request $request, string $type, string $id) => app(RecycleBinController::class)->forceDelete($request, null, $type, $id))->name('settings.maintenance.recycle-bin.force-delete');
+
+        // Security Logs & System Audit Trail under Settings -> System Maintenance
+        Route::get('settings/maintenance/security-logs', function (Request $request) {
+            $request->merge(['tab' => 'security']);
+
+            return app(UserController::class)->index($request);
+        })->name('settings.maintenance.security-logs');
+
+        Route::get('settings/maintenance/audit-trail', function (Request $request) {
+            $request->merge(['tab' => 'audit']);
+
+            return app(UserController::class)->index($request);
+        })->name('settings.maintenance.audit-trail');
     });
 });

@@ -130,7 +130,7 @@ test('can update a supplier without type error', function () {
     ]);
 });
 
-test('inventory index provides the backend ahp prioritization', function () {
+test('reports and analytics provides the backend ahp product prioritization', function () {
     $team = Team::factory()->create(['slug' => 'test-team']);
     $user = User::factory()->create([
         'role' => 'admin',
@@ -168,18 +168,71 @@ test('inventory index provides the backend ahp prioritization', function () {
 
     $response = $this->actingAs($user)
         ->withCookies($deviceData['cookies'])
-        ->get("/{$team->slug}/inventory");
+        ->get("/{$team->slug}/reports?view=priority");
 
     $response->assertOk();
     $response->assertInertia(fn ($page) => $page
-        ->component('Inventory/Index')
-        ->has('priorities', 1)
-        ->where('priorities.0.product.sku', 'MCCB-100A')
+        ->component('Reports/Index')
+        ->has('productPriority.items', 1)
+        ->where('productPriority.items.0.product.sku', 'MCCB-100A')
         // No sales history and no verified supplier availability: reported as incomplete, not scored as 0.
-        ->where('priorities.0.complete', false)
-        ->where('priorities.0.classification', null)
-        ->where('priorities.0.criteria.0.key', 'demand')
-        ->where('priorities.0.criteria.0.weight', 0.4)
-        ->where('priorities.0.criteria.0.available', false)
+        ->where('productPriority.items.0.complete', false)
+        ->where('productPriority.items.0.classification', null)
+        ->where('productPriority.items.0.criteria.0.key', 'demand')
+        ->where('productPriority.items.0.criteria.0.weight', 0.4)
+        ->where('productPriority.items.0.criteria.0.available', false)
+        ->where('productPriority.weights.demand', 0.4)
+        ->where('productPriority.forecastMonths', 3)
+        ->where('productPriority.canRequestPurchase', true)
     );
+
+    // Inventory no longer carries the AHP prioritization.
+    $this->actingAs($user)->withCookies($deviceData['cookies'])->get("/{$team->slug}/inventory")
+        ->assertOk()
+        ->assertInertia(fn ($page) => $page->component('Inventory/Index')->missing('priorities')->missing('forecastPeriods')->has('products.data', 1));
+});
+
+test('reports-only staff see the AHP prioritization but cannot create purchase requests from it', function () {
+    $team = Team::factory()->create(['slug' => 'test-team']);
+    $user = User::factory()->create(['role' => 'staff_reports', 'current_team_id' => $team->id, 'password_changed_at' => now()]);
+    $team->members()->attach($user, ['role' => TeamRole::Member->value]);
+    $cookies = createTrustedDeviceFor($user)['cookies'];
+    Product::create(['team_id' => $team->id, 'name' => 'Wire 2.0mm', 'sku' => 'WIRE-2', 'price' => 10, 'stock' => 3, 'is_active' => true]);
+
+    $this->actingAs($user)->withCookies($cookies)->get("/{$team->slug}/reports?view=priority")
+        ->assertOk()
+        ->assertInertia(fn ($page) => $page->has('productPriority.items', 1)->where('productPriority.canRequestPurchase', false));
+    $this->actingAs($user)->withCookies($cookies)->post("/{$team->slug}/procurement/requests", ['lines' => []])->assertForbidden();
+});
+
+test('inventory views: product catalog and product movement; an old AHP link opens the catalog', function () {
+    $team = Team::factory()->create(['slug' => 'test-team']);
+    $user = User::factory()->create([
+        'role' => 'admin',
+        'current_team_id' => $team->id,
+        'password_changed_at' => now(),
+    ]);
+    $team->members()->attach($user, ['role' => TeamRole::Owner->value]);
+    $cookies = createTrustedDeviceFor($user)['cookies'];
+
+    Product::create([
+        'team_id' => $team->id,
+        'name' => 'Wire 2.0mm',
+        'sku' => 'WIRE-2',
+        'price' => 10,
+        'stock' => 3,
+        'is_active' => true,
+    ]);
+
+    // AHP Product Prioritization moved to Reports and Analytics: an old link falls back to the Product Catalog.
+    $this->actingAs($user)->withCookies($cookies)->get("/{$team->slug}/inventory?view=prioritization")
+        ->assertOk()
+        ->assertInertia(fn ($page) => $page->where('filters.view', 'table')->missing('priorities')->has('products.data', 1)->where('products.data.0.sku', 'WIRE-2'));
+
+    $this->actingAs($user)->withCookies($cookies)->get("/{$team->slug}/inventory?view=history")
+        ->assertInertia(fn ($page) => $page->where('filters.view', 'history'));
+
+    // Unknown views open the Product Catalog.
+    $this->actingAs($user)->withCookies($cookies)->get("/{$team->slug}/inventory?view=something-else")
+        ->assertInertia(fn ($page) => $page->where('filters.view', 'table'));
 });

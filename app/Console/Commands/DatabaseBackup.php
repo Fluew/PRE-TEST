@@ -4,7 +4,7 @@ namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Process;
 
 class DatabaseBackup extends Command
 {
@@ -25,37 +25,39 @@ class DatabaseBackup extends Command
             mkdir($backupDir, 0750, true);
         }
 
-        $filename = "backup_{$database}_" . date('Y-m-d_His') . '.sql.gz';
+        $filename = "backup_{$database}_".date('Y-m-d_His').'.sql.gz';
         $filepath = "{$backupDir}/{$filename}";
+        $sqlPath = substr($filepath, 0, -3);
 
-        $passwordArg = $password !== '' && $password !== null
-            ? '--password=' . escapeshellarg($password)
-            : '';
+        // No shell: works on Windows (no `| gzip`), the password goes in MYSQL_PWD instead of the
+        // command line, and mysqldump's location is configurable (XAMPP does not put it on PATH).
+        $result = Process::timeout(600)
+            ->env($password !== '' && $password !== null ? ['MYSQL_PWD' => $password] : [])
+            ->run([
+                config('database.connections.mysql.mysqldump_path') ?: 'mysqldump',
+                '--host='.$host,
+                '--port='.$port,
+                '--user='.$username,
+                '--single-transaction',
+                '--routines',
+                '--triggers',
+                '--result-file='.$sqlPath,
+                $database,
+            ]);
 
-        $command = sprintf(
-            'mysqldump --host=%s --port=%s --user=%s %s --single-transaction --routines --triggers %s | gzip > %s',
-            escapeshellarg($host),
-            escapeshellarg((string) $port),
-            escapeshellarg($username),
-            $passwordArg,
-            escapeshellarg($database),
-            escapeshellarg($filepath)
-        );
-
-        $result = null;
-        $output = [];
-        exec($command . ' 2>&1', $output, $result);
-
-        if ($result !== 0) {
-            $errorMsg = implode("\n", $output);
+        if (! $result->successful() || ! is_file($sqlPath) || filesize($sqlPath) === 0) {
+            @unlink($sqlPath);
+            $errorMsg = trim($result->errorOutput()."\n".$result->output()) ?: 'mysqldump produced no output.';
             Log::channel('security')->error("Database backup failed: {$errorMsg}");
             $this->error("Backup failed: {$errorMsg}");
 
             return self::FAILURE;
         }
 
+        $this->compress($sqlPath, $filepath);
+
         $size = filesize($filepath);
-        $sizeFormatted = number_format($size / 1024 / 1024, 2) . ' MB';
+        $sizeFormatted = number_format($size / 1024 / 1024, 2).' MB';
 
         Log::channel('security')->info("Database backup created: {$filename} ({$sizeFormatted})");
         $this->info("Backup created: {$filename} ({$sizeFormatted})");
@@ -63,6 +65,19 @@ class DatabaseBackup extends Command
         $this->pruneOldBackups($backupDir, (int) $this->option('max-files'));
 
         return self::SUCCESS;
+    }
+
+    /** Gzip the dump in PHP (streamed, so large dumps do not need to fit in memory), then remove the plain copy. */
+    private function compress(string $from, string $to): void
+    {
+        $in = fopen($from, 'rb');
+        $out = gzopen($to, 'wb6');
+        while (! feof($in)) {
+            gzwrite($out, (string) fread($in, 1024 * 512));
+        }
+        fclose($in);
+        gzclose($out);
+        unlink($from);
     }
 
     private function pruneOldBackups(string $dir, int $maxFiles): void
@@ -77,7 +92,7 @@ class DatabaseBackup extends Command
         $toDelete = array_slice($files, $maxFiles);
         foreach ($toDelete as $file) {
             unlink($file);
-            $this->line('Pruned old backup: ' . basename($file));
+            $this->line('Pruned old backup: '.basename($file));
         }
     }
 }

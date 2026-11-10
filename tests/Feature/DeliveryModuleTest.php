@@ -3,7 +3,6 @@
 use App\Enums\TeamRole;
 use App\Models\Delivery;
 use App\Models\PurchaseOrder;
-use App\Models\Supplier;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -42,9 +41,11 @@ test('deliveries index loads delivery records and metrics', function () {
         ->has('inboundDeliveries.data', 1)
         ->where('inboundDeliveries.data.0.delivery_number', 'DEL-102526-001')
         ->where('inboundDeliveries.data.0.purchase_order_number', '4000005472')
-        ->where('inboundDeliveries.data.0.quantity', 100)
-        ->where('inboundDeliveries.data.0.unit', 'PCS')
-        ->where('inboundDeliveries.data.0.description', '0.68mm Stainless Steel Conduit Rod 2m')
+        // One row per delivery record (Delivery Date, Delivery #); products are shown with View.
+        ->where('inboundDeliveries.data.0.delivery_date', fn ($d) => str_starts_with((string) $d, '2026-10-25'))
+        ->where('inboundDeliveries.data.0.items_count', 1)
+        ->where('inboundDeliveries.data.0.received_total', fn ($q) => (int) $q === 100)
+        ->where('inboundDeliveries.data.0.quality_status', 'Pending Inspection')
         ->has('inboundMetrics')
         ->where('inboundMetrics.totalDeliveries', 1)
         ->where('inboundMetrics.totalQuantityDelivered', 100)

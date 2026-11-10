@@ -5,10 +5,22 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="csrf-token" content="{{ csrf_token() }}">
 
-        {{-- Force light mode background --}}
+        {{-- Force light mode background & suppress native browser password reveal icons --}}
         <style>
             html {
                 background-color: oklch(1 0 0);
+            }
+            input::-ms-reveal,
+            input::-ms-clear {
+                display: none !important;
+                width: 0 !important;
+                height: 0 !important;
+            }
+            input::-webkit-contacts-auto-fill-button,
+            input::-webkit-credentials-auto-fill-button {
+                visibility: hidden !important;
+                display: none !important;
+                pointer-events: none !important;
             }
         </style>
 

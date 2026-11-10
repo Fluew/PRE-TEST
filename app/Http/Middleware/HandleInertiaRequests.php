@@ -59,6 +59,12 @@ class HandleInertiaRequests extends Middleware
     {
         $user = $request->user();
 
+        // The user's teams are read once per request and serve both currentTeam and teams.
+        $userTeams = null;
+        $teams = function () use ($user, &$userTeams) {
+            return $userTeams ??= $user?->toUserTeams(includeCurrent: true) ?? collect();
+        };
+
         return [
             ...parent::share($request),
             'name' => config('app.name'),
@@ -80,8 +86,10 @@ class HandleInertiaRequests extends Middleware
                 'rate' => app(ExchangeRates::class)->cached(),
             ] : null,
             'sidebarOpen' => ! $request->hasCookie('sidebar_state') || $request->cookie('sidebar_state') === 'true',
-            'currentTeam' => fn () => $user?->currentTeam ? $user->toUserTeam($user->currentTeam) : null,
-            'teams' => fn () => $user?->toUserTeams(includeCurrent: true) ?? [],
+            'currentTeam' => fn () => $user?->currentTeam
+                ? ($teams()->firstWhere('id', $user->current_team_id) ?? $user->toUserTeam($user->currentTeam))
+                : null,
+            'teams' => fn () => $teams()->all(),
             'flash' => [
                 'success' => fn () => $request->session()->get('success'),
                 'error' => fn () => $request->session()->get('error'),

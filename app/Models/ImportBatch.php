@@ -39,7 +39,7 @@ class ImportBatch extends Model
     protected $fillable = [
         'team_id', 'module', 'status', 'original_filename', 'stored_path', 'mime_type', 'file_type', 'file_size',
         'file_hash', 'extraction_method', 'page_count', 'meta', 'summary', 'error', 'attempts',
-        'uploaded_by_id', 'imported_by_id', 'processed_at', 'imported_at',
+        'uploaded_by_id', 'imported_by_id', 'processed_at', 'imported_at', 'completed_at',
     ];
 
     protected $hidden = ['stored_path'];
@@ -54,6 +54,7 @@ class ImportBatch extends Model
             'attempts' => 'integer',
             'processed_at' => 'datetime',
             'imported_at' => 'datetime',
+            'completed_at' => 'datetime',
         ];
     }
 

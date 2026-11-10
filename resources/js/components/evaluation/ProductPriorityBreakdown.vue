@@ -16,8 +16,19 @@ export interface ReorderRecommendation {
     basis: string;
 }
 
+/** SMA forecast for the forecasting period staff chose (3 Months, 6 Months, 1 Year). */
+export interface PriorityForecast {
+    months: number;
+    period: string;
+    monthly: number | null;
+    period_total: number | null;
+    reason: string | null;
+}
+
 export interface ProductPriority extends Evaluation {
     product: { id: number; name: string; sku: string; unit: string };
+    available_stock?: number;
+    forecast?: PriorityForecast;
     reorder: ReorderRecommendation;
 }
 
@@ -31,7 +42,10 @@ const has = (key: string) => props.priority.criteria.find((c) => c.key === key)?
     <div>
         <dl class="mb-4 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
             <div><dt class="text-xs text-gray-500">Available stock</dt><dd class="font-mono">{{ input('stock').available }} {{ priority.product.unit }}</dd></div>
-            <div><dt class="text-xs text-gray-500">SMA forecast</dt><dd class="font-mono">{{ input('demand').forecast ?? 'Insufficient data' }}</dd></div>
+            <div>
+                <dt class="text-xs text-gray-500">Forecast, next {{ priority.forecast?.period ?? 'month' }}</dt>
+                <dd class="font-mono">{{ priority.forecast?.period_total ?? input('demand').forecast ?? 'Insufficient data' }}<span v-if="priority.forecast?.monthly != null" class="text-xs text-gray-500"> ({{ priority.forecast.monthly }}/month)</span></dd>
+            </div>
             <div><dt class="text-xs text-gray-500">Units moved ({{ input('movement').months }} mo)</dt><dd class="font-mono">{{ has('movement') ? input('movement').units : 'Insufficient data' }}</dd></div>
             <div><dt class="text-xs text-gray-500">Verified suppliers</dt><dd class="font-mono">{{ input('supplier_availability').verified ? `${input('supplier_availability').available} of ${input('supplier_availability').verified} available` : 'None recorded' }}</dd></div>
         </dl>

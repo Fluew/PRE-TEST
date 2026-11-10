@@ -4,23 +4,25 @@ namespace App\Services\Suppliers;
 
 use App\Models\Delivery;
 use App\Models\Supplier;
-use App\Models\SupplierQuote;
 use Carbon\Carbon;
 use Carbon\CarbonInterface;
 use Illuminate\Support\Collection;
 
 /**
- * Transaction-based Supplier Evaluation. Every score is calculated from records only:
- * - Delivery (40%): inbound deliveries against purchase orders with a promised date, and the
- *   accepted quantity recorded at inspection.
- * - Price (35%): verified, unexpired supplier quotes for the same product, unit, currency and tax basis.
- * - Quality (25%): accepted / inspected quantities from goods-receipt inspections.
- * A criterion without records is "insufficient data", never 0, and such a supplier gets no final
- * score or classification. Nobody can type a score in.
+ * AHP-based Supplier Evaluation. Every score is calculated from recorded transactions only:
+ * - Delivery Performance (40%): inbound deliveries against purchase orders with a promised date,
+ *   and the accepted quantity recorded at inspection.
+ * - Price Competitiveness (35%): purchase order unit costs of accepted inbound deliveries, compared
+ *   with other suppliers' costs for the same product and unit.
+ * - Product Quality (25%): accepted / inspected quantities from staff inspections.
+ * Score = Σ (criterion score × AHP weight). Suppliers with a complete score are ranked (1 = best)
+ * to help staff choose; nothing selects or orders from a supplier automatically. A criterion
+ * without records is "insufficient data", never 0, and such a supplier gets no final score or
+ * rank. Nobody can type a score in.
  */
 class SupplierEvaluator
 {
-    /** @return array<int, array> keyed by supplier id */
+    /** @return array<int, array> keyed by supplier id; complete scores carry rank (1 = highest) and ranked_of */
     public function forTeam(int $teamId, ?CarbonInterface $now = null): array
     {
         $now = Carbon::instance($now ?? now());
@@ -28,13 +30,31 @@ class SupplierEvaluator
 
         $suppliers = Supplier::where('team_id', $teamId)->orderBy('name')->get(['id', 'name', 'status']);
         $deliveries = $this->deliveries($teamId, $periodStart, $now);
-        $quoteGroups = $this->quoteGroups($teamId, $now);
-        $quoteExclusions = $this->quoteExclusions($teamId, $now);
+        $priceGroups = $this->purchaseCostGroups($teamId, $periodStart, $now);
 
         $results = [];
         foreach ($suppliers as $s) {
             $mine = $deliveries->where('supplier_id', $s->id);
-            $results[$s->id] = $this->evaluate($s, $mine, $quoteGroups, $quoteExclusions[$s->id] ?? ['expired' => 0, 'unverified' => 0], $periodStart, $now);
+            $results[$s->id] = $this->evaluate($s, $mine, $priceGroups, $periodStart, $now);
+        }
+
+        return $this->rank($results);
+    }
+
+    /**
+     * Rank suppliers with a complete score, highest first. Equal scores share a rank (1, 2, 2, 4).
+     * Suppliers without a complete score are not ranked (rank null).
+     *
+     * @param  array<int, array>  $results
+     * @return array<int, array>
+     */
+    private function rank(array $results): array
+    {
+        $scores = collect($results)->filter(fn ($r) => $r['complete'])->map(fn ($r) => $r['score'])->sortDesc();
+        $count = $scores->count();
+        foreach ($results as $id => $r) {
+            $results[$id]['rank'] = $r['complete'] ? $scores->filter(fn ($s) => $s > $r['score'])->count() + 1 : null;
+            $results[$id]['ranked_of'] = $count;
         }
 
         return $results;
@@ -56,12 +76,12 @@ class SupplierEvaluator
         return 'Needs Improvement';
     }
 
-    private function evaluate(Supplier $s, Collection $deliveries, array $quoteGroups, array $quoteExclusions, Carbon $from, Carbon $now): array
+    private function evaluate(Supplier $s, Collection $deliveries, array $priceGroups, Carbon $from, Carbon $now): array
     {
         $weights = config('evaluation.supplier.weights');
         $criteria = [
             $this->deliveryCriterion($deliveries, $weights['delivery']),
-            $this->priceCriterion($s->id, $quoteGroups, $quoteExclusions, $weights['price']),
+            $this->priceCriterion($s->id, $priceGroups, $weights['price']),
             $this->qualityCriterion($deliveries, $weights['quality']),
         ];
 
@@ -148,43 +168,41 @@ class SupplierEvaluator
             .'; ('.number_format($onTimeRate, 2).' × 0.60) + ('.number_format($fulfillRate, 2).' × 0.40) = '.number_format($score, 2));
     }
 
-    private function priceCriterion(int $supplierId, array $groups, array $exclusions, float $weight): array
+    private function priceCriterion(int $supplierId, array $groups, float $weight): array
     {
         $comparisons = [];
         foreach ($groups as $g) {
-            $mine = collect($g['quotes'])->firstWhere('supplier_id', $supplierId);
-            if (! $mine || count($g['quotes']) < 2) {
+            $mine = collect($g['prices'])->firstWhere('supplier_id', $supplierId);
+            if (! $mine || count($g['prices']) < 2) {
                 continue;
             }
-            $lowest = min(array_column($g['quotes'], 'unit_price'));
+            $lowest = min(array_column($g['prices'], 'unit_price'));
             $comparisons[] = [
                 'product' => $g['product'],
                 'basis' => $g['basis'],
                 'own_price' => $mine['unit_price'],
-                'own_reference' => $mine['reference'],
-                'own_quoted_on' => $mine['quoted_on'],
                 'lowest_price' => $lowest,
                 'score' => round($lowest / $mine['unit_price'] * 100, 2),
-                'quotes' => $g['quotes'],
+                'prices' => $g['prices'],
             ];
         }
 
         $base = [
             'key' => 'price', 'label' => 'Price Competitiveness', 'weight' => $weight,
-            'source' => 'Verified, unexpired supplier quotes for the same product, unit, currency and tax basis',
-            'inputs' => ['comparisons' => $comparisons, 'excluded_expired' => $exclusions['expired'], 'excluded_unverified' => $exclusions['unverified']],
+            'source' => 'Purchase order unit costs of accepted inbound deliveries in the evaluation period, for the same product and unit',
+            'inputs' => ['comparisons' => $comparisons],
         ];
 
         if (! $comparisons) {
             return $base + ['available' => false, 'score' => null, 'weighted' => null,
-                'reason' => 'Insufficient data: no verified, unexpired quote from this supplier can be compared with another supplier\'s quote for the same product and terms.'];
+                'reason' => 'Insufficient data: no accepted delivery from this supplier can be compared with another supplier\'s accepted delivery of the same product and unit.'];
         }
 
         $score = round(array_sum(array_column($comparisons, 'score')) / count($comparisons), 2);
         $parts = array_map(fn ($c) => '('.number_format($c['lowest_price'], 2).' / '.number_format($c['own_price'], 2).') × 100 = '.number_format($c['score'], 2), $comparisons);
 
         return $base + $this->scored($score, $weight,
-            'Average over comparable products of (Lowest Verified Price / Supplier\'s Verified Price) × 100',
+            'Average over comparable products of (Lowest Purchase Unit Cost / Supplier\'s Purchase Unit Cost) × 100',
             implode('; ', $parts).(count($comparisons) > 1 ? '; average = '.number_format($score, 2) : ''));
     }
 
@@ -271,56 +289,58 @@ class SupplierEvaluator
             ->values();
     }
 
-    /** Latest valid verified quote per supplier, grouped by product + unit + currency + tax basis. */
-    private function quoteGroups(int $teamId, Carbon $now): array
+    /**
+     * Each supplier's purchase unit cost per product and unit, from accepted inbound deliveries
+     * dated in the period: Σ (accepted × PO unit cost) / Σ accepted. Cancelled deliveries and
+     * rejected units do not count.
+     *
+     * @return list<array{product: array, basis: string, prices: list<array{supplier_id: int, supplier: ?string, unit_price: float, quantity: int, receipts: list<array>}>}>
+     */
+    private function purchaseCostGroups(int $teamId, Carbon $from, Carbon $to): array
     {
-        $quotes = SupplierQuote::query()
-            ->with(['product:id,name,sku', 'supplier:id,name'])
-            ->whereHas('supplier')
-            ->where('team_id', $teamId)
-            ->whereNotNull('verified_at')
-            ->whereDate('quoted_on', '<=', $now)
-            ->where(fn ($q) => $q->whereNull('valid_until')->orWhereDate('valid_until', '>=', $now))
-            ->orderByDesc('quoted_on')->orderByDesc('id')
-            ->get();
+        $rows = Delivery::query()
+            ->join('purchase_orders', 'purchase_orders.id', '=', 'deliveries.purchase_order_id')
+            ->join('suppliers', 'suppliers.id', '=', 'purchase_orders.supplier_id')
+            ->join('products', 'products.id', '=', 'purchase_orders.product_id')
+            ->where('deliveries.team_id', $teamId)
+            ->where(fn ($q) => $q->whereNull('deliveries.status')->orWhere('deliveries.status', '!=', 'Cancelled'))
+            ->where('deliveries.accepted_quantity', '>', 0)
+            ->where('purchase_orders.unit_cost', '>', 0)
+            ->whereNull('suppliers.deleted_at')
+            ->whereBetween('deliveries.delivery_date', [$from->toDateString(), $to->toDateString()])
+            ->orderBy('deliveries.delivery_date')->orderBy('deliveries.id')
+            ->get([
+                'deliveries.purchase_order_id', 'deliveries.delivery_number', 'deliveries.delivery_date', 'deliveries.accepted_quantity',
+                'purchase_orders.po_number', 'purchase_orders.unit_cost', 'purchase_orders.unit_of_measure', 'purchase_orders.supplier_id', 'purchase_orders.product_id',
+                'suppliers.name as supplier_name', 'products.name as product_name', 'products.sku as product_sku',
+            ])
+            // The same delivery recorded twice counts once (as in the delivery criterion).
+            ->unique(fn ($d) => $d->purchase_order_id.'|'.mb_strtolower(trim((string) $d->delivery_number)));
 
         $groups = [];
-        foreach ($quotes as $q) {
-            $key = implode('|', [$q->product_id, mb_strtolower($q->unit), $q->currency, (int) $q->tax_inclusive]);
-            $groups[$key] ??= [
-                'product' => ['id' => $q->product_id, 'name' => $q->product?->name, 'sku' => $q->product?->sku],
-                'basis' => "per {$q->unit}, {$q->currency}, ".($q->tax_inclusive ? 'tax included' : 'tax excluded'),
-                'quotes' => [],
-            ];
-            if (collect($groups[$key]['quotes'])->contains('supplier_id', $q->supplier_id)) {
-                continue;
-            }
-            $groups[$key]['quotes'][] = [
-                'supplier_id' => $q->supplier_id,
-                'supplier' => $q->supplier?->name,
-                'unit_price' => (float) $q->unit_price,
-                'reference' => $q->reference,
-                'quoted_on' => $q->quoted_on->toDateString(),
-                'valid_until' => $q->valid_until?->toDateString(),
-            ];
+        foreach ($rows as $r) {
+            $unit = strtoupper(trim((string) ($r->unit_of_measure ?: 'PCS')));
+            $key = "{$r->product_id}|{$unit}";
+            $groups[$key] ??= ['product' => ['id' => $r->product_id, 'name' => $r->product_name, 'sku' => $r->product_sku], 'basis' => "per {$unit}", 'suppliers' => []];
+            $groups[$key]['suppliers'][$r->supplier_id] ??= ['supplier_id' => (int) $r->supplier_id, 'supplier' => $r->supplier_name, 'quantity' => 0, 'amount' => 0.0, 'receipts' => []];
+            $row = &$groups[$key]['suppliers'][$r->supplier_id];
+            $row['quantity'] += (int) $r->accepted_quantity;
+            $row['amount'] += (int) $r->accepted_quantity * (float) $r->unit_cost;
+            $row['receipts'][] = ['delivery_number' => $r->delivery_number, 'delivery_date' => substr((string) $r->delivery_date, 0, 10), 'po_number' => $r->po_number,
+                'quantity' => (int) $r->accepted_quantity, 'unit_cost' => (float) $r->unit_cost];
+            unset($row);
         }
 
-        return array_values($groups);
-    }
-
-    /** @return array<int, array{expired: int, unverified: int}> */
-    private function quoteExclusions(int $teamId, Carbon $now): array
-    {
-        $out = [];
-        foreach (SupplierQuote::where('team_id', $teamId)->get(['supplier_id', 'verified_at', 'valid_until']) as $q) {
-            $out[$q->supplier_id] ??= ['expired' => 0, 'unverified' => 0];
-            if (! $q->verified_at) {
-                $out[$q->supplier_id]['unverified']++;
-            } elseif ($q->valid_until && $q->valid_until->lt($now->copy()->startOfDay())) {
-                $out[$q->supplier_id]['expired']++;
-            }
-        }
-
-        return $out;
+        return array_values(array_map(fn ($g) => [
+            'product' => $g['product'],
+            'basis' => $g['basis'],
+            'prices' => array_values(array_map(fn ($r) => [
+                'supplier_id' => $r['supplier_id'],
+                'supplier' => $r['supplier'],
+                'unit_price' => round($r['amount'] / $r['quantity'], 2),
+                'quantity' => $r['quantity'],
+                'receipts' => $r['receipts'],
+            ], $g['suppliers'])),
+        ], $groups));
     }
 }

@@ -122,6 +122,13 @@ trait HasTeams
      */
     public function teamRole(Team $team): ?TeamRole
     {
+        // A team loaded through teams() already carries this user's role on its pivot.
+        if ($team->relationLoaded('pivot') && (int) $team->pivot->user_id === (int) $this->id && isset($team->pivot->role)) {
+            $role = $team->pivot->role;
+
+            return $role instanceof TeamRole ? $role : TeamRole::tryFrom((string) $role);
+        }
+
         return $this->teamMemberships()
             ->where('team_id', $team->id)
             ->first()

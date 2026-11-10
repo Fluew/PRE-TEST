@@ -2,10 +2,15 @@
 
 namespace App\Services\MaterialList;
 
+use App\Models\ImportBatch;
+use App\Services\Import\ColumnSchema;
+use PhpOffice\PhpSpreadsheet\Cell\Cell;
 use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
 use PhpOffice\PhpSpreadsheet\Cell\DataType;
 use PhpOffice\PhpSpreadsheet\IOFactory;
+use PhpOffice\PhpSpreadsheet\Reader\IReadFilter;
 use PhpOffice\PhpSpreadsheet\RichText\RichText;
+use PhpOffice\PhpSpreadsheet\Shared\Date as ExcelDate;
 use Smalot\PdfParser\Parser as PdfParser;
 
 /**
@@ -15,7 +20,8 @@ use Smalot\PdfParser\Parser as PdfParser;
  */
 class FileReader
 {
-    public const MAX_BYTES = 10 * 1024 * 1024;
+    /** Largest file the public quotation form accepts (each file). */
+    public const MAX_BYTES = 25 * 1024 * 1024;
 
     public const MAX_PDF_PAGES = 20;
 
@@ -26,7 +32,7 @@ class FileReader
     public const MAX_SHEETS = 10;
 
     /** Largest image we decode, to avoid "decompression bomb" images exhausting memory. */
-    public const MAX_IMAGE_PIXELS = 40_000_000;
+    public const MAX_IMAGE_PIXELS = 100_000_000; // a 25 MB phone photo can be 48+ megapixels; OCR shrinks it first
 
     public const EXTENSIONS = ['pdf', 'xlsx', 'xls', 'csv', 'jpg', 'jpeg', 'png'];
 
@@ -85,6 +91,11 @@ class FileReader
         $head = (string) file_get_contents($path, false, null, 0, 8);
         $bad = fn () => new ExtractionException("This file doesn't look like a valid .{$ext} file. It may be damaged, or saved in a different format.", 'corrupted');
 
+        // Programs and scripts renamed to a document name are refused outright.
+        if (self::isExecutable($path)) {
+            throw new ExtractionException('This file is not a document or spreadsheet. Please upload a PDF, Excel (.xlsx/.xls), CSV, JPG or PNG file.', 'unsupported');
+        }
+
         switch ($ext) {
             case 'pdf':
                 if (! str_starts_with($head, '%PDF-')) {
@@ -129,7 +140,7 @@ class FileReader
                     throw $bad();
                 }
                 if ($info[0] * $info[1] > self::MAX_IMAGE_PIXELS) {
-                    throw new ExtractionException('This image is too large to process. Please upload a smaller image (under 40 megapixels).', 'too_large');
+                    throw new ExtractionException('This image is too large to process. Please upload a smaller image (under 100 megapixels).', 'too_large');
                 }
 
                 return 'image';
@@ -144,6 +155,40 @@ class FileReader
 
                 return 'csv';
         }
+    }
+
+    /** MIME types (detected from the content) that are programs or web pages, never product lists. */
+    private const EXECUTABLE_MIMES = [
+        'application/x-dosexec', 'application/x-msdownload', 'application/x-executable', 'application/x-sharedlib',
+        'application/x-mach-binary', 'application/x-elf', 'application/java-archive', 'application/x-msi',
+        'text/x-php', 'application/x-php', 'text/x-shellscript', 'application/x-sh', 'text/x-python', 'text/x-script.python',
+        'text/x-perl', 'text/html', 'application/javascript', 'text/javascript', 'application/x-bat',
+    ];
+
+    /**
+     * True when the file is a program or script, whatever its name: Windows/Linux/macOS
+     * executables, shell/PHP scripts and web pages, by their first bytes and detected MIME type.
+     */
+    public static function isExecutable(string $path): bool
+    {
+        $head = (string) file_get_contents($path, false, null, 0, 512);
+        $start = ltrim(substr($head, str_starts_with($head, "\xEF\xBB\xBF") ? 3 : 0));
+        // "MZ" alone could start a CSV row ("MZ-100 breaker"); a Windows program also has binary bytes.
+        if (str_starts_with($head, 'MZ') && str_contains($head, "\0")) {
+            return true;
+        }
+        foreach (["\x7FELF", "\xCF\xFA\xED\xFE", "\xCE\xFA\xED\xFE", "\xFE\xED\xFA", '#!'] as $signature) {
+            if (str_starts_with($head, $signature)) {
+                return true;
+            }
+        }
+        if (preg_match('/^(?:<\?php|<\?=|<script\b|<!doctype\s+html|<html\b)/i', $start)) {
+            return true;
+        }
+
+        $mime = function_exists('finfo_open') ? (string) @mime_content_type($path) : '';
+
+        return in_array(strtolower($mime), self::EXECUTABLE_MIMES, true);
     }
 
     /**
@@ -330,8 +375,21 @@ class FileReader
     {
         try {
             $reader = IOFactory::createReader($type === 'xlsx' ? 'Xlsx' : 'Xls');
-            $reader->setReadDataOnly(true);
+            // Cell formats are read too, so a date cell can be told apart from a plain number.
+            $reader->setReadDataOnly(false);
             $reader->setReadEmptyCells(false);
+            if ($this->maxRows !== null) {
+                // Only the cells that are read are loaded, so a large workbook does not exhaust memory.
+                $reader->setReadFilter(new class($this->maxRows, self::MAX_COLS) implements IReadFilter
+                {
+                    public function __construct(private int $rows, private int $cols) {}
+
+                    public function readCell(string $columnAddress, int $row, string $worksheetName = ''): bool
+                    {
+                        return $row <= $this->rows && Coordinate::columnIndexFromString($columnAddress) <= $this->cols;
+                    }
+                });
+            }
             $book = $reader->load($path);
         } catch (\Throwable $e) {
             $protected = stripos($e->getMessage(), 'password') !== false || stripos($e->getMessage(), 'encrypt') !== false;
@@ -344,6 +402,7 @@ class FileReader
         }
 
         $sheets = [];
+        $tables = [];
         $best = null;
         $all = [];
         foreach (array_slice($book->getAllSheets(), 0, $this->maxSheets) as $sheet) {
@@ -354,17 +413,39 @@ class FileReader
                 $row = [];
                 for ($c = 1; $c <= $maxCol; $c++) {
                     $cell = $sheet->getCell([$c, $r]);
-                    // Formulas are never calculated: use the value Excel saved with the file.
-                    $value = $cell->getDataType() === DataType::TYPE_FORMULA ? $cell->getOldCalculatedValue() : $cell->getValue();
+                    if ($cell->getDataType() === DataType::TYPE_FORMULA) {
+                        $value = $cell->getOldCalculatedValue();
+                        if ($value === null) {
+                            try {
+                                $value = $cell->getCalculatedValue();
+                            } catch (\Throwable) {
+                                $value = $cell->getValue();
+                            }
+                        }
+                    } else {
+                        $value = $cell->getValue();
+                    }
                     $value = $value instanceof RichText ? $value->getPlainText() : $value;
-                    $row[] = is_scalar($value) ? $value : '';
+                    $row[] = is_scalar($value) ? $this->excelDate($cell, $value) : '';
                 }
                 $rows[] = $row;
             }
 
             $found = HeaderMapper::findHeaderRow($rows);
             $score = count($found['mapping']) + (HeaderMapper::isConfident($found['mapping']) ? 10 : 0);
+            if ($score === 0) {
+                foreach (array_slice($rows, 0, 50) as $candidateRow) { // as far down as HeaderMapper::findHeaderRow() looks
+                    $strRow = array_map(fn ($v) => (string) $v, $candidateRow);
+                    $invMap = ColumnSchema::headerMap(ImportBatch::INVENTORY, $strRow);
+                    $sqMap = ColumnSchema::headerMap(ImportBatch::SUPPLIER_QUOTATION, $strRow);
+                    $altScore = max($invMap ? count($invMap) + 10 : 0, $sqMap ? count($sqMap) + 10 : 0);
+                    if ($altScore > $score) {
+                        $score = $altScore;
+                    }
+                }
+            }
             $sheets[] = $sheet->getTitle();
+            $tables[] = ['sheet' => $sheet->getTitle(), 'rows' => $rows];
             if ($this->allSheets) {
                 array_push($all, ...$rows);
             }
@@ -374,7 +455,30 @@ class FileReader
         }
         $book->disconnectWorksheets();
 
-        return ['method' => 'spreadsheet', 'rows' => $this->allSheets ? $all : ($best['rows'] ?? []), 'sheet' => $best['title'] ?? null, 'sheets' => $sheets];
+        // 'tables': every sheet's rows on their own, for readers that handle each sheet separately.
+        return ['method' => 'spreadsheet', 'rows' => $this->allSheets ? $all : ($best['rows'] ?? []), 'sheet' => $best['title'] ?? null, 'sheets' => $sheets, 'tables' => $tables];
+    }
+
+    /**
+     * A number in a date-formatted Excel cell is a date serial (46329 = 2026-11-03), which is
+     * unambiguous: it is returned as ISO YYYY-MM-DD (with the time when there is one). Plain
+     * numbers, text and time-only cells are returned unchanged.
+     */
+    private function excelDate(Cell $cell, mixed $value): mixed
+    {
+        if ((! is_int($value) && ! is_float($value)) || $value < 1) {
+            return $value;
+        }
+        try {
+            if (! ExcelDate::isDateTime($cell, $value)) {
+                return $value;
+            }
+            $dt = ExcelDate::excelToDateTimeObject($value);
+        } catch (\Throwable) {
+            return $value;
+        }
+
+        return $dt->format('H:i:s') === '00:00:00' ? $dt->format('Y-m-d') : $dt->format('Y-m-d H:i:s');
     }
 
     /**
@@ -402,6 +506,32 @@ class FileReader
         $tsv = $this->ocr->pdfTextTsv($path);
 
         return $tsv === null ? null : ['method' => 'pdf-text'] + WordTable::build([$tsv], $isHeader, false);
+    }
+
+    /**
+     * The words of a PDF or image with their positions (Tesseract or pdftotext TSV; one string per
+     * scanned page, or one for all pages of a text PDF), for documents read by their layout, such as
+     * a label with its value beside or below it. Null for other types, or for a text PDF when
+     * pdftotext is not installed.
+     *
+     * @return array{method: 'ocr'|'pdf-ocr'|'pdf-text', tsv: list<string>}|null
+     */
+    public function readWords(string $path, string $type): ?array
+    {
+        if ($type === 'image') {
+            return ['method' => 'ocr', 'tsv' => [$this->ocr->imageToTsv($path)]];
+        }
+        if ($type !== 'pdf') {
+            return null;
+        }
+
+        ['pages' => $pages, 'scanned' => $scanned] = $this->inspectPdf($path);
+        if ($scanned) {
+            return ['method' => 'pdf-ocr', 'tsv' => array_values($this->ocr->pdfToTsv($path, count($pages)))];
+        }
+        $tsv = $this->ocr->pdfTextTsv($path);
+
+        return $tsv === null ? null : ['method' => 'pdf-text', 'tsv' => [$tsv]];
     }
 
     private function readPdf(string $path): array

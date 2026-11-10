@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Enums\EmailStatus;
+use App\Enums\QuotationStatus;
 use App\Models\NotificationLog;
 use App\Models\OrderFulfillment;
 use App\Models\Payment;
@@ -14,6 +15,7 @@ use App\Services\CustomerEmails;
 use App\Services\ResendService;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Queue\Jobs\SyncJob;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -107,15 +109,37 @@ class SendCustomerNotification implements ShouldQueue
         );
 
         if (! $success && $log->attempts < self::MAX_ATTEMPTS && $this->job) {
-            $this->release($this->backoff()[min($log->attempts - 1, 1)]);
+            $delay = $this->backoff()[min($log->attempts - 1, 1)];
+            // Sent in-process (after the web response): a retry cannot wait in this request, so it
+            // goes to the queue. Until a worker sends it, it shows as Failed and staff can resend it.
+            if ($this->job instanceof SyncJob && config('queue.default') !== 'sync') {
+                self::dispatch($log->id)->delay($delay);
+            } else {
+                $this->release($delay);
+            }
         }
     }
 
-    /** The quotation keeps its own email status for the "Send Quotation" action. */
+    /**
+     * The quotation keeps its own email status for the "Send Quotation" action, and becomes Sent
+     * only once its email was actually accepted for delivery (a failed send leaves it approved).
+     */
     private function mirror(NotificationLog $log, mixed $record): void
     {
-        if ($log->type === 'quotation_sent' && $record instanceof Quotation) {
-            $record->forceFill(['email_status' => $log->status])->saveQuietly();
+        if ($log->type !== 'quotation_sent' || ! $record instanceof Quotation) {
+            return;
+        }
+        $changes = ['email_status' => $log->status];
+        if ($log->status === EmailStatus::Sent) {
+            $changes['sent_at'] = $log->sent_at ?? now();
+            if ($record->status === QuotationStatus::Draft && $record->approved_at) {
+                $changes['status'] = QuotationStatus::Sent;
+            }
+        }
+        $record->forceFill($changes)->saveQuietly();
+
+        if (isset($changes['status'])) {
+            AuditLogger::record('quotation.status_changed', "Quotation {$record->quotation_number} is now Sent: emailed to {$log->recipient}.", $record, ['notification_log_id' => $log->id, 'from' => 'draft', 'to' => 'sent']);
         }
     }
 

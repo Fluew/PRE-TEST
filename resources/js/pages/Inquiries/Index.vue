@@ -340,17 +340,17 @@ const formatDate = (dateStr?: string | null) => {
 
     <div class="workspace-page">
         <!-- Page Header -->
-        <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div class="page-header">
             <div>
                 <h1 class="page-title">Messages / Inquiries</h1>
                 <p class="page-subtitle">Messages from the Contact Us page: assign and reply.</p>
             </div>
 
             <!-- Header Actions -->
-            <div class="flex flex-wrap items-center gap-2.5 w-full md:w-auto">
+            <div class="page-actions">
                 <button
                     type="button"
-                    @click="router.reload({ preserveScroll: true })"
+                    @click="router.reload()"
                     class="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-gray-200 bg-white px-3.5 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors"
                     title="Refresh data"
                 >
@@ -389,7 +389,7 @@ const formatDate = (dateStr?: string | null) => {
                         @input="applyFilter"
                         type="text"
                         placeholder="Search customer, email, subject, message..."
-                        class="w-full rounded-xl border border-gray-200 bg-gray-50/50 pl-9 pr-3.5 py-2 text-xs sm:text-sm text-gray-900 placeholder-gray-400 focus:border-[#4b5320] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#4b5320]"
+                        class="field-control w-full pl-9 pr-3.5"
                     />
                 </div>
 
@@ -398,7 +398,7 @@ const formatDate = (dateStr?: string | null) => {
                     <select
                         v-model="selectedStatus"
                         @change="applyFilter"
-                        class="w-full rounded-xl border border-gray-200 bg-gray-50/50 px-3 py-2 text-xs sm:text-sm text-gray-900 focus:border-[#4b5320] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#4b5320]"
+                        class="field-control w-full"
                     >
                         <option value="all">All Statuses</option>
                         <option value="unread">Unread</option>
@@ -414,7 +414,7 @@ const formatDate = (dateStr?: string | null) => {
                     <select
                         v-model="selectedPriority"
                         @change="applyFilter"
-                        class="w-full rounded-xl border border-gray-200 bg-gray-50/50 px-3 py-2 text-xs sm:text-sm text-gray-900 focus:border-[#4b5320] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#4b5320]"
+                        class="field-control w-full"
                     >
                         <option value="all">All Priorities</option>
                         <option value="urgent">Urgent</option>
@@ -431,7 +431,7 @@ const formatDate = (dateStr?: string | null) => {
                         @change="applyFilter"
                         type="date"
                         title="From Date"
-                        class="w-full rounded-xl border border-gray-200 bg-gray-50/50 px-3 py-2 text-xs sm:text-sm text-gray-900 focus:border-[#4b5320] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#4b5320]"
+                        class="field-control w-full"
                     />
                 </div>
 
@@ -442,7 +442,7 @@ const formatDate = (dateStr?: string | null) => {
                         @change="applyFilter"
                         type="date"
                         title="To Date"
-                        class="w-full rounded-xl border border-gray-200 bg-gray-50/50 px-3 py-2 text-xs sm:text-sm text-gray-900 focus:border-[#4b5320] focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#4b5320]"
+                        class="field-control w-full"
                     />
                     <button
                         v-if="hasActiveFilters"
@@ -463,13 +463,13 @@ const formatDate = (dateStr?: string | null) => {
                 <table class="w-full text-left text-xs sm:text-sm text-gray-700">
                     <thead class="border-b border-gray-200 bg-gray-50/80 text-[11px] font-semibold text-gray-500">
                         <tr>
-                            <th class="px-4 py-3.5">ID / Date</th>
-                            <th class="px-4 py-3.5">Customer</th>
-                            <th class="px-4 py-3.5">Subject & Preview</th>
-                            <th class="px-4 py-3.5">Status</th>
-                            <th class="px-4 py-3.5">Priority</th>
-                            <th class="px-4 py-3.5">Assigned To</th>
-                            <th class="px-4 py-3.5 text-right">Actions</th>
+                            <th class="px-4 py-3">ID / Date</th>
+                            <th class="px-4 py-3">Customer</th>
+                            <th class="px-4 py-3">Subject & Preview</th>
+                            <th class="px-4 py-3">Status</th>
+                            <th class="px-4 py-3">Priority</th>
+                            <th class="px-4 py-3">Assigned To</th>
+                            <th class="px-4 py-3 text-right">Actions</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-gray-100">
@@ -480,7 +480,7 @@ const formatDate = (dateStr?: string | null) => {
                             :class="{ 'bg-amber-50/30 font-semibold text-gray-900': item.status === 'unread' }"
                         >
                             <!-- ID / Date -->
-                            <td class="px-4 py-3.5 whitespace-nowrap">
+                            <td class="px-4 py-3 whitespace-nowrap">
                                 <div class="font-mono text-xs font-semibold text-gray-900">#{{ item.id }}</div>
                                 <div class="text-[11px] text-gray-400 flex items-center gap-1 mt-0.5">
                                     <Clock class="size-3" />
@@ -489,7 +489,7 @@ const formatDate = (dateStr?: string | null) => {
                             </td>
 
                             <!-- Customer Info -->
-                            <td class="px-4 py-3.5 whitespace-nowrap">
+                            <td class="px-4 py-3 whitespace-nowrap">
                                 <div class="font-semibold text-gray-900">{{ item.name }}</div>
                                 <div class="flex items-center gap-1.5 text-xs text-gray-500 mt-0.5">
                                     <Mail class="size-3 text-gray-400" />
@@ -502,7 +502,7 @@ const formatDate = (dateStr?: string | null) => {
                             </td>
 
                             <!-- Subject & Snippet -->
-                            <td class="px-4 py-3.5 max-w-xs sm:max-w-md">
+                            <td class="px-4 py-3 max-w-xs sm:max-w-md">
                                 <div class="font-semibold text-gray-900 truncate">
                                     {{ item.subject || 'General Inquiry' }}
                                 </div>
@@ -516,7 +516,7 @@ const formatDate = (dateStr?: string | null) => {
                             </td>
 
                             <!-- Status -->
-                            <td class="px-4 py-3.5 whitespace-nowrap">
+                            <td class="px-4 py-3 whitespace-nowrap">
                                 <span
                                     class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold"
                                     :class="{
@@ -542,7 +542,7 @@ const formatDate = (dateStr?: string | null) => {
                             </td>
 
                             <!-- Priority -->
-                            <td class="px-4 py-3.5 whitespace-nowrap">
+                            <td class="px-4 py-3 whitespace-nowrap">
                                 <span
                                     class="inline-flex items-center rounded-md px-2 py-0.5 text-[11px] font-semibold"
                                     :class="{
@@ -557,7 +557,7 @@ const formatDate = (dateStr?: string | null) => {
                             </td>
 
                             <!-- Assigned To -->
-                            <td class="px-4 py-3.5 whitespace-nowrap">
+                            <td class="px-4 py-3 whitespace-nowrap">
                                 <div v-if="item.assigned_to" class="flex items-center gap-1.5 text-xs font-semibold text-gray-800">
                                     <Shield class="size-3.5 text-[#4b5320]" />
                                     <span>{{ item.assigned_to.name }}</span>
@@ -568,7 +568,7 @@ const formatDate = (dateStr?: string | null) => {
                             </td>
 
                             <!-- Actions -->
-                            <td class="px-4 py-3.5 text-right whitespace-nowrap">
+                            <td class="px-4 py-3 text-right whitespace-nowrap">
                                 <div class="inline-flex items-center gap-1.5">
                                     <button
                                         type="button"

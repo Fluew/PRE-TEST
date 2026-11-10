@@ -10,7 +10,9 @@ use App\Models\StockMovement;
 use App\Models\Supplier;
 use App\Models\Team;
 use App\Models\TeamInvitation;
+use App\Services\Forecast\SmaForecaster;
 use App\Services\Suppliers\SupplierEvaluator;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -60,8 +62,17 @@ class DashboardController extends Controller
         ];
 
         $recentActivity = [];
+        $forecastSeries = null;
 
         if ($team) {
+            $curYear = (int) today()->year;
+            $forecastSeries = app(SmaForecaster::class)->series(
+                $team->id,
+                Carbon::create($curYear, 1, 1),
+                Carbon::create($curYear, 12, 31),
+                SmaForecaster::DEFAULT_WINDOW,
+            );
+
             $productCounts = Product::where('team_id', $team->id)
                 ->where('is_active', true)
                 ->selectRaw("COUNT(*) as total, SUM(CASE WHEN status = 'Low Stock' THEN 1 ELSE 0 END) as low_stock")
@@ -101,7 +112,7 @@ class DashboardController extends Controller
                 ->get(['id', 'reference_number', 'type', 'created_at'])
                 ->map(fn ($m) => [
                     'id' => $m->reference_number ?: ('MOV-'.$m->id),
-                    'type' => $m->type === 'stock_in' ? 'Stock In' : ($m->type === 'stock_out' ? 'Stock Out' : 'Adjustment'),
+                    'type' => $m->formatted_type,
                     'status' => 'Completed',
                     'created_at' => $m->created_at,
                 ]);
@@ -156,6 +167,7 @@ class DashboardController extends Controller
             'pendingInvitations' => $pendingInvitations,
             'stats' => $stats,
             'recentActivity' => $recentActivity,
+            'forecastSeries' => $forecastSeries,
             'isFirstLogin' => $isFirstLogin,
         ]);
     }

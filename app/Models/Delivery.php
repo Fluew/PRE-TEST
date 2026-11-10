@@ -3,7 +3,6 @@
 namespace App\Models;
 
 use App\Traits\TracksDeletions;
-use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -15,6 +14,7 @@ class Delivery extends Model
 
     protected $fillable = [
         'team_id',
+        'inbound_delivery_id',
         'delivery_date',
         'delivery_number',
         'purchase_order_number',
@@ -90,6 +90,50 @@ class Delivery extends Model
         };
     }
 
+    /** Quality status of the received product: Passed, Partially Passed, Failed, or Pending Inspection. */
+    public function qualityStatus(): string
+    {
+        return match ($this->inspection_result) {
+            'accepted' => 'Passed',
+            'partially_accepted' => 'Partially Passed',
+            'rejected' => 'Failed',
+            default => 'Pending Inspection',
+        };
+    }
+
+    /**
+     * Every delivery belongs to an inbound delivery record (its Delivery #). Records made one
+     * line at a time (the purchase order workspace, the CSV import) get theirs here; deliveries
+     * sharing a number share one.
+     */
+    protected static function booted(): void
+    {
+        $attach = function (Delivery $delivery) {
+            if ($delivery->inbound_delivery_id || ! $delivery->team_id || $delivery->delivery_number === null) {
+                return;
+            }
+            $header = InboundDelivery::firstOrCreate(
+                ['team_id' => $delivery->team_id, 'delivery_number' => $delivery->delivery_number],
+                [
+                    'delivery_date' => $delivery->delivery_date ?? now()->toDateString(),
+                    'purchase_order_number' => $delivery->purchase_order_number,
+                    'supplier_id' => $delivery->supplier_id,
+                    'status' => $delivery->status === 'Cancelled' ? InboundDelivery::CANCELLED : InboundDelivery::CONFIRMED,
+                    'confirmed_by_id' => $delivery->received_by_id,
+                    'confirmed_at' => now(),
+                ],
+            );
+            $delivery->inbound_delivery_id = $header->id;
+        };
+        static::creating($attach);
+        static::restoring($attach);
+    }
+
+    public function inboundDelivery(): BelongsTo
+    {
+        return $this->belongsTo(InboundDelivery::class);
+    }
+
     public function invoices(): HasMany
     {
         return $this->hasMany(CommercialInvoice::class, 'delivery_id');
@@ -126,24 +170,11 @@ class Delivery extends Model
     }
 
     /**
-     * Generate unique delivery number, e.g. DEL-102526-001
+     * Generate a unique delivery number, e.g. DEL-102526-001 (same sequence as the inbound
+     * delivery records, so two deliveries recorded at once never share a number).
      */
     public static function generateDeliveryNumber(int $teamId, mixed $date = null): string
     {
-        $parsedDate = $date ? Carbon::parse($date) : now();
-        $dateCode = $parsedDate->format('mdy'); // e.g. 102526
-
-        $count = static::where('team_id', $teamId)
-            ->whereDate('delivery_date', $parsedDate->toDateString())
-            ->count() + 1;
-
-        $counter = $count;
-        do {
-            $seq = str_pad((string) $counter, 3, '0', STR_PAD_LEFT);
-            $candidate = "DEL-{$dateCode}-{$seq}";
-            $counter++;
-        } while (static::where('team_id', $teamId)->where('delivery_number', $candidate)->exists());
-
-        return $candidate;
+        return InboundDelivery::reserveNumber($teamId, $date);
     }
 }

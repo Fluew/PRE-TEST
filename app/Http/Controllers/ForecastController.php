@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Product;
 use App\Services\Forecast\SmaForecaster;
+use App\Services\Inventory\ProductPrioritizer;
 use App\Support\Csv;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -160,10 +161,27 @@ class ForecastController extends Controller
                 ];
             });
 
+        // Review: each product's forecast for the chosen period, with the AHP priority and reorder
+        // advice it feeds (the same ProductPrioritizer results as Reports → AHP Product Prioritization).
+        $scopeIds = $productId ? [$productId] : $productsList->pluck('id')->all();
+        $productForecasts = collect(app(ProductPrioritizer::class)->forTeam($team->id, null, $smaWindow))
+            ->only($scopeIds)
+            ->sortBy(fn ($p) => [$p['reorder']['needed'] ? 0 : 1, -($p['forecast']['period_total'] ?? -1), $p['product']['name']])
+            ->map(fn ($p) => [
+                'product' => $p['product'],
+                'available_stock' => $p['available_stock'],
+                'forecast' => $p['forecast'],
+                'classification' => $p['classification'],
+                'score' => $p['score'],
+                'reorder' => ['needed' => $p['reorder']['needed'], 'suggested_quantity' => $p['reorder']['suggested_quantity'], 'basis' => $p['reorder']['basis']],
+            ])->values();
+
         return Inertia::render('Forecast/Index', [
             'fromDate' => $fromDate->format('Y-m-d'),
             'toDate' => $toDate->format('Y-m-d'),
             'smaWindow' => $smaWindow,
+            'forecastPeriods' => SmaForecaster::PERIOD_LABELS,
+            'productForecasts' => $productForecasts,
             'selectedCategory' => $category,
             'selectedProductId' => $productId,
             'categories' => $categories,

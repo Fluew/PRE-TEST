@@ -7,6 +7,7 @@ import { index as company } from '@/routes/company';
 import { index as contact } from '@/routes/contact';
 import { index as products } from '@/routes/products';
 import { create as quotation } from '@/routes/quotations';
+import { vWordReveal } from '@/directives/wordReveal';
 import StaggeredMenu from '@/components/vue-bits/StaggeredMenu.vue';
 import CustomerLoadingScreen from '@/components/CustomerLoadingScreen.vue';
 import FloatingContactSidebar from '@/components/FloatingContactSidebar.vue';
@@ -21,6 +22,8 @@ const navigation = [
     { name: 'Company Info', href: company().url },
     { name: 'Contact Us', href: contact().url },
 ];
+
+const year = new Date().getFullYear();
 </script>
 <template>
     <div
@@ -124,55 +127,40 @@ const navigation = [
             <div class="mx-auto max-w-7xl px-4 pt-14 pb-7 sm:px-6 lg:px-8">
                 <div class="grid gap-10 pb-12 md:grid-cols-[2fr_1fr_1fr]">
                     <div>
-                        <p
-                            class="text-lg font-extrabold text-[#4b5320] dark:text-[#F8B803]"
-                        >
-                            MR-PRIDE<span class="text-[#F8B803]">.</span>
-                        </p>
-                        <p
-                            class="mt-4 max-w-sm text-sm leading-7 text-gray-600 dark:text-neutral-300"
-                        >
-                            Electrical, hardware, and industrial supplies for
-                            your next project. Quality products. Trusted brand
-                            partners.
+                        <p v-word-reveal class="text-lg font-extrabold text-[#4b5320] dark:text-[#F8B803]">MR-PRIDE<span class="text-[#F8B803]">.</span></p>
+                        <p v-word-reveal class="mt-4 max-w-sm text-sm leading-7 text-gray-600 dark:text-neutral-300">
+                            Electrical, hardware, and industrial supplies for your next project. Quality products. Trusted brand partners.
                         </p>
                     </div>
                     <div>
-                        <h2
-                            class="text-xs font-bold tracking-widest text-gray-500 uppercase dark:text-neutral-400"
-                        >
-                            Explore
-                        </h2>
+                        <h2 v-word-reveal class="text-xs font-bold tracking-widest text-gray-500 uppercase dark:text-neutral-400">Explore</h2>
                         <ul class="mt-3.5 grid text-sm font-medium">
-                            <li v-for="item in navigation" :key="item.name">
+                            <li
+                                v-for="item in navigation"
+                                :key="item.name"
+                            >
                                 <Link
                                     :href="item.href"
                                     class="inline-block py-1.5 text-gray-700 hover:text-[#4b5320] hover:underline dark:text-neutral-300 dark:hover:text-[#F8B803]"
-                                    >{{ item.name }}</Link
-                                >
+                                    ><span v-word-reveal>{{ item.name }}</span></Link>
                             </li>
                             <li>
                                 <Link
                                     :href="quotation()"
                                     class="inline-block py-1.5 text-gray-700 hover:text-[#4b5320] hover:underline dark:text-neutral-300 dark:hover:text-[#F8B803]"
-                                    >Request Quotation</Link
-                                >
+                                    ><span v-word-reveal>Request Quotation</span></Link>
                             </li>
                         </ul>
                     </div>
                     <div>
-                        <h2
-                            class="text-xs font-bold tracking-widest text-gray-500 uppercase dark:text-neutral-400"
-                        >
-                            Visit our office
-                        </h2>
+                        <h2 v-word-reveal class="text-xs font-bold tracking-widest text-gray-500 uppercase dark:text-neutral-400">Visit our office</h2>
                         <p
                             class="mt-5 flex gap-2 text-sm leading-7 text-gray-600 dark:text-neutral-300"
                         >
                             <MapPin
                                 class="mt-1 size-4 shrink-0 text-[#4b5320] dark:text-[#F8B803]"
                                 aria-hidden="true"
-                            />#610 Esguerra St.<br />Tondo, Manila, Philippines
+                            /><span v-word-reveal>#610 Esguerra St.<br />Tondo, Manila, Philippines</span>
                         </p>
                     </div>
                 </div>
@@ -183,15 +171,9 @@ const navigation = [
                     <div
                         class="flex flex-col gap-3 text-xs text-white/90 sm:flex-row sm:items-center sm:justify-between"
                     >
-                        <p>
-                            &copy; {{ new Date().getFullYear() }} MR-Pride
-                            Electrical Supplies. All rights reserved.
-                        </p>
+                        <p v-word-reveal>© {{ year }} MR-Pride Electrical Supplies. All rights reserved.</p>
                         <div class="flex items-center gap-3">
-                            <span class="text-white/80"
-                                >Hardware · Electrical · Industrial ·
-                                Safety</span
-                            >
+                            <span v-word-reveal class="text-white/80">Hardware · Electrical · Industrial · Safety</span>
                             <span class="text-white/40">·</span>
                             <a
                                 href="https://web.facebook.com/mrprideelectricalsupplies"
@@ -211,7 +193,7 @@ const navigation = [
                                         d="M22 12c0-5.523-4.477-10-10-10S2 6.477 2 12c0 4.991 3.657 9.128 8.438 9.878v-6.987h-2.54V12h2.54V9.797c0-2.506 1.492-3.89 3.777-3.89 1.094 0 2.238.195 2.238.195v2.46h-1.26c-1.243 0-1.63.771-1.63 1.562V12h2.773l-.443 2.89h-2.33v6.988C18.343 21.128 22 16.991 22 12z"
                                     />
                                 </svg>
-                                <span>Facebook</span>
+                                <span v-word-reveal>Facebook</span>
                             </a>
                         </div>
                     </div>

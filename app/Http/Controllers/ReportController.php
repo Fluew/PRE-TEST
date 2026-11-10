@@ -4,6 +4,8 @@ namespace App\Http\Controllers;
 
 use App\Enums\QuotationStatus;
 use App\Enums\SalesOrderStatus;
+use App\Http\Middleware\EnsureRole;
+use App\Models\AuditLog;
 use App\Models\Product;
 use App\Models\PurchaseRequest;
 use App\Models\Quotation;
@@ -12,13 +14,17 @@ use App\Models\SaleItem;
 use App\Models\Supplier;
 use App\Services\Forecast\SmaForecaster;
 use App\Services\Inventory\ProductPrioritizer;
+use App\Services\Reports\ReportTableExporter;
 use App\Services\Suppliers\SupplierEvaluator;
 use App\Support\Csv;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 use Inertia\Inertia;
 use Inertia\Response;
+use Symfony\Component\HttpFoundation\Response as SymfonyResponse;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class ReportController extends Controller
@@ -109,7 +115,7 @@ class ReportController extends Controller
         $quotationsCount = $quotesQuery->count();
         $pendingQuotationsCount = (clone $quotesQuery)->where('status', 'Pending')->count();
         $pendingQuotationsValue = (float) (clone $quotesQuery)->where('status', 'Pending')->sum('grand_total');
-        $approvedQuotationsCount = (clone $quotesQuery)->where(fn ($q) => $q->whereNotNull('approved_at')->orWhereIn('status', [QuotationStatus::Sent->value, QuotationStatus::Accepted->value, QuotationStatus::Converted->value]))->count();
+        $approvedQuotationsCount = (clone $quotesQuery)->where(fn ($q) => $q->whereNotNull('approved_at')->orWhereIn('status', [QuotationStatus::Sent->value, QuotationStatus::Accepted->value]))->count();
         $convertedQuotationsCount = (clone $quotesQuery)->whereNotNull('converted_to_sale_id')->count();
 
         // Procurement Metrics (filtered by date range)
@@ -257,10 +263,12 @@ class ReportController extends Controller
             ->whereIn('status', SalesOrderStatus::countedInSales())
             ->where('sale_date', '>=', $trendPeriods[0]->copy()->startOfMonth())
             ->where('sale_date', '<=', $trendPeriods[count($trendPeriods) - 1]->copy()->endOfMonth())
-            ->selectRaw("DATE_FORMAT(sale_date, '%Y-%m') as ym, SUM(grand_total) as monthly_rev, COUNT(*) as count")
-            ->groupBy('ym')
-            ->get()
-            ->keyBy('ym');
+            ->get(['sale_date', 'grand_total'])
+            ->groupBy(fn (Sale $s) => $s->sale_date?->format('Y-m'))
+            ->map(fn ($group) => (object) [
+                'monthly_rev' => (float) $group->sum('grand_total'),
+                'count' => $group->count(),
+            ]);
 
         $salesTrendLabels = [];
         $salesTrendData = [];
@@ -360,7 +368,7 @@ class ReportController extends Controller
             ->map(fn ($pr) => [
                 'id' => $pr->id,
                 'request_number' => $pr->request_number,
-                'product_name' => $pr->product?->name ?? 'Unknown Item',
+                'product_name' => $pr->product?->name ?? ($pr->product_description !== null ? 'Not listed: '.$pr->product_description : 'Unknown Item'),
                 'sku' => $pr->product?->sku ?? 'N/A',
                 'supplier_name' => $pr->supplier?->name ?? 'N/A',
                 'requested_by' => $pr->requestedBy?->name ?? 'Staff',
@@ -370,12 +378,15 @@ class ReportController extends Controller
                 'date' => $pr->requested_at?->format('Y-m-d') ?? $pr->created_at->format('Y-m-d'),
             ]);
 
+        // AHP Product Prioritization forecasting period (?forecast_months=3|6|12).
+        $priorityMonths = SmaForecaster::window($request->input('forecast_months', SmaForecaster::DEFAULT_WINDOW));
+
         // F. Supplier AHP Prioritization Analytics
         $ahpRankingItems = $this->rankedSupplierEvaluations($team->id)->values()->map(function ($row, $idx) {
             [$s, $e] = $row;
 
             return [
-                'rank' => $e['complete'] ? $idx + 1 : null,
+                'rank' => $e['rank'] ?? null, // from SupplierEvaluator (equal scores share a rank)
                 'id' => $s->id,
                 'name' => $s->name,
                 'contact_person' => $s->contact_person ?? 'N/A',
@@ -389,6 +400,44 @@ class ReportController extends Controller
                 'status' => $s->status,
             ];
         });
+
+        // G. Recent Activity Feed (sourced directly from System Audit Trail / AuditLog)
+        $activityModules = [
+            'Sales',
+            'Inventory',
+            'Procurement',
+            'Suppliers',
+            'User Management',
+            'System Maintenance',
+        ];
+
+        $auditQuery = AuditLog::with(['user:id,name,email', 'targetUser:id,name,email'])
+            ->when($fromDate, fn ($q) => $q->where('created_at', '>=', $fromDate)->where('created_at', '<=', $toDate))
+            ->orderByDesc('created_at')
+            ->orderByDesc('id');
+
+        if ($request->filled('activity_from')) {
+            $auditQuery->whereDate('created_at', '>=', $request->input('activity_from'));
+        }
+        if ($request->filled('activity_to')) {
+            $auditQuery->whereDate('created_at', '<=', $request->input('activity_to'));
+        }
+
+        $rawAuditLogs = $auditQuery->limit(300)->get();
+
+        $activityByModule = array_fill_keys($activityModules, 0);
+        $activityItems = $rawAuditLogs->map(function (AuditLog $log) use (&$activityByModule) {
+            $mapped = $this->transformAuditLogForFeed($log);
+            $mod = $mapped['module'];
+            $activityByModule[$mod] = ($activityByModule[$mod] ?? 0) + 1;
+
+            return $mapped;
+        })->values();
+
+        if ($request->filled('activity_module') && $request->input('activity_module') !== 'All') {
+            $reqMod = $request->input('activity_module');
+            $activityItems = $activityItems->where('module', $reqMod)->values();
+        }
 
         return Inertia::render('Reports/Index', [
             // Standard / Preserved Metrics
@@ -415,6 +464,9 @@ class ReportController extends Controller
                 'fromDate' => $fromDate ? $fromDate->format('Y-m-d') : null,
                 'toDate' => $toDate ? $toDate->format('Y-m-d') : null,
             ],
+
+            // For the printed business summary.
+            'companyName' => config('company.name'),
 
             // Available Categories & Products
             'categories' => array_keys($categoriesSet),
@@ -467,10 +519,11 @@ class ReportController extends Controller
 
             'procurementAnalytics' => [
                 'statusDistribution' => [
-                    'Requested' => (int) ($procurementStatusCounts['Requested']->count ?? 0),
-                    'Ordered' => (int) ($procurementStatusCounts['Ordered']->count ?? 0),
-                    'Delivered' => (int) ($procurementStatusCounts['Delivered']->count ?? 0),
-                    'Cancelled' => (int) ($procurementStatusCounts['Cancelled']->count ?? 0),
+                    'Draft' => (int) ($procurementStatusCounts['Draft']->count ?? 0),
+                    'Pending Approval' => (int) (($procurementStatusCounts['Pending Approval']->count ?? 0) + ($procurementStatusCounts['Requested']->count ?? 0)),
+                    'Approved' => (int) ($procurementStatusCounts['Approved']->count ?? 0),
+                    'Converted to Purchase Order' => (int) (($procurementStatusCounts['Converted to Purchase Order']->count ?? 0) + ($procurementStatusCounts['Ordered']->count ?? 0) + ($procurementStatusCounts['Delivered']->count ?? 0)),
+                    'Rejected' => (int) (($procurementStatusCounts['Rejected']->count ?? 0) + ($procurementStatusCounts['Cancelled']->count ?? 0)),
                 ],
                 'totalEstimatedCost' => $totalPurchasesEstimatedCost,
                 'requestsList' => $procurementTableItems,
@@ -485,15 +538,58 @@ class ReportController extends Controller
                 'classes' => config('evaluation.supplier.classes'),
             ],
 
-            // AHP Product Prioritization: same service as the Inventory page.
+            // AHP Product Prioritization (moved here from Inventory): rankings, reorder
+            // recommendations and the forecasting period (3, 6 or 12 months = the SMA window).
             'productPriority' => [
-                'items' => array_values(app(ProductPrioritizer::class)->forTeam($team->id)),
+                'items' => array_values(app(ProductPrioritizer::class)->forTeam($team->id, null, $priorityMonths)),
                 'weights' => config('evaluation.product_priority.weights'),
                 'classes' => config('evaluation.product_priority.classes'),
                 'movementMonths' => (int) config('evaluation.product_priority.movement_months'),
-                'smaWindow' => SmaForecaster::DEFAULT_WINDOW,
+                'smaWindow' => $priorityMonths,
+                'forecastMonths' => $priorityMonths,
+                'forecastPeriods' => SmaForecaster::PERIOD_LABELS,
+                // Same rule as the purchase request routes (admin, procurement or inventory staff).
+                'canRequestPurchase' => EnsureRole::allows($request->user(), ['admin', 'staff_procurement', 'staff_inventory']),
+            ],
+
+            // Recent Activity Feed (System Audit Trail)
+            'activityFeed' => [
+                'items' => $activityItems,
+                'modules' => $activityModules,
+                'byModule' => $activityByModule,
+                'totalCount' => $activityItems->count(),
             ],
         ]);
+    }
+
+    /**
+     * Export the report view on screen, as filtered, in the chosen format. The page sends the
+     * tables it shows (period, view filters and report search already applied); this only lays
+     * them out as Excel, PDF, CSV, PNG or JPG.
+     */
+    public function export(Request $request, ReportTableExporter $exporter): SymfonyResponse
+    {
+        $team = $request->user()->currentTeam;
+        abort_if(! $team, 403);
+
+        // The page downloads the file with fetch(), so problems come back as JSON (this app renders
+        // JSON errors only for api/* routes by default).
+        try {
+            $data = $request->validate([
+                'format' => ['required', Rule::in(ReportTableExporter::FORMATS)],
+                'title' => ['required', 'string', 'max:120'],
+                'scope' => ['nullable', 'string', 'max:300'],
+                'sections' => ['required', 'array', 'min:1', 'max:'.ReportTableExporter::MAX_SECTIONS],
+            ]);
+
+            return $exporter->download($data['format'], $exporter->normalize($data['sections']), [
+                'title' => $data['title'],
+                'team' => $team->name,
+                'scope' => $data['scope'] ?: 'All records',
+            ]);
+        } catch (ValidationException $e) {
+            return response()->json(['message' => collect($e->errors())->flatten()->first(), 'errors' => $e->errors()], 422);
+        }
     }
 
     /**
@@ -739,45 +835,224 @@ class ReportController extends Controller
     }
 
     /**
-     * Export All Master Data (All Products + Suppliers + Summary).
+     * Export Recent Activity Feed (System Audit Trail) to CSV.
      */
-    public function exportAll(Request $request): StreamedResponse
+    public function exportActivityFeed(Request $request): StreamedResponse
     {
         $team = $request->user()->currentTeam;
         abort_if(! $team, 403);
 
-        $fileName = 'all_master_data_'.date('Y-m-d').'.csv';
-        $products = Product::where('team_id', $team->id)->with('supplier:id,name')->get();
+        $moduleFilter = $request->input('module', 'All');
+        $fromDate = $request->input('from_date');
+        $toDate = $request->input('to_date');
 
-        $evaluations = app(SupplierEvaluator::class)->forTeam($team->id);
+        $query = AuditLog::with(['user:id,name,email', 'targetUser:id,name,email'])
+            ->orderByDesc('created_at')
+            ->orderByDesc('id');
 
-        return $this->streamCsv($fileName, ['Type', 'SKU/Code', 'Name', 'Category/Role', 'Stock/Contact', 'Unit/Email', 'Price/Evaluation Score', 'Status'], function ($file) use ($products, $team, $evaluations) {
-            foreach ($products as $p) {
+        if ($fromDate) {
+            $query->whereDate('created_at', '>=', $fromDate);
+        }
+        if ($toDate) {
+            $query->whereDate('created_at', '<=', $toDate);
+        }
+
+        $logs = $query->limit(500)->get()->map(fn (AuditLog $log) => $this->transformAuditLogForFeed($log));
+
+        if ($moduleFilter && $moduleFilter !== 'All') {
+            $logs = $logs->where('module', $moduleFilter)->values();
+        }
+
+        $fileName = 'recent_activity_feed_'.date('Y-m-d').'.csv';
+
+        return $this->streamCsv($fileName, ['Timestamp', 'User', 'User Email', 'Action Performed', 'Affected Module', 'Record Reference', 'Description', 'Outcome'], function ($file) use ($logs) {
+            foreach ($logs as $item) {
                 Csv::put($file, [
-                    'Product',
-                    $p->sku,
-                    $p->name,
-                    $p->category ?: 'General',
-                    $p->stock,
-                    $p->unit ?? 'pcs',
-                    number_format($p->price, 2),
-                    $p->status,
-                ]);
-            }
-
-            foreach ($team->suppliers as $s) {
-                Csv::put($file, [
-                    'Supplier',
-                    'SUP-'.$s->id,
-                    $s->name,
-                    $s->contact_person ?? 'N/A',
-                    $s->phone ?? 'N/A',
-                    $s->email ?? 'N/A',
-                    ($evaluations[$s->id]['score'] ?? null) !== null ? number_format($evaluations[$s->id]['score'], 2) : 'Insufficient data',
-                    $s->status,
+                    $item['timestamp'],
+                    $item['user'],
+                    $item['user_email'],
+                    $item['action'],
+                    $item['module'],
+                    $item['reference'],
+                    $item['description'],
+                    $item['outcome'],
                 ]);
             }
         });
+    }
+
+    /**
+     * Transform an AuditLog record into a normalized Recent Activity Feed row.
+     *
+     * @return array<string, mixed>
+     */
+    private function transformAuditLogForFeed(AuditLog $log): array
+    {
+        $userName = $log->user?->name
+            ?: ($log->user_email ? explode('@', $log->user_email)[0] : 'System');
+        $userEmail = $log->user_email ?: ($log->user?->email ?? 'system@mrpride.local');
+
+        return [
+            'id' => $log->id,
+            'user' => $userName,
+            'user_email' => $userEmail,
+            'action' => $this->resolveAuditActionLabel($log),
+            'event' => (string) ($log->event ?: $log->action_type ?: 'system.event'),
+            'description' => (string) ($log->description ?? ''),
+            'module' => $this->resolveAuditModule($log),
+            'reference' => $this->resolveAuditReference($log),
+            'outcome' => (string) ($log->outcome ?: 'success'),
+            'timestamp' => $log->created_at?->format('M d, Y h:i:s A') ?? 'N/A',
+            'date' => $log->created_at?->format('Y-m-d') ?? '',
+            'relative_time' => $log->created_at?->diffForHumans() ?? '',
+        ];
+    }
+
+    /**
+     * Classify an AuditLog record into its affected system module.
+     */
+    private function resolveAuditModule(AuditLog $log): string
+    {
+        $event = strtolower((string) ($log->event ?: $log->action_type));
+        $subjectType = strtolower((string) $log->subject_type);
+
+        if (
+            str_starts_with($event, 'system.maintenance') ||
+            str_starts_with($event, 'maintenance.') ||
+            str_starts_with($event, 'recycle_bin.') ||
+            str_contains($event, 'recycle_bin')
+        ) {
+            return 'System Maintenance';
+        }
+
+        if (
+            str_starts_with($event, 'sale.') ||
+            str_starts_with($event, 'sales.') ||
+            str_starts_with($event, 'quotation.') ||
+            str_starts_with($event, 'pos.') ||
+            in_array($subjectType, ['sale', 'saleitem', 'quotation', 'quotationitem'], true)
+        ) {
+            return 'Sales';
+        }
+
+        if (
+            str_starts_with($event, 'product.') ||
+            str_starts_with($event, 'inventory.') ||
+            str_starts_with($event, 'stock.') ||
+            in_array($subjectType, ['product', 'stockmovement', 'inventoryimport'], true)
+        ) {
+            return 'Inventory';
+        }
+
+        if (
+            str_starts_with($event, 'purchase_request.') ||
+            str_starts_with($event, 'purchase_order.') ||
+            str_starts_with($event, 'procurement.') ||
+            str_starts_with($event, 'delivery.') ||
+            str_starts_with($event, 'supplier_invoice.') ||
+            str_starts_with($event, 'invoice.') ||
+            in_array($subjectType, ['purchaserequest', 'purchaseorder', 'purchaseorderitem', 'delivery', 'deliveryitem', 'supplierinvoice'], true)
+        ) {
+            return 'Procurement';
+        }
+
+        if (
+            str_starts_with($event, 'supplier.') ||
+            str_starts_with($event, 'supplier_quote.') ||
+            str_starts_with($event, 'supplier_availability.') ||
+            in_array($subjectType, ['supplier', 'supplierquote', 'productsupplier'], true)
+        ) {
+            return 'Suppliers';
+        }
+
+        if (
+            str_starts_with($event, 'user.') ||
+            str_starts_with($event, 'account.') ||
+            str_starts_with($event, 'session.') ||
+            str_starts_with($event, 'device.') ||
+            str_starts_with($event, 'auth.') ||
+            in_array($subjectType, ['user', 'trusteddevice'], true) ||
+            $log->category === 'security'
+        ) {
+            return 'User Management';
+        }
+
+        return 'System Maintenance';
+    }
+
+    /**
+     * Extract a concise human-readable action label from an AuditLog entry.
+     */
+    private function resolveAuditActionLabel(AuditLog $log): string
+    {
+        $raw = (string) ($log->event ?: $log->action_type ?: 'Activity Recorded');
+        $normalized = str_replace(['.', '_', '-'], ' ', $raw);
+        $normalized = preg_replace('/^system\s+/i', '', $normalized) ?? $normalized;
+
+        return ucwords(trim($normalized));
+    }
+
+    /**
+     * Extract the affected record reference from an AuditLog entry.
+     */
+    private function resolveAuditReference(AuditLog $log): string
+    {
+        $meta = is_array($log->metadata) ? $log->metadata : [];
+
+        $directKeys = [
+            'order_number',
+            'invoice_number',
+            'quotation_number',
+            'request_number',
+            'po_number',
+            'delivery_number',
+            'reference_number',
+            'reference',
+            'sku',
+            'device_name',
+            'device_uuid',
+            'label',
+            'name',
+        ];
+
+        foreach ($directKeys as $key) {
+            if (! empty($meta[$key]) && is_scalar($meta[$key])) {
+                return (string) $meta[$key];
+            }
+        }
+
+        foreach (['sale', 'quotation', 'product', 'purchase_request', 'purchase_order', 'supplier', 'delivery'] as $nested) {
+            if (! empty($meta[$nested]) && is_array($meta[$nested])) {
+                foreach ($directKeys as $key) {
+                    if (! empty($meta[$nested][$key]) && is_scalar($meta[$nested][$key])) {
+                        return (string) $meta[$nested][$key];
+                    }
+                }
+            }
+        }
+
+        $desc = (string) ($log->description ?? '');
+        if (preg_match('/\b((?:SO|INV|QT|PR|PO|DEL|GRN|SI|INIT|IN|OUT|ADJ)-[A-Z0-9-]+|[A-Z]{2,6}-\d{3,6})\b/', $desc, $matches)) {
+            return $matches[1];
+        }
+
+        if (! empty($log->target_user_email)) {
+            return $log->target_user_email;
+        }
+
+        if (! empty($log->subject_type) && ! empty($log->subject_id)) {
+            return "{$log->subject_type} #{$log->subject_id}";
+        }
+
+        $event = strtolower((string) $log->event);
+        if (str_contains($event, 'maintenance')) {
+            return 'Maintenance Mode';
+        }
+        if (str_contains($event, 'recycle_bin')) {
+            return 'Recycle Bin';
+        }
+
+        return 'System';
     }
 
     /**

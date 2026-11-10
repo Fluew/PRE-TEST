@@ -135,6 +135,12 @@ class Quotation extends Model
         return $this->hasMany(QuotationItem::class);
     }
 
+    /** Purchase requests raised for this quotation's short items. */
+    public function purchaseRequests(): HasMany
+    {
+        return $this->hasMany(PurchaseRequest::class);
+    }
+
     /** Extra files the client sent with the request (product lists). */
     public function files(): HasMany
     {

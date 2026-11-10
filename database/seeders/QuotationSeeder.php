@@ -221,7 +221,7 @@ class QuotationSeeder extends Seeder
                     'client' => $createdClients[0],
                     'date' => now()->subDays(12)->toDateString(),
                     'valid_until' => now()->addDays(18)->toDateString(),
-                    'status' => QuotationStatus::Pending,
+                    'status' => QuotationStatus::Draft,
                     'notes' => 'Commercial high-rise substation circuit breaker and control upgrade package.',
                     'items' => [
                         ['sku' => 'BRK-IND-001', 'qty' => 5, 'disc' => 0.00],
@@ -247,7 +247,7 @@ class QuotationSeeder extends Seeder
                     'client' => $createdClients[2],
                     'date' => now()->subDays(2)->toDateString(),
                     'valid_until' => now()->addDays(28)->toDateString(),
-                    'status' => QuotationStatus::Preparing,
+                    'status' => QuotationStatus::Draft,
                     'notes' => 'Renewable power plant wiring maintenance & diagnostics package.',
                     'items' => [
                         ['sku' => 'WR-CU-100', 'qty' => 15, 'disc' => 0.00],

@@ -2,7 +2,6 @@
 
 namespace App\Services\Procurement;
 
-use App\Events\Procurement\CommercialInvoiceVerified;
 use App\Events\Procurement\InboundDeliveryRecorded;
 use App\Events\Procurement\InventoryUpdated;
 use App\Events\Procurement\PurchaseOrderCreated;
@@ -12,7 +11,6 @@ use App\Events\Procurement\PurchaseRequestRejected;
 use App\Events\Procurement\PurchaseRequestSubmitted;
 use App\Events\Procurement\QualityInspectionCompleted;
 use App\Exceptions\WorkflowException;
-use App\Models\CommercialInvoice;
 use App\Models\Delivery;
 use App\Models\Product;
 use App\Models\PurchaseOrder;
@@ -25,11 +23,8 @@ use App\Models\User;
 use App\Services\AuditLogger;
 use App\Services\Inventory\ProductPrioritizer;
 use Carbon\Carbon;
-use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
-use Illuminate\Support\Str;
 
 /**
  * The Inventory-to-Procurement workflow. Every state change goes through here, inside a
@@ -37,9 +32,8 @@ use Illuminate\Support\Str;
  *
  *   AHP reorder recommendation → Purchase Request (staff) → approval (admin)
  *   → Purchase Order (from the approved request only) → sent to supplier
- *   → Inbound Delivery (actual quantities) → Inspection (accepted / rejected)
- *   → Commercial Invoice (checked against PO, delivery and inspection) → verification
- *   → inventory posting of the accepted quantity, exactly once.
+ *   → Inbound Delivery (actual quantities) → Inspection (accepted / rejected), which adds the
+ *     accepted quantity to stock automatically, exactly once (rejected units never reach stock)
  *
  * An AHP recommendation never creates an order or changes stock by itself.
  */
@@ -54,29 +48,44 @@ class ProcurementWorkflow
      * recommended quantity are taken from the server-side calculation at submission time,
      * never from the browser.
      *
-     * @param  list<array{product_id: int, quantity: int, justification: string, supplier_id?: int|null}>  $lines
+     * @param  list<array{product_id: ?int, quantity: int, product_description?: ?string, unit?: ?string, justification: string, supplier_id?: int|null, quotation_id?: int|null}>  $lines
+     * @param  int|null  $forecastMonths  forecasting period the staff member reviewed (3, 6 or 12)
      * @return Collection<int, PurchaseRequest>
      */
-    public function submitRequests(Team $team, User $user, array $lines, bool $asDraft = false): Collection
+    public function submitRequests(Team $team, User $user, array $lines, bool $asDraft = false, ?int $forecastMonths = null): Collection
     {
         if ($lines === []) {
             throw new WorkflowException('Select at least one product.', 'lines');
         }
-        $ids = array_map(fn ($l) => (int) $l['product_id'], $lines);
+        // Unlisted products (no product id) are not compared with each other.
+        $ids = array_values(array_filter(array_map(fn ($l) => (int) ($l['product_id'] ?? 0), $lines)));
         if (count($ids) !== count(array_unique($ids))) {
             throw new WorkflowException('Each product can appear only once in a submission.', 'lines');
         }
 
-        $priorities = $this->prioritizer->forTeam($team->id);
+        $priorities = $this->prioritizer->forTeam($team->id, null, $forecastMonths);
 
         $created = DB::transaction(function () use ($team, $user, $lines, $asDraft, $priorities) {
             $out = collect();
             foreach ($lines as $i => $line) {
+                if (empty($line['product_id'])) {
+                    $out->push($this->createUnlistedRequest($team, $user, $line, $i, $asDraft));
+
+                    continue;
+                }
                 $product = Product::where('team_id', $team->id)->where('is_active', true)->find($line['product_id'])
                     ?? throw new WorkflowException('A selected product is not an active product of this team.', "lines.{$i}.product_id");
                 $qty = (int) $line['quantity'];
                 if ($qty < 1) {
                     throw new WorkflowException("Requested quantity for {$product->name} must be at least 1.", "lines.{$i}.quantity");
+                }
+                // A catalog product has its own name and details: no separate description is kept.
+                $description = null;
+                // The unit is the product's own unit from the Product Catalog: staff cannot choose
+                // another, and none is assumed when the product has no unit.
+                $unit = trim((string) $product->unit);
+                if ($unit === '') {
+                    throw new WorkflowException("{$product->name} has no unit of measure in the Product Catalog. Add its unit in Inventory before requesting it.", "lines.{$i}.product_id");
                 }
                 $justification = trim((string) ($line['justification'] ?? ''));
                 if ($justification === '') {
@@ -95,9 +104,12 @@ class ProcurementWorkflow
                     'team_id' => $team->id,
                     'request_number' => PurchaseRequest::generateRequestNumber($team->id),
                     'product_id' => $product->id,
+                    'product_description' => $description,
+                    'quotation_id' => $line['quotation_id'] ?? null,
                     'supplier_id' => $line['supplier_id'] ?? null,
                     'requested_by_id' => $user->id,
                     'quantity' => $qty,
+                    'unit' => $unit,
                     'current_stock' => $stock,
                     'forecast_quantity' => $p['reorder']['forecast'] ?? null,
                     'ahp_score' => $p['score'] ?? null,
@@ -109,7 +121,8 @@ class ProcurementWorkflow
                     'requested_at' => now(),
                     'submitted_at' => $asDraft ? null : now(),
                 ]);
-                AuditLogger::record('purchase_request.'.($asDraft ? 'drafted' : 'submitted'), "{$pr->request_number}: {$qty} × {$product->name} requested.", $pr, [
+                AuditLogger::record('purchase_request.'.($asDraft ? 'drafted' : 'submitted'), "{$pr->request_number}: {$qty}".($unit ? " {$unit}" : '')." × {$product->name} requested.", $pr, [
+                    'product_description' => $description, 'unit' => $unit,
                     'recommended_quantity' => $pr->recommended_quantity, 'ahp_score' => $pr->ahp_score, 'forecast' => $pr->forecast_quantity, 'current_stock' => $stock,
                 ], $user);
                 $out->push($pr);
@@ -123,6 +136,54 @@ class ProcurementWorkflow
         }
 
         return $created;
+    }
+
+    /**
+     * "Product Not Listed": a request for something that is not in the Product Catalog. It keeps
+     * the staff's description, quantity and unit, has no product and no AHP snapshot, and creates
+     * nothing in inventory. The product is linked or created only when the goods are received.
+     */
+    private function createUnlistedRequest(Team $team, User $user, array $line, int $i, bool $asDraft): PurchaseRequest
+    {
+        $description = trim((string) ($line['product_description'] ?? ''));
+        if ($description === '') {
+            throw new WorkflowException('Describe the product you need to purchase.', "lines.{$i}.product_description");
+        }
+        $unit = trim((string) ($line['unit'] ?? ''));
+        if ($unit === '') {
+            throw new WorkflowException('Select the unit.', "lines.{$i}.unit");
+        }
+        $qty = (int) $line['quantity'];
+        if ($qty < 1) {
+            throw new WorkflowException('Requested quantity must be at least 1.', "lines.{$i}.quantity");
+        }
+        $justification = trim((string) ($line['justification'] ?? ''));
+        if ($justification === '') {
+            throw new WorkflowException('Give a purchase justification.', "lines.{$i}.justification");
+        }
+
+        $pr = PurchaseRequest::create([
+            'team_id' => $team->id,
+            'request_number' => PurchaseRequest::generateRequestNumber($team->id),
+            'product_id' => null,
+            'product_description' => $description,
+            'quotation_id' => $line['quotation_id'] ?? null,
+            'supplier_id' => $line['supplier_id'] ?? null,
+            'requested_by_id' => $user->id,
+            'quantity' => $qty,
+            'unit' => $unit,
+            'current_stock' => null,
+            'estimated_cost' => 0, // no catalog price yet: the agreed price is entered on the purchase order
+            'status' => $asDraft ? PurchaseRequest::DRAFT : PurchaseRequest::PENDING,
+            'justification' => $justification,
+            'requested_at' => now(),
+            'submitted_at' => $asDraft ? null : now(),
+        ]);
+        AuditLogger::record('purchase_request.'.($asDraft ? 'drafted' : 'submitted'), "{$pr->request_number}: {$qty} {$unit} × \"{$description}\" requested (product not listed in the Product Catalog).", $pr, [
+            'product_not_listed' => true, 'product_description' => $description, 'unit' => $unit,
+        ], $user);
+
+        return $pr;
     }
 
     public function submitDraft(PurchaseRequest $pr, User $user): void
@@ -198,6 +259,9 @@ class ProcurementWorkflow
         if (PurchaseOrder::withTrashed()->where('purchase_request_id', $pr->id)->exists()) {
             throw new WorkflowException("{$pr->request_number} already has a purchase order.");
         }
+        if ($pr->isUnlisted()) {
+            return $this->draftUnlistedPurchaseOrder($pr, $by);
+        }
         $product = $pr->product ?? throw new WorkflowException('The product of this request no longer exists.');
         $quotes = SupplierQuote::where('team_id', $pr->team_id)->where('product_id', $product->id)->whereNotNull('verified_at')
             ->where(fn ($q) => $q->whereNull('valid_until')->orWhereDate('valid_until', '>=', today()))
@@ -247,6 +311,44 @@ class ProcurementWorkflow
     }
 
     /**
+     * Draft order for a "Product Not Listed" request: the staff's description and unit, no product
+     * and no SKU. Staff choose the supplier and enter the agreed price before sending. When the goods
+     * arrive, Record Inbound P.O. Delivery asks to link them to a catalog product or create one.
+     */
+    private function draftUnlistedPurchaseOrder(PurchaseRequest $pr, User $by): PurchaseOrder
+    {
+        $supplierId = $pr->supplier_id && Supplier::where('team_id', $pr->team_id)->where('status', 'Active')->whereKey($pr->supplier_id)->exists() ? $pr->supplier_id : null;
+        $prefill = [
+            'Product not listed in the Product Catalog: it is linked to a catalog product or created when the goods are received.',
+            $supplierId ? 'Supplier pre-filled (named on the purchase request).' : 'Supplier to be chosen.',
+            'Agreed price to be entered.',
+        ];
+
+        $po = PurchaseOrder::create([
+            'team_id' => $pr->team_id,
+            'purchase_request_id' => $pr->id,
+            'po_date' => today(),
+            'po_number' => PurchaseOrder::generatePoNumber($pr->team_id),
+            'quantity' => $pr->quantity,
+            'product_id' => null,
+            'item_sku' => null,
+            'description' => $pr->product_description,
+            'unit_of_measure' => strtoupper($pr->unit ?: 'PCS'),
+            'unit_cost' => 0,
+            'total_cost' => 0,
+            'supplier_id' => $supplierId,
+            'prepared_by_id' => $by->id,
+            'status' => PurchaseOrder::DRAFT,
+            'notes' => implode(' ', $prefill),
+        ]);
+        $pr->update(['status' => PurchaseRequest::CONVERTED, 'ordered_at' => now()]);
+        AuditLogger::record('purchase_order.created', "Draft purchase order {$po->po_number} created automatically from approved {$pr->request_number} (product not listed). ".implode(' ', $prefill), $po,
+            ['purchase_request' => $pr->request_number, 'automatic' => true, 'product_not_listed' => true], $by);
+
+        return $po;
+    }
+
+    /**
      * Staff review of a draft order: confirm or change the supplier, quantity, agreed price and
      * terms. A quantity different from the approved one needs a reason; more needs an admin.
      *
@@ -286,7 +388,6 @@ class ProcurementWorkflow
                 'quantity' => $qty,
                 'unit_cost' => $unitCost,
                 'total_cost' => round($qty * $unitCost, 2),
-                'po_date' => $data['po_date'] ?? $po->po_date,
                 'promised_delivery_date' => $data['promised_delivery_date'] ?? null,
                 'payment_terms' => $data['payment_terms'] ?? null,
                 'quantity_adjustment_reason' => $qty !== $approved ? $reason : null,
@@ -299,6 +400,79 @@ class ProcurementWorkflow
         });
     }
 
+    /**
+     * Administrator correction of a purchase order as recorded: the Order Date (for every line of
+     * the PO number, it is the document's date), the inventory product a line is linked to (an
+     * existing product only; nothing is created), and the promised delivery date. A reason is
+     * required and every before/after value goes to the audit trail. Quantities, prices and
+     * descriptions are never changed here.
+     *
+     * @param  array{reason: string, po_date?: ?string, product_id?: ?int, promised_delivery_date?: ?string}  $data
+     */
+    public function correctPurchaseOrder(PurchaseOrder $po, User $admin, array $data): PurchaseOrder
+    {
+        if (! $admin->isAdmin()) {
+            throw new WorkflowException('Only an administrator can correct a purchase order.');
+        }
+        $reason = trim((string) ($data['reason'] ?? ''));
+        if ($reason === '') {
+            throw new WorkflowException('Give the reason for the correction.', 'reason');
+        }
+
+        return DB::transaction(function () use ($po, $admin, $data, $reason) {
+            $po = PurchaseOrder::lockForUpdate()->findOrFail($po->id);
+            $lines = PurchaseOrder::where('team_id', $po->team_id)->where('po_number', $po->po_number)->lockForUpdate()->get();
+            $changes = [];
+
+            if (array_key_exists('po_date', $data) && $data['po_date']) {
+                $date = Carbon::parse($data['po_date'])->startOfDay();
+                if ($date->toDateString() !== $po->po_date?->toDateString()) {
+                    if ($date->isAfter(today())) {
+                        throw new WorkflowException('The order date cannot be in the future.', 'po_date');
+                    }
+                    $firstDelivery = Delivery::whereIn('purchase_order_id', $lines->pluck('id'))
+                        ->where(fn ($q) => $q->whereNull('status')->orWhere('status', '!=', 'Cancelled'))->min('delivery_date');
+                    if ($firstDelivery && $date->isAfter(Carbon::parse($firstDelivery))) {
+                        throw new WorkflowException('The order date cannot be after the first delivery ('.Carbon::parse($firstDelivery)->format('M j, Y').').', 'po_date');
+                    }
+                    $changes['po_date'] = ['from' => $po->po_date?->toDateString(), 'to' => $date->toDateString(), 'lines' => $lines->count()];
+                    PurchaseOrder::whereIn('id', $lines->pluck('id'))->update(['po_date' => $date->toDateString()]);
+                }
+            }
+
+            if (array_key_exists('product_id', $data) && (int) ($data['product_id'] ?? 0) !== (int) $po->product_id) {
+                $productId = $data['product_id'] ? (int) $data['product_id'] : null;
+                if ($productId && ! Product::where('team_id', $po->team_id)->whereKey($productId)->exists()) {
+                    throw new WorkflowException('Choose an existing product of this team.', 'product_id');
+                }
+                if (Delivery::where('purchase_order_id', $po->id)->where('posted_quantity', '>', 0)->exists()) {
+                    throw new WorkflowException('Accepted units of this purchase order are already in stock under its current product, so the product cannot be changed. Correct the stock first.', 'product_id');
+                }
+                $changes['product_id'] = ['from' => $po->product_id, 'to' => $productId];
+                $po->update(['product_id' => $productId]);
+            }
+
+            if (array_key_exists('promised_delivery_date', $data)) {
+                $promised = $data['promised_delivery_date'] ?: null;
+                if ($promised !== $po->promised_delivery_date?->toDateString()) {
+                    $orderDate = PurchaseOrder::whereKey($po->id)->value('po_date');
+                    if ($promised && $orderDate && Carbon::parse($promised)->lt(Carbon::parse($orderDate))) {
+                        throw new WorkflowException('The promised delivery date cannot be before the order date.', 'promised_delivery_date');
+                    }
+                    $changes['promised_delivery_date'] = ['from' => $po->promised_delivery_date?->toDateString(), 'to' => $promised];
+                    $po->update(['promised_delivery_date' => $promised]);
+                }
+            }
+
+            if (! $changes) {
+                throw new WorkflowException('Nothing was changed.');
+            }
+            AuditLogger::record('purchase_order.corrected', "Purchase order {$po->po_number} corrected by {$admin->name}: {$reason}", $po, ['reason' => $reason, 'changes' => $changes], $admin);
+
+            return $po->fresh();
+        });
+    }
+
     public function sendPurchaseOrder(PurchaseOrder $po, User $user): void
     {
         DB::transaction(function () use ($po, $user) {
@@ -306,8 +480,11 @@ class ProcurementWorkflow
             if ($po->status !== PurchaseOrder::DRAFT) {
                 throw new WorkflowException("Purchase order {$po->po_number} is {$po->status}; only a draft can be sent.");
             }
-            if (! $po->supplier_id || ! $po->product_id) {
+            if (! $po->supplier_id) {
                 throw new WorkflowException('Confirm the supplier of the purchase order before sending it.', 'supplier_id');
+            }
+            if (! $po->product_id && ! $po->purchaseRequest?->isUnlisted()) {
+                throw new WorkflowException('The product of this purchase order no longer exists.', 'supplier_id');
             }
             if ((float) $po->unit_cost <= 0) {
                 throw new WorkflowException('Enter the agreed unit price before sending the purchase order.', 'unit_cost');
@@ -335,7 +512,7 @@ class ProcurementWorkflow
     }
 
     /**
-     * Close a fully delivered order once everything accepted is posted and invoiced. An admin may
+     * Close a fully delivered order once everything accepted is posted to stock. An admin may
      * also close a partially delivered order (the supplier will not deliver the rest), with a reason.
      */
     public function closePurchaseOrder(PurchaseOrder $po, User $user, ?string $reason = null): void
@@ -362,11 +539,12 @@ class ProcurementWorkflow
     /**
      * Quantities of an order: delivered, inspected, accepted, rejected, posted to stock, still open.
      *
-     * @return array{ordered: int, delivered: int, uninspected: int, accepted: int, rejected: int, posted: int, awaiting_posting: int, remaining: int, verified_invoice_quantity: int}
+     * @return array{ordered: int, delivered: int, uninspected: int, accepted: int, rejected: int, unresolved_rejected: int, posted: int, awaiting_posting: int, remaining: int}
      */
     public function summary(PurchaseOrder $po): array
     {
-        $deliveries = Delivery::where('purchase_order_id', $po->id)->get();
+        // Cancelled deliveries no longer count: their goods were taken back out of stock.
+        $deliveries = Delivery::where('purchase_order_id', $po->id)->where(fn ($q) => $q->whereNull('status')->orWhere('status', '!=', 'Cancelled'))->get();
         $accepted = (int) $deliveries->sum(fn ($d) => (int) $d->accepted_quantity);
         $uninspected = (int) $deliveries->whereNull('inspection_result')->sum('quantity');
         $posted = (int) $deliveries->sum(fn ($d) => (int) $d->posted_quantity);
@@ -377,15 +555,20 @@ class ProcurementWorkflow
             'uninspected' => $uninspected,
             'accepted' => $accepted,
             'rejected' => (int) $deliveries->sum(fn ($d) => (int) $d->rejected_quantity),
+            // Rejected units not yet settled with the supplier (returned, replaced, credited, written off).
+            'unresolved_rejected' => (int) $deliveries->whereNull('resolution_status')->sum(fn ($d) => (int) $d->rejected_quantity),
             'posted' => $posted,
             'awaiting_posting' => (int) $deliveries->whereNull('posted_at')->sum(fn ($d) => (int) $d->accepted_quantity),
             // Rejected units do not count as delivered: the supplier still owes them.
             'remaining' => max(0, (int) $po->quantity - $accepted - $uninspected),
-            'verified_invoice_quantity' => (int) CommercialInvoice::where('purchase_order_id', $po->id)->where('status', CommercialInvoice::VERIFIED)->sum('quantity'),
         ];
     }
 
-    /** Delivery status from actual cumulative records: accepted units, not the fact that a delivery exists. */
+    /**
+     * Delivery status from actual cumulative records: accepted units, not the fact that a delivery
+     * exists. Received (Fully Delivered) only when every ordered unit was accepted and no rejected
+     * units are still waiting for a resolution with the supplier.
+     */
     public function refreshPurchaseOrderStatus(PurchaseOrder $po, ?User $user = null): void
     {
         $po = PurchaseOrder::lockForUpdate()->findOrFail($po->id);
@@ -394,7 +577,7 @@ class ProcurementWorkflow
         }
         $s = $this->summary($po);
         $status = match (true) {
-            $s['accepted'] >= $s['ordered'] => PurchaseOrder::FULL,
+            $s['accepted'] >= $s['ordered'] && $s['unresolved_rejected'] === 0 => PurchaseOrder::FULL,
             $s['delivered'] > 0 => PurchaseOrder::PARTIAL,
             default => PurchaseOrder::SENT,
         };
@@ -419,6 +602,10 @@ class ProcurementWorkflow
             $po = PurchaseOrder::lockForUpdate()->findOrFail($po->id);
             if (! in_array($po->status, PurchaseOrder::RECEIVABLE, true)) {
                 throw new WorkflowException("Purchase order {$po->po_number} is {$po->status}. Goods can be received only on an order sent to the supplier.", 'purchase_order_id');
+            }
+            if (! $po->product_id && $po->purchaseRequest?->isUnlisted()) {
+                // Accepted units must go into stock, so the product is chosen first.
+                throw new WorkflowException("{$po->description} is not in the Product Catalog yet. Record this delivery in Deliveries → Record Inbound P.O. Delivery, where you link it to a catalog product or create it.", 'purchase_order_id');
             }
             if (Carbon::parse($data['delivery_date'])->lt($po->po_date)) {
                 throw new WorkflowException('The delivery date cannot be before the purchase order date.', 'delivery_date');
@@ -466,11 +653,12 @@ class ProcurementWorkflow
 
     /**
      * Goods-receipt inspection. The result is derived from the quantities, never entered as a rating.
-     * Once recorded, only an administrator may correct it, and never after stock was posted.
+     * The accepted units are added to stock right away, in the same transaction; rejected units
+     * are held and never reach stock. Admin and staff may correct it later; a correction moves
+     * stock by the difference only and is refused if stock would go negative.
      *
      * Rejected units may be broken down into damaged and defective; the rest are rejected for
-     * another reason (wrong item, nonconforming…), given by the category. Rejected units are held:
-     * they never reach stock.
+     * another reason (wrong item, nonconforming…), given by the category.
      *
      * @param  array{accepted_quantity: int, rejected_quantity: int, damaged_quantity?: ?int, defective_quantity?: ?int, inspected_on: string, inspection_remarks?: ?string, rejection_reason?: ?string, rejection_category?: ?string}  $data
      */
@@ -478,12 +666,11 @@ class ProcurementWorkflow
     {
         $delivery = DB::transaction(function () use ($delivery, $user, $data) {
             $delivery = Delivery::lockForUpdate()->findOrFail($delivery->id);
-            if ($delivery->posted_at) {
-                throw new WorkflowException('Accepted units of this delivery were already posted to inventory, so the inspection can no longer change.');
+            $po = $delivery->purchase_order_id ? PurchaseOrder::find($delivery->purchase_order_id) : null;
+            if ($po?->status === PurchaseOrder::CANCELLED) {
+                throw new WorkflowException("Purchase order {$po->po_number} is cancelled, so its goods cannot be inspected into stock.");
             }
-            if ($delivery->inspection_result !== null && ! $user->isAdmin()) {
-                throw new WorkflowException('This delivery was already inspected. Only an administrator can correct the inspection.', 'inspection');
-            }
+            // Admin and staff may both correct an inspection; stock then moves by the difference only.
             $accepted = (int) $data['accepted_quantity'];
             $rejected = (int) $data['rejected_quantity'];
             if ((int) $delivery->quantity !== $accepted + $rejected) {
@@ -530,10 +717,17 @@ class ProcurementWorkflow
                 ['before' => $before['inspection_result'] ? $before : null, 'result' => $result],
                 $user,
             );
+
+            // Stock In: the accepted units go into stock now (a correction moves only the difference).
+            $movement = $this->syncAcceptedStock($delivery, $user);
+
             if ($delivery->purchaseOrder) {
                 $this->refreshPurchaseOrderStatus($delivery->purchaseOrder, $user);
             }
             QualityInspectionCompleted::dispatch($delivery, $user);
+            if ($movement?->type === 'stock_in') { // first posting only, not a correction
+                InventoryUpdated::dispatch($delivery->fresh(), $user, $movement);
+            }
 
             return $delivery;
         });
@@ -554,224 +748,18 @@ class ProcurementWorkflow
             }
             $delivery->update(['resolution_status' => $resolution, 'resolution_remarks' => $remarks, 'resolved_at' => now()]);
             AuditLogger::record('inbound_delivery.rejection_resolved', "Delivery {$delivery->delivery_number}: {$delivery->rejected_quantity} rejected units {$resolution}.", $delivery, ['remarks' => $remarks], $user);
+            if ($delivery->purchaseOrder) {
+                $this->refreshPurchaseOrderStatus($delivery->purchaseOrder, $user);
+            }
         });
-    }
-
-    // ─────────────────────────── Commercial invoices ───────────────────────────
-
-    /**
-     * @param  array{purchase_order_id: int, delivery_id: int, invoice_number: string, invoice_date: string, quantity: int, unit_cost: float|string, tax_amount?: float|string|null, payment_terms?: ?string, notes?: ?string}  $data
-     */
-    public function recordInvoice(Team $team, User $user, array $data, ?UploadedFile $attachment = null): CommercialInvoice
-    {
-        // The supplier's invoice document is kept on the private disk; removed again if saving fails.
-        $stored = $attachment ? Storage::disk('local')->putFileAs("invoices/{$team->id}", $attachment, Str::uuid().'.'.(strtolower($attachment->getClientOriginalExtension()) ?: 'pdf')) : null;
-        $data['attachment_path'] = $stored;
-        $data['attachment_name'] = $attachment ? mb_substr($attachment->getClientOriginalName(), 0, 255) : null;
-
-        try {
-            return $this->storeInvoice($team, $user, $data);
-        } catch (\Throwable $e) {
-            if ($stored) {
-                Storage::disk('local')->delete($stored);
-            }
-            throw $e;
-        }
-    }
-
-    private function storeInvoice(Team $team, User $user, array $data): CommercialInvoice
-    {
-        $invoice = DB::transaction(function () use ($team, $user, $data) {
-            $po = PurchaseOrder::where('team_id', $team->id)->lockForUpdate()->find($data['purchase_order_id'])
-                ?? throw new WorkflowException('Select the purchase order this invoice is for.', 'purchase_order_id');
-            if (in_array($po->status, [PurchaseOrder::DRAFT, PurchaseOrder::CANCELLED], true)) {
-                throw new WorkflowException("Purchase order {$po->po_number} is {$po->status}; an invoice cannot be recorded against it.", 'purchase_order_id');
-            }
-            $delivery = Delivery::where('team_id', $team->id)->find($data['delivery_id'])
-                ?? throw new WorkflowException('Select the inbound delivery this invoice covers.', 'delivery_id');
-
-            $qty = (int) $data['quantity'];
-            $unit = round((float) $data['unit_cost'], 2);
-            $tax = round((float) ($data['tax_amount'] ?? 0), 2);
-            $invoice = CommercialInvoice::create([
-                'team_id' => $team->id,
-                'purchase_order_id' => $po->id,
-                'delivery_id' => $delivery->id,
-                'product_id' => $po->product_id,
-                'invoice_date' => $data['invoice_date'],
-                'invoice_number' => trim($data['invoice_number']),
-                'quantity' => $qty,
-                'description' => $po->description,
-                'unit_cost' => $unit,
-                'total_cost' => round($qty * $unit + $tax, 2),
-                'tax_amount' => $tax,
-                'payment_terms' => $data['payment_terms'] ?? $po->payment_terms,
-                'supplier_id' => $po->supplier_id,
-                'recorded_by_id' => $user->id,
-                'status' => CommercialInvoice::PENDING,
-                'notes' => $data['notes'] ?? null,
-                'attachment_path' => $data['attachment_path'] ?? null,
-                'attachment_name' => $data['attachment_name'] ?? null,
-            ]);
-            $invoice->update(['discrepancies' => $this->checkInvoice($invoice)]);
-            AuditLogger::record('commercial_invoice.recorded', "Invoice {$invoice->invoice_number} recorded for {$po->po_number} / {$delivery->delivery_number}: {$qty} × {$unit}.", $invoice, ['discrepancies' => $invoice->discrepancies], $user);
-
-            return $invoice;
-        });
-
-        $flags = count($invoice->discrepancies ?? []);
-        $this->notifier->notify($invoice->team, ['admin', 'staff_procurement'], 'commercial_invoice.needs_verification', 'Invoice requires verification',
-            "Invoice {$invoice->invoice_number} was recorded".($flags ? " with {$flags} discrepancy flag(s)." : ' and matches the order and inspection.'), $user, 'procurement?tab=commercial_invoices');
-
-        return $invoice;
-    }
-
-    /**
-     * Correct an unverified invoice's quantities or prices (e.g. the supplier sent a corrected
-     * invoice). The checks run again and the before/after values are audited.
-     *
-     * @param  array{quantity: int, unit_cost: float|string, tax_amount?: float|string|null, invoice_number?: ?string, remarks: string}  $data
-     */
-    public function correctInvoice(CommercialInvoice $invoice, User $user, array $data): CommercialInvoice
-    {
-        return DB::transaction(function () use ($invoice, $user, $data) {
-            $invoice = CommercialInvoice::lockForUpdate()->findOrFail($invoice->id);
-            if (! in_array($invoice->status, [CommercialInvoice::PENDING, CommercialInvoice::FLAGGED], true)) {
-                throw new WorkflowException("Invoice {$invoice->invoice_number} is {$invoice->status} and cannot be changed.");
-            }
-            $remarks = trim((string) ($data['remarks'] ?? '')) ?: throw new WorkflowException('Say why the invoice is being corrected.', 'remarks');
-            $before = $invoice->only(['invoice_number', 'quantity', 'unit_cost', 'tax_amount', 'total_cost']);
-            $qty = (int) $data['quantity'];
-            $unit = round((float) $data['unit_cost'], 2);
-            $tax = round((float) ($data['tax_amount'] ?? $invoice->tax_amount), 2);
-            $invoice->fill([
-                'invoice_number' => trim((string) ($data['invoice_number'] ?? '')) ?: $invoice->invoice_number,
-                'quantity' => $qty, 'unit_cost' => $unit, 'tax_amount' => $tax, 'total_cost' => round($qty * $unit + $tax, 2),
-                'status' => CommercialInvoice::PENDING,
-            ])->save();
-            $invoice->update(['discrepancies' => $this->checkInvoice($invoice)]);
-            AuditLogger::record('commercial_invoice.corrected', "Invoice {$invoice->invoice_number} corrected: {$remarks}", $invoice, ['before' => $before, 'discrepancies' => $invoice->discrepancies], $user);
-
-            return $invoice;
-        });
-    }
-
-    /**
-     * Three-way match: Purchase Order (agreed quantity and price) ↔ Inbound Delivery and
-     * Inspection (received and accepted quantities) ↔ Commercial Invoice (what is charged).
-     *
-     * @return list<array{code: string, message: string, overridable: bool}>
-     */
-    public function checkInvoice(CommercialInvoice $invoice): array
-    {
-        $flags = [];
-        $add = function (string $code, string $message, bool $overridable = false) use (&$flags) {
-            $flags[] = compact('code', 'message', 'overridable');
-        };
-
-        $po = $invoice->purchase_order_id ? PurchaseOrder::withTrashed()->find($invoice->purchase_order_id) : null;
-        $delivery = $invoice->delivery_id ? Delivery::withTrashed()->find($invoice->delivery_id) : null;
-
-        if (! $po) {
-            $add('no_purchase_order', 'Not linked to a purchase order.');
-        }
-        if (! $delivery) {
-            $add('no_delivery', 'Not linked to an inbound delivery.');
-        }
-        if ($po && $delivery && (int) $delivery->purchase_order_id !== (int) $po->id) {
-            $add('po_mismatch', "Delivery {$delivery->delivery_number} belongs to a different purchase order than {$po->po_number}.");
-        }
-        if ($po && $invoice->supplier_id && (int) $invoice->supplier_id !== (int) $po->supplier_id) {
-            $add('supplier_mismatch', 'The invoice supplier is not the purchase order supplier.');
-        }
-        if ($delivery && $delivery->inspection_result === null) {
-            $add('not_inspected', "Delivery {$delivery->delivery_number} has not been inspected yet.");
-        }
-        if ($delivery && $delivery->inspection_result !== null && (int) $invoice->quantity !== (int) $delivery->accepted_quantity) {
-            $add('quantity', "Invoiced {$invoice->quantity} units, but {$delivery->accepted_quantity} were accepted at inspection (".(int) $delivery->rejected_quantity.' rejected).', true);
-        }
-        if ($po && abs((float) $invoice->unit_cost - (float) $po->unit_cost) >= 0.005) {
-            $add('price', 'Invoiced unit price '.number_format((float) $invoice->unit_cost, 2).' differs from the agreed PO price '.number_format((float) $po->unit_cost, 2).'.', true);
-        }
-        $dupe = CommercialInvoice::where('team_id', $invoice->team_id)->where('id', '!=', $invoice->id)
-            ->where('supplier_id', $invoice->supplier_id)->where('invoice_number', $invoice->invoice_number)
-            ->where('status', '!=', CommercialInvoice::CANCELLED)->exists();
-        if ($dupe) {
-            $add('duplicate_reference', "Invoice number {$invoice->invoice_number} was already recorded for this supplier.");
-        }
-        if ($delivery && CommercialInvoice::where('delivery_id', $delivery->id)->where('id', '!=', $invoice->id)->where('status', '!=', CommercialInvoice::CANCELLED)->exists()) {
-            $add('delivery_already_invoiced', "Another invoice is already recorded for delivery {$delivery->delivery_number}.");
-        }
-
-        return $flags;
-    }
-
-    /**
-     * Verify an invoice. Never automatic. Blocking discrepancies (no PO, wrong PO, not inspected,
-     * duplicate reference) must be fixed first; a quantity or price difference may be accepted
-     * only by an administrator, with remarks. Recording or verifying an invoice is not payment.
-     */
-    public function verifyInvoice(CommercialInvoice $invoice, User $user, ?string $remarks): CommercialInvoice
-    {
-        $invoice = DB::transaction(function () use ($invoice, $user, $remarks) {
-            $invoice = CommercialInvoice::lockForUpdate()->findOrFail($invoice->id);
-            if ($invoice->status === CommercialInvoice::VERIFIED) {
-                throw new WorkflowException("Invoice {$invoice->invoice_number} is already verified.");
-            }
-            if (! in_array($invoice->status, [CommercialInvoice::PENDING, CommercialInvoice::FLAGGED], true)) {
-                throw new WorkflowException("Invoice {$invoice->invoice_number} is {$invoice->status} and cannot be verified.");
-            }
-            $flags = $this->checkInvoice($invoice);
-            $remarks = trim((string) $remarks) ?: null;
-            $blocking = array_values(array_filter($flags, fn ($f) => ! $f['overridable']));
-            if ($blocking) {
-                throw new WorkflowException('Cannot verify: '.implode(' ', array_column($blocking, 'message')));
-            }
-            if ($flags && (! $user->isAdmin() || ! $remarks)) {
-                throw new WorkflowException('This invoice has discrepancies ('.implode(' ', array_column($flags, 'message')).') Correct the invoice, or an administrator may accept the difference with remarks.', 'remarks');
-            }
-            $invoice->update(['status' => CommercialInvoice::VERIFIED, 'discrepancies' => $flags, 'verified_by_id' => $user->id, 'verified_at' => now(), 'verification_remarks' => $remarks]);
-            AuditLogger::record('commercial_invoice.verified', "Invoice {$invoice->invoice_number} verified".($flags ? ' with accepted differences: '.$remarks : '.'), $invoice, ['accepted_discrepancies' => $flags], $user);
-            CommercialInvoiceVerified::dispatch($invoice, $user);
-
-            // Every receiving condition is now met (inspected, accepted units, verified invoice):
-            // post the accepted units to stock in the same transaction, so verification and
-            // stock can never disagree. Rejected units are not posted.
-            $delivery = Delivery::lockForUpdate()->find($invoice->delivery_id);
-            if ($delivery && ! $delivery->posted_at && $delivery->inspection_result !== null && (int) $delivery->accepted_quantity > 0) {
-                $movement = $this->postAccepted($delivery, $user, $invoice, true);
-                InventoryUpdated::dispatch($delivery->fresh(), $user, $movement);
-            }
-
-            return $invoice;
-        });
-
-        return $invoice;
-    }
-
-    public function flagInvoice(CommercialInvoice $invoice, User $user, ?string $remarks): void
-    {
-        $remarks = trim((string) $remarks) ?: throw new WorkflowException('Describe the problem with this invoice.', 'remarks');
-        $invoice = DB::transaction(function () use ($invoice, $user, $remarks) {
-            $invoice = CommercialInvoice::lockForUpdate()->findOrFail($invoice->id);
-            if ($invoice->status !== CommercialInvoice::PENDING) {
-                throw new WorkflowException("Invoice {$invoice->invoice_number} is {$invoice->status}; only a pending invoice can be flagged.");
-            }
-            $invoice->update(['status' => CommercialInvoice::FLAGGED, 'verification_remarks' => $remarks]);
-            AuditLogger::record('commercial_invoice.flagged', "Invoice {$invoice->invoice_number} flagged: {$remarks}", $invoice, [], $user, 'success', 'warning');
-
-            return $invoice;
-        });
-        $this->notifier->notify($invoice->team, ['admin', 'staff_procurement'], 'commercial_invoice.flagged', 'Invoice flagged', "Invoice {$invoice->invoice_number} was flagged: {$remarks}", $user, 'procurement?tab=commercial_invoices');
     }
 
     // ─────────────────────────── Inventory posting ───────────────────────────
 
     /**
-     * Manual posting: a fallback for deliveries whose invoice was verified before automatic
-     * posting existed. Normally verification posts the stock itself (verifyInvoice). Same rules:
-     * inspection recorded, accepted units, a verified invoice, and never twice
-     * (stock_movements.movement_key is unique).
+     * Manual posting: a fallback for deliveries inspected before stock was added at inspection.
+     * Normally the inspection posts the stock itself (inspect). Same rules: inspection recorded,
+     * accepted units, and never twice (stock_movements.movement_key is unique).
      */
     public function postToInventory(Delivery $delivery, User $user): StockMovement
     {
@@ -787,27 +775,87 @@ class ProcurementWorkflow
             if ($accepted < 1) {
                 throw new WorkflowException('No units were accepted at inspection, so nothing can be posted.');
             }
-            $po = $delivery->purchase_order_id ? PurchaseOrder::find($delivery->purchase_order_id) : null;
-            if (! $po || ! $po->product_id) {
-                throw new WorkflowException('The delivery must belong to a purchase order with a product.');
-            }
-            $invoice = CommercialInvoice::where('delivery_id', $delivery->id)->where('status', CommercialInvoice::VERIFIED)->first()
-                ?? throw new WorkflowException('Verify the supplier invoice for this delivery before posting to inventory.');
-
-            $movement = $this->postAccepted($delivery, $user, $invoice, false);
+            $movement = $this->postAccepted($delivery, $user, false);
             InventoryUpdated::dispatch($delivery->fresh(), $user, $movement);
 
             return $movement;
         });
     }
 
-    /** Call inside a transaction with the delivery row locked. */
-    private function postAccepted(Delivery $delivery, User $user, CommercialInvoice $invoice, bool $automatic): StockMovement
+    /**
+     * Bring stock in line with the inspection: the first time, post the accepted units; after an
+     * admin correction, add or take away only the difference. Call inside a transaction with the
+     * delivery row locked.
+     */
+    public function syncAcceptedStock(Delivery $delivery, User $user): ?StockMovement
     {
+        $po = $delivery->purchase_order_id ? PurchaseOrder::find($delivery->purchase_order_id) : null;
+        if (! $po?->product_id) {
+            return null; // an older or imported delivery not linked to a product: there is nothing to stock
+        }
         $accepted = (int) $delivery->accepted_quantity;
-        $po = PurchaseOrder::find($delivery->purchase_order_id);
+        if (! $delivery->posted_at) {
+            return $accepted > 0 ? $this->postAccepted($delivery, $user, true) : null;
+        }
+
+        $diff = $accepted - (int) $delivery->posted_quantity;
+        if ($diff === 0) {
+            return null;
+        }
+        $po = $this->postablePurchaseOrder($delivery);
+        $product = Product::lockForUpdate()->findOrFail($po->product_id);
+        $prev = (int) $product->stock;
+        if ($prev + $diff < 0) {
+            throw new WorkflowException("Only {$prev} units of {$product->name} are in stock, so the {$delivery->posted_quantity} units added from delivery {$delivery->delivery_number} cannot be reduced to {$accepted}. Correct the stock count first.", 'accepted_quantity');
+        }
+        $product->stock = $prev + $diff;
+        $product->save();
+        $product->updateCalculatedStatus();
+
+        $n = StockMovement::where('movement_key', 'like', "inbound-delivery:{$delivery->id}:correction:%")->count() + 1;
+        $movement = StockMovement::create([
+            'team_id' => $delivery->team_id,
+            'product_id' => $product->id,
+            'user_id' => $user->id,
+            'supplier_id' => $po->supplier_id,
+            'movement_key' => "inbound-delivery:{$delivery->id}:correction:{$n}",
+            'type' => 'adjustment',
+            'quantity' => abs($diff),
+            'previous_stock' => $prev,
+            'new_stock' => $prev + $diff,
+            'reference_number' => $delivery->delivery_number,
+            'reason' => 'Inspection corrected',
+            'remarks' => "PO {$po->po_number} · Inspection {$delivery->inspection_number}: accepted {$delivery->posted_quantity} → {$accepted}",
+            'movement_date' => now(),
+        ]);
+        $delivery->update(['posted_quantity' => $accepted]);
+        AuditLogger::record('inventory.received', "Inspection of delivery {$delivery->delivery_number} corrected: stock ".($diff > 0 ? '+' : '')."{$diff} × {$product->name} ({$prev} → ".($prev + $diff).').', $delivery,
+            ['purchase_order' => $po->po_number, 'accepted_before' => $accepted - $diff, 'accepted_after' => $accepted], $user);
+
+        return $movement;
+    }
+
+    private function postablePurchaseOrder(Delivery $delivery): PurchaseOrder
+    {
+        $po = $delivery->purchase_order_id ? PurchaseOrder::find($delivery->purchase_order_id) : null;
         if (! $po || ! $po->product_id) {
             throw new WorkflowException('The delivery must belong to a purchase order with a product.');
+        }
+        if ($po->status === PurchaseOrder::CANCELLED) {
+            throw new WorkflowException("Purchase order {$po->po_number} is cancelled, so its goods cannot be added to stock.");
+        }
+
+        return $po;
+    }
+
+    /** Call inside a transaction with the delivery row locked. Rejected units are never posted. */
+    private function postAccepted(Delivery $delivery, User $user, bool $automatic): StockMovement
+    {
+        $accepted = (int) $delivery->accepted_quantity;
+        $po = $this->postablePurchaseOrder($delivery);
+        $key = "inbound-delivery:{$delivery->id}";
+        if (StockMovement::where('movement_key', $key)->exists()) {
+            throw new WorkflowException("Delivery {$delivery->delivery_number} was already added to stock.");
         }
 
         $product = Product::lockForUpdate()->findOrFail($po->product_id);
@@ -823,22 +871,21 @@ class ProcurementWorkflow
             'product_id' => $product->id,
             'user_id' => $user->id,
             'supplier_id' => $po->supplier_id,
-            'movement_key' => "inbound-delivery:{$delivery->id}",
+            'movement_key' => $key,
             'type' => 'stock_in',
             'quantity' => $accepted,
             'previous_stock' => $prev,
             'new_stock' => $prev + $accepted,
             'reference_number' => $delivery->delivery_number,
             'reason' => 'Accepted supplier delivery',
-            'remarks' => "PO {$po->po_number} · Delivery {$delivery->delivery_number} · Inspection {$delivery->inspection_number} · Invoice {$invoice->invoice_number}"
+            'remarks' => "PO {$po->po_number} · Delivery {$delivery->delivery_number} · Inspection {$delivery->inspection_number}"
                 .((int) $delivery->rejected_quantity > 0 ? " · {$delivery->rejected_quantity} rejected units excluded" : ''),
             'movement_date' => now(),
         ]);
         $delivery->update(['posted_quantity' => $accepted, 'posted_at' => now(), 'posted_by_id' => $user->id, 'stock_movement_id' => $movement->id]);
         AuditLogger::record('inventory.received', ($automatic ? '[Automatic] ' : '')."{$accepted} × {$product->name} added to stock from delivery {$delivery->delivery_number} ({$prev} → ".($prev + $accepted).').', $delivery,
-            ['purchase_order' => $po->po_number, 'invoice' => $invoice->invoice_number, 'inspection' => $delivery->inspection_number, 'rejected_excluded' => (int) $delivery->rejected_quantity, 'automatic' => $automatic], $user);
+            ['purchase_order' => $po->po_number, 'inspection' => $delivery->inspection_number, 'rejected_excluded' => (int) $delivery->rejected_quantity, 'automatic' => $automatic], $user);
 
         return $movement;
-
     }
 }

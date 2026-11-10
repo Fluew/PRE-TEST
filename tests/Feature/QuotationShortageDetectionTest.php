@@ -39,7 +39,7 @@ it('accurately computes available stock and shortage on quotation line items', f
         'tax_rate' => 12,
         'tax_amount' => 0,
         'grand_total' => 0,
-        'status' => 'pending',
+        'status' => 'draft',
     ]);
 
     // Item 1: Requested 10, stock 50 -> shortage should be 0

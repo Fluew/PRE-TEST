@@ -22,10 +22,9 @@ createInertiaApp({
                 return null;
             case name.startsWith('auth/'):
                 return AuthLayout;
-            case name === 'settings/Maintenance':
-                return AppLayout;
             case name.startsWith('settings/'):
             case name.startsWith('teams/'):
+            case name === 'RecycleBin/Index':
                 return [AppLayout, SettingsLayout];
             default:
                 return AppLayout;

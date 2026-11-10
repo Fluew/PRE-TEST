@@ -70,6 +70,24 @@ abstract class RowRules
         return collect($issues)->contains('level', 'error') ? ImportRow::NEEDS_REVIEW : ImportRow::READY;
     }
 
+    /**
+     * Compute extraction confidence ('high', 'medium', 'low') from actual extraction facts.
+     *
+     * @param  list<array{level: string, field: ?string, message: string}>  $issues
+     * @param  array<string, ?string>  $sources
+     */
+    protected function confidence(bool $ocr, ImportRow $row, array $issues, array $sources, bool $hadOcrCorrection): string
+    {
+        if (($row->extracted['_no_header'] ?? false) || $hadOcrCorrection || collect($issues)->contains('level', 'error')) {
+            return 'low';
+        }
+        if ($ocr || in_array('calculated', $sources, true) || collect($issues)->contains('level', 'warning')) {
+            return 'medium';
+        }
+
+        return 'high';
+    }
+
     protected static function issue(string $level, ?string $field, string $message): array
     {
         return compact('level', 'field', 'message');

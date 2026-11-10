@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\AuditLog;
+use App\Models\Team;
 use App\Models\TrustedDevice;
 use App\Models\User;
 use App\Services\AuditLogger;
@@ -21,6 +22,35 @@ use Inertia\Response;
 class UserController extends Controller
 {
     /**
+     * Role options in the User Management role filter, keyed by filter value.
+     * Owner / Superadmin and User are not offered here; those accounts still appear under All Roles.
+     *
+     * @var array<string, string>
+     */
+    protected const ROLE_FILTERS = [
+        'admin' => 'Administrator',
+        'staff' => 'Staff',
+    ];
+
+    /**
+     * Narrow a team member query to one role filter option.
+     *
+     * Administrator matches every account shown as "Administrator" in the list (admin, plus
+     * legacy superadmin/owner accounts, which User::isAdmin() treats the same). Staff matches
+     * every staff account, whatever modules it has (staff, staff_inventory, staff_sales, ...).
+     */
+    protected function applyRoleFilter(mixed $query, string $role): mixed
+    {
+        return match ($role) {
+            'admin' => $query->whereIn('users.role', ['admin', 'superadmin', 'owner']),
+            'staff' => $query->where(function ($q) {
+                $q->where('users.role', 'staff')->orWhere('users.role', 'like', 'staff_%');
+            }),
+            default => $query,
+        };
+    }
+
+    /**
      * Display centralized User Management screen.
      * Accessible to Owner/Superadmin and Admin.
      * Tabs:
@@ -35,39 +65,63 @@ class UserController extends Controller
         $currentUser = $request->user();
         abort_if(! $currentUser || ! $currentUser->isAdmin(), 403, 'User Management requires administrative privileges.');
 
-        $team = $currentUser->currentTeam;
+        $team = $currentUser->currentTeam ?: $currentUser->teams()->first() ?: Team::first();
         abort_if(! $team, 403, 'No active team selected.');
 
         $activeTab = $request->input('tab', 'accounts');
 
-        $search = $request->input('search');
-        $roleFilter = $request->input('role', 'All Roles');
+        $search = trim((string) $request->input('search', ''));
+        // Only the roles offered in the filter are accepted; anything else shows all roles.
+        $roleFilter = strtolower((string) $request->input('role', ''));
+        if (! array_key_exists($roleFilter, self::ROLE_FILTERS)) {
+            $roleFilter = 'All Roles';
+        }
         $statusFilter = $request->input('status', 'All Statuses');
 
-        // 1. User Accounts Data
-        $accountsData = [];
+        // 1. User Accounts Data (filtered, paginated list for the accounts table)
+        $accountsData = null;
+        $roleCounts = [];
         if ($activeTab === 'accounts') {
-            $query = $team->members()->withPivot('role')->withCount('trustedDevices')->with('modulePermissions');
+            // Members matching the search and status; the role filter is applied on top.
+            $filteredMembers = function () use ($team, $search, $statusFilter) {
+                $query = $team->members();
 
-            if ($search) {
-                $query->where(function ($q) use ($search) {
-                    $q->where('name', 'like', "%{$search}%")
-                        ->orWhere('email', 'like', "%{$search}%");
-                });
+                if ($search !== '') {
+                    $query->where(function ($q) use ($search) {
+                        $q->where('users.name', 'like', "%{$search}%")
+                            ->orWhere('users.email', 'like', "%{$search}%");
+                    });
+                }
+
+                if ($statusFilter && $statusFilter !== 'All Statuses') {
+                    $query->where('users.status', strtolower($statusFilter));
+                }
+
+                return $query;
+            };
+
+            // Count per role option, following the current search and status.
+            $roleCounts = ['All Roles' => $filteredMembers()->count()];
+            foreach (array_keys(self::ROLE_FILTERS) as $roleKey) {
+                $roleCounts[$roleKey] = $this->applyRoleFilter($filteredMembers(), $roleKey)->count();
             }
 
-            if ($roleFilter && $roleFilter !== 'All Roles') {
-                $query->where(function ($q) use ($roleFilter) {
-                    $q->wherePivot('role', strtolower($roleFilter))
-                        ->orWhere('role', strtolower($roleFilter));
-                });
+            $query = $filteredMembers()->withCount('trustedDevices')->with('modulePermissions');
+            if ($roleFilter !== 'All Roles') {
+                $this->applyRoleFilter($query, $roleFilter);
             }
 
-            if ($statusFilter && $statusFilter !== 'All Statuses') {
-                $query->where('status', strtolower($statusFilter));
-            }
+            // Keep the page inside the filtered result so a narrower filter never lands on an empty page.
+            $perPage = 15;
+            $total = $roleCounts[$roleFilter];
+            $page = min(max(1, (int) $request->input('page', 1)), max(1, (int) ceil($total / $perPage)));
 
-            $accountsData = $query->orderBy('name')->get()->map(fn (User $user) => [
+            $accountsData = $query->orderBy('users.name')->paginate($perPage, ['*'], 'page', $page)->appends(array_filter([
+                'tab' => 'accounts',
+                'search' => $search !== '' ? $search : null,
+                'role' => $roleFilter !== 'All Roles' ? $roleFilter : null,
+                'status' => $statusFilter !== 'All Statuses' ? $statusFilter : null,
+            ]))->through(fn (User $user) => [
                 'id' => $user->id,
                 'name' => $user->name,
                 'email' => $user->email,
@@ -266,27 +320,32 @@ class UserController extends Controller
             $securityData = $secQuery->orderByDesc('created_at')->paginate(20)->withQueryString();
         }
 
-        $usersList = ! empty($accountsData)
-            ? $accountsData
-            : $team->members()->with('modulePermissions')->get()->map(fn (User $u) => [
-                'id' => $u->id,
-                'name' => $u->name,
-                'email' => $u->email,
-                'role' => $u->roleLabel(),
-                'raw_role' => $u->role,
-                'modules' => $u->isStaff() ? $u->assignedModules() : [],
-                'status' => $u->status === 'pending_activation' ? 'Pending Activation' : ucfirst($u->status ?? 'active'),
-                'raw_status' => $u->status ?? 'active',
-                'is_active' => ($u->status ?? 'active') === 'active',
-                'is_pending_activation' => $u->status === 'pending_activation',
-                'trusted_devices_count' => $u->trustedDevices()->count(),
-                'is_superadmin' => false,
-            ]);
+        // Every team member, unfiltered (used by the device enrollment pickers and other tabs).
+        $usersList = $team->members()->with('modulePermissions')->withCount('trustedDevices')->orderBy('users.name')->get()->map(fn (User $u) => [
+            'id' => $u->id,
+            'name' => $u->name,
+            'email' => $u->email,
+            'role' => $u->roleLabel(),
+            'raw_role' => $u->role,
+            'modules' => $u->isStaff() ? $u->assignedModules() : [],
+            'status' => $u->status === 'pending_activation' ? 'Pending Activation' : ucfirst($u->status ?? 'active'),
+            'raw_status' => $u->status ?? 'active',
+            'is_active' => ($u->status ?? 'active') === 'active',
+            'is_pending_activation' => $u->status === 'pending_activation',
+            'trusted_devices_count' => $u->trusted_devices_count ?? 0,
+            'is_superadmin' => false,
+        ]);
 
         return Inertia::render('Users/Index', [
             'activeTab' => $activeTab,
             'isSuperAdmin' => true,
             'users' => $usersList,
+            'accounts' => $accountsData,
+            'roleCounts' => $roleCounts,
+            'roleFilterOptions' => collect(self::ROLE_FILTERS)->map(fn ($label, $value) => [
+                'value' => $value,
+                'label' => $label,
+            ])->values(),
             'sessions' => $sessionsData,
             'devices' => $devicesData,
             'auditLogs' => $auditData,
@@ -328,7 +387,7 @@ class UserController extends Controller
         $currentUser = $request->user();
         abort_if(! $currentUser || ! $currentUser->isAdmin(), 403, 'User Management requires administrative privileges.');
 
-        $team = $currentUser->currentTeam;
+        $team = $currentUser->currentTeam ?: $currentUser->teams()->first() ?: Team::first();
         abort_if(! $team, 403, 'No active team selected.');
 
         $allowedRoles = [
@@ -602,6 +661,9 @@ class UserController extends Controller
 
         $currentUser = $request->user();
         abort_if(! $currentUser || ! $currentUser->isAdmin(), 403, 'User Management requires administrative privileges.');
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
+        }
 
         if ($user->id === $currentUser->id) {
             return back()->withErrors(['user' => 'You cannot remove your own administrator account.']);
@@ -864,8 +926,17 @@ class UserController extends Controller
 
         $currentUser = $request->user();
         abort_if(! $currentUser || ! $currentUser->isAdmin(), 403, 'Deleting devices is restricted to Administrator.');
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
+        }
 
         $deviceName = $device->device_name;
+        if ($device->user_id) {
+            DB::table('sessions')->where('user_id', $device->user_id)->delete();
+        }
+        if ($device->is_shared && is_array($device->authorized_user_ids)) {
+            DB::table('sessions')->whereIn('user_id', $device->authorized_user_ids)->delete();
+        }
         $device->delete();
 
         AuditLogger::audit(

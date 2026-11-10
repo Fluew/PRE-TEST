@@ -8,7 +8,7 @@ use App\Models\Supplier;
 use App\Models\Team;
 use App\Services\AuditLogger;
 use App\Services\Inventory\InventoryExporter;
-use App\Services\Inventory\ProductPrioritizer;
+use App\Services\Inventory\SkuGenerator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
@@ -35,11 +35,13 @@ class InventoryController extends Controller
     {
         $thresholdSql = self::THRESHOLD_SQL;
 
-        // "Incomplete": products imported with missing values, inactive until staff complete them.
+        // "Incomplete": products with missing values (imported, or created by an inbound delivery
+        // without a selling price). They are not sellable until completed, but they are real stock,
+        // so the normal list shows them too. Products an admin deactivated stay hidden.
         $query = Product::where('team_id', $teamId)
             ->when($status === 'Incomplete',
                 fn ($q) => $q->where('is_active', false)->whereNotNull('missing_fields'),
-                fn ($q) => $q->where('is_active', true))
+                fn ($q) => $q->where(fn ($w) => $w->where('is_active', true)->orWhereNotNull('missing_fields')))
             ->with('supplier:id,name');
         if ($status === 'Incomplete') {
             $status = null;
@@ -100,9 +102,9 @@ class InventoryController extends Controller
             ->paginate(10)
             ->withQueryString();
 
-        // Calculate inventory summary counts in a single aggregate query
+        // Calculate inventory summary counts in a single aggregate query (same products as the list)
         $counts = Product::where('team_id', $team->id)
-            ->where('is_active', true)
+            ->where(fn ($w) => $w->where('is_active', true)->orWhereNotNull('missing_fields'))
             ->selectRaw("
                 COUNT(*) as total_items,
                 SUM(CASE WHEN stock <= 0 THEN 1 ELSE 0 END) as out_of_stock,
@@ -186,7 +188,6 @@ class InventoryController extends Controller
 
         return Inertia::render('Inventory/Index', [
             'products' => $products,
-            'priorities' => array_values(app(ProductPrioritizer::class)->forTeam($team->id)),
             'summary' => [
                 'total' => $totalItems,
                 'in_stock' => $inStockCount,
@@ -202,7 +203,9 @@ class InventoryController extends Controller
                 'search' => $search,
                 'category' => $category,
                 'status' => $status,
-                'view' => $request->input('view', 'table'),
+                // Product Catalog ('table') or Product Movement ('history'). AHP Product Prioritization
+                // moved to Reports and Analytics; an old ?view=prioritization link opens the catalog.
+                'view' => $request->input('view') === 'history' ? 'history' : 'table',
             ],
         ]);
     }
@@ -214,14 +217,9 @@ class InventoryController extends Controller
     {
         $team = $request->user()->currentTeam;
 
+        // The SKU is not taken from the form: it is generated from the category when saving.
         $validated = $request->validate([
             'name' => ['required', 'string', 'max:255'],
-            'sku' => [
-                'required',
-                'string',
-                'max:100',
-                Rule::unique('products')->where(fn ($q) => $q->where('team_id', $team->id)),
-            ],
             'category' => ['required', 'string', 'max:100'],
             'brand' => ['nullable', 'string', 'max:100'],
             'unit' => ['nullable', 'string', 'max:50'],
@@ -245,10 +243,10 @@ class InventoryController extends Controller
             $status = 'Low Stock';
         }
 
-        DB::transaction(function () use ($team, $request, $validated, $reorderLevel, $reorderQty, $stock, $status) {
+        $product = DB::transaction(function () use ($team, $request, $validated, $reorderLevel, $reorderQty, $stock, $status) {
             $product = Product::create([
                 'team_id' => $team->id,
-                'sku' => strtoupper(trim($validated['sku'])),
+                'sku' => app(SkuGenerator::class)->next($team->id, $validated['category']),
                 'name' => trim($validated['name']),
                 'category' => $validated['category'],
                 'brand' => filled($validated['brand'] ?? null) ? trim($validated['brand']) : null,
@@ -282,9 +280,29 @@ class InventoryController extends Controller
                     'movement_date' => now(),
                 ]);
             }
+
+            AuditLogger::record(
+                'product.created',
+                "Created product {$product->name} ({$product->sku}) with initial stock of {$stock}.",
+                $product,
+                ['sku' => $product->sku, 'name' => $product->name, 'stock' => $stock],
+                $request->user()
+            );
+
+            return $product;
         });
 
-        return back()->with('success', "Product '{$validated['name']}' created successfully!");
+        return back()->with('success', "Product '{$product->name}' created with SKU {$product->sku}.");
+    }
+
+    /** The SKU the next product of a category would get, for the product form (reserved only when saving). */
+    public function nextSku(Request $request): JsonResponse
+    {
+        $team = $request->user()->currentTeam;
+        abort_if(! $team, 403);
+        $category = (string) $request->validate(['category' => ['required', 'string', 'max:100']])['category'];
+
+        return response()->json(['sku' => app(SkuGenerator::class)->peek($team->id, $category)]);
     }
 
     /**
@@ -300,12 +318,7 @@ class InventoryController extends Controller
 
         $validated = $request->validate([
             'name' => ['required', 'string', 'max:255'],
-            'sku' => [
-                'required',
-                'string',
-                'max:100',
-                Rule::unique('products')->where(fn ($q) => $q->where('team_id', $team->id))->ignore($product->id),
-            ],
+            // No SKU: it stays as created, also when the category changes.
             'category' => ['required', 'string', 'max:100'],
             'brand' => ['nullable', 'string', 'max:100'],
             'unit' => ['nullable', 'string', 'max:50'],
@@ -321,7 +334,6 @@ class InventoryController extends Controller
         $reorderQty = (int) ($validated['reorder_quantity'] ?? 50);
 
         $product->update([
-            'sku' => strtoupper(trim($validated['sku'])),
             'name' => trim($validated['name']),
             'category' => $validated['category'],
             'brand' => filled($validated['brand'] ?? null) ? trim($validated['brand']) : null,
@@ -340,10 +352,18 @@ class InventoryController extends Controller
         $product->updateCalculatedStatus();
         $product->refreshCompleteness();
         if ($wasIncomplete && $product->is_active) {
-            AuditLogger::record('product.completed', "Imported product {$product->sku} completed and activated.", $product, [], $request->user());
+            AuditLogger::record('product.completed', "Imported product {$product->sku} completed and activated.", $product, ['sku' => $product->sku], $request->user());
 
             return back()->with('success', "Product '{$product->name}' completed and is now active.");
         }
+
+        AuditLogger::record(
+            'product.updated',
+            "Updated product {$product->name} ({$product->sku}).",
+            $product,
+            ['sku' => $product->sku, 'name' => $product->name],
+            $request->user()
+        );
 
         return back()->with('success', "Product '{$product->name}' updated successfully!");
     }
@@ -353,6 +373,10 @@ class InventoryController extends Controller
      */
     public function destroy(Request $request, mixed $current_team = null, mixed $product = null): RedirectResponse
     {
+        abort_unless($request->user()?->isAdmin(), 403, 'Only administrators can delete records.');
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
+        }
         $product = $this->resolveProduct($product, $current_team, $request);
         $team = $request->user()->currentTeam;
         if (! $team || $product->team_id !== $team->id) {
@@ -399,6 +423,8 @@ class InventoryController extends Controller
             $product->save();
             $product->updateCalculatedStatus();
 
+            $ref = ($validated['reference_number'] ?? null) ?: ('IN-'.strtoupper(uniqid()));
+
             StockMovement::create([
                 'team_id' => $team->id,
                 'product_id' => $product->id,
@@ -408,11 +434,19 @@ class InventoryController extends Controller
                 'quantity' => $qty,
                 'previous_stock' => $prevStock,
                 'new_stock' => $newStock,
-                'reference_number' => $validated['reference_number'] ?: ('IN-'.strtoupper(uniqid())),
-                'reason' => 'Supplier Restock',
+                'reference_number' => $ref,
+                'reason' => 'Manual Stock In',
                 'remarks' => $validated['remarks'] ?? null,
                 'movement_date' => $validated['movement_date'] ?? now(),
             ]);
+
+            AuditLogger::record(
+                'stock.in',
+                "Stock-In of {$qty} units for {$product->name} ({$product->sku}). Stock: {$prevStock} → {$newStock}.",
+                $product,
+                ['sku' => $product->sku, 'reference_number' => $ref, 'quantity' => $qty, 'previous_stock' => $prevStock, 'new_stock' => $newStock],
+                $request->user()
+            );
         });
 
         return back()->with('success', 'Stock-In recorded successfully! Inventory updated.');
@@ -437,19 +471,16 @@ class InventoryController extends Controller
         $product = Product::find($validated['product_id']);
         $qty = (int) $validated['quantity'];
 
-        if ($qty > $product->stock) {
-            throw ValidationException::withMessages([
-                'quantity' => "Insufficient stock. Available quantity: {$product->stock}.",
-            ]);
-        }
-
         DB::transaction(function () use ($team, $request, $validated, $product, $qty) {
             $product = Product::lockForUpdate()->find($product->id);
             $prevStock = $product->stock;
 
-            if ($qty > $prevStock) {
+            // Units reserved for confirmed Sales Orders cannot be taken out by hand.
+            $reserved = $product->reservedQuantity();
+            $available = max(0, $prevStock - $reserved);
+            if ($qty > $available) {
                 throw ValidationException::withMessages([
-                    'quantity' => "Insufficient stock. Available quantity: {$prevStock}.",
+                    'quantity' => "Insufficient stock. Available quantity: {$available}".($reserved > 0 ? " ({$reserved} of {$prevStock} reserved for sales orders)" : '').'.',
                 ]);
             }
 
@@ -457,6 +488,8 @@ class InventoryController extends Controller
             $product->stock = $newStock;
             $product->save();
             $product->updateCalculatedStatus();
+
+            $ref = ($validated['reference_number'] ?? null) ?: ('OUT-'.strtoupper(uniqid()));
 
             StockMovement::create([
                 'team_id' => $team->id,
@@ -466,11 +499,19 @@ class InventoryController extends Controller
                 'quantity' => $qty,
                 'previous_stock' => $prevStock,
                 'new_stock' => $newStock,
-                'reference_number' => $validated['reference_number'] ?: ('OUT-'.strtoupper(uniqid())),
+                'reference_number' => $ref,
                 'reason' => $validated['reason'],
                 'remarks' => $validated['remarks'] ?? null,
                 'movement_date' => $validated['movement_date'] ?? now(),
             ]);
+
+            AuditLogger::record(
+                'stock.out',
+                "Stock-Out of {$qty} units for {$product->name} ({$product->sku}). Reason: {$validated['reason']}.",
+                $product,
+                ['sku' => $product->sku, 'reference_number' => $ref, 'quantity' => $qty, 'previous_stock' => $prevStock, 'new_stock' => $newStock],
+                $request->user()
+            );
         });
 
         return back()->with('success', 'Stock-Out recorded successfully! Inventory updated.');
@@ -500,6 +541,8 @@ class InventoryController extends Controller
             $product->save();
             $product->updateCalculatedStatus();
 
+            $ref = 'ADJ-'.strtoupper(uniqid());
+
             StockMovement::create([
                 'team_id' => $team->id,
                 'product_id' => $product->id,
@@ -508,11 +551,19 @@ class InventoryController extends Controller
                 'quantity' => abs($diff),
                 'previous_stock' => $prevStock,
                 'new_stock' => $newStock,
-                'reference_number' => 'ADJ-'.strtoupper(uniqid()),
+                'reference_number' => $ref,
                 'reason' => $validated['reason'],
                 'remarks' => $validated['remarks'] ?: "Adjusted from {$prevStock} to {$newStock} ({$diff})",
                 'movement_date' => now(),
             ]);
+
+            AuditLogger::record(
+                'stock.adjusted',
+                "Adjusted stock for {$product->name} ({$product->sku}) from {$prevStock} to {$newStock} ({$validated['reason']}).",
+                $product,
+                ['sku' => $product->sku, 'reference_number' => $ref, 'previous_stock' => $prevStock, 'new_stock' => $newStock],
+                $request->user()
+            );
         });
 
         return back()->with('success', 'Inventory adjustment successfully recorded and audited.');

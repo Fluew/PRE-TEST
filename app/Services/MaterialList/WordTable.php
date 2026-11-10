@@ -16,62 +16,128 @@ final class WordTable
 {
     /**
      * @param  array<int, string>  $tsvPages  TSV output (one string may hold several pages)
-     * @param  callable(array<int, string>): bool  $isHeader  is this line the column header row?
+     * @param  callable(array<int, string>, bool): bool  $isHeader  is this line the column header row?
+     *                                                              (2nd argument: the cells are single words)
      * @param  bool  $tesseractLines  group words by Tesseract's own line ids (copes with slightly
      *                                tilted photos); otherwise by vertical position (PDF text)
-     * @return array{aligned: bool, rows: array<int, array<int, string>>} aligned = a header row was found
+     * @return array{aligned: bool, rows: array<int, array<int, string>>, conf: array<int, array<int, float>>} aligned: a header row was found; conf: lowest OCR confidence (0-100) of the words in each cell
      */
     public static function build(array $tsvPages, callable $isHeader, bool $tesseractLines): array
     {
         $columns = null; // [{text, x0, x1}], edges between them
         $edges = [];
         $rows = [];
+        $conf = [];
 
         foreach ($tsvPages as $tsv) {
             foreach (self::pages($tsv) as $words) {
                 $lines = self::lines($words, $tesseractLines);
 
-                $headerAt = null;
-                foreach ($lines as $i => $line) {
-                    $phrases = array_column(self::phrases($line), 'text');
-                    if ($isHeader($phrases) || $isHeader(array_column($line, 'text'))) {
-                        $headerAt = $i;
-                        break;
-                    }
-                }
+                [$headerAt, $header, $titles] = self::findHeader($lines, $isHeader);
 
                 $data = $headerAt === null ? $lines : array_slice($lines, $headerAt + 1);
                 if ($headerAt !== null) {
-                    [$found, $edges] = self::columns($lines[$headerAt], $data);
+                    [$found, $edges] = self::columns($header, $data);
                     if ($columns === null) {
-                        foreach (array_slice($lines, 0, $headerAt) as $title) {
+                        foreach (array_slice($lines, 0, $titles) as $title) {
                             $rows[] = array_column(self::phrases($title), 'text');
+                            $conf[] = array_map(fn ($p) => self::lowestConf($p['words']), self::phrases($title));
                         }
                         $rows[] = array_column($found, 'text');
-                        $first = ['row' => array_key_last($rows), 'columns' => $found, 'letter' => self::letterHeight($lines[$headerAt])];
+                        $conf[] = array_fill(0, count($found), 100.0);
+                        $first = ['row' => array_key_last($rows), 'columns' => $found, 'letter' => self::letterHeight($header)];
                     }
                     $columns = $found; // a repeated header on a later page realigns the columns
                 } elseif ($columns === null) {
                     foreach ($lines as $line) {
                         $rows[] = array_column(self::phrases($line), 'text'); // no table (yet): plain lines
+                        $conf[] = array_map(fn ($p) => self::lowestConf($p['words']), self::phrases($line));
                     }
 
                     continue;
                 }
 
-                self::addRows($rows, $data, $columns, $edges);
+                self::addRows($rows, $conf, $data, $columns, $edges);
             }
         }
 
         if (isset($first)) {
-            self::joinEmptyColumns($rows, $first['row'], $first['columns'], $first['letter']);
+            self::joinEmptyColumns($rows, $conf, $first['row'], $first['columns'], $first['letter']);
         }
 
-        return ['aligned' => $columns !== null, 'rows' => $rows];
+        return ['aligned' => $columns !== null, 'rows' => $rows, 'conf' => $conf];
+    }
+
+    /** Lowest confidence of a group of words (100 when the source gives none, as for PDF text). */
+    private static function lowestConf(array $words): float
+    {
+        $values = array_map(fn ($w) => (float) ($w['conf'] ?? 100), $words);
+
+        return $values === [] ? 100.0 : min($values);
+    }
+
+    /**
+     * The header line of a page: [index of its last line, its words, number of lines above it],
+     * or [null, [], 0]. A header whose cells wrap onto a second line ("Available" over
+     * "Quantity") is read as one, but only when no single line is a header.
+     */
+    private static function findHeader(array $lines, callable $isHeader): array
+    {
+        // Phrases first ("Product Name" | "Qty"); single words only when the phrases ran
+        // together. Word-level cells are flagged so a title ("Bill of Materials and
+        // Quantities") is not taken for a header just because two of its words are labels.
+        $test = fn (array $line) => $isHeader(array_column(self::phrases($line), 'text'), false)
+            || $isHeader(array_column($line, 'text'), true);
+
+        foreach ($lines as $i => $line) {
+            if ($test($line)) {
+                return [$i, $line, $i];
+            }
+        }
+        for ($i = 0; $i + 1 < count($lines); $i++) {
+            $joined = self::joinWrapped($lines[$i], $lines[$i + 1]);
+            if ($joined !== null && $test($joined)) {
+                return [$i + 1, $joined, $i];
+            }
+        }
+
+        return [null, [], 0];
+    }
+
+    /**
+     * Two lines read as one header line when the second sits right under the first (wrapped
+     * text, not the next table row). Words under each other become one cell, top line first.
+     */
+    private static function joinWrapped(array $upper, array $lower): ?array
+    {
+        [, $bottom, $h1] = self::extent($upper);
+        [$top, , $h2] = self::extent($lower);
+        if ($top - $bottom >= 0.6 * min($h1, $h2)) {
+            return null;
+        }
+
+        $words = array_merge(
+            array_map(fn ($w) => $w + ['row' => 0], $upper),
+            array_map(fn ($w) => $w + ['row' => 1], $lower),
+        );
+        usort($words, fn ($a, $b) => $a['x0'] <=> $b['x0']);
+        $cell = -1;
+        $right = -INF;
+        foreach ($words as &$w) {
+            if ($w['x0'] > $right) {
+                $cell++;
+            }
+            $w['cell'] = $cell;
+            $right = max($right, $w['x1']);
+        }
+        unset($w);
+        usort($words, fn ($a, $b) => [$a['cell'], $a['row'], $a['x0']] <=> [$b['cell'], $b['row'], $b['x0']]);
+
+        return array_map(fn ($w) => array_diff_key($w, ['row' => 0, 'cell' => 0]), $words);
     }
 
     /** Place each data line into the columns; skip notes and page numbers, join wrapped cells. */
-    private static function addRows(array &$rows, array $lines, array $columns, array $edges): void
+    private static function addRows(array &$rows, array &$conf, array $lines, array $columns, array $edges): void
     {
         $lastData = null;
         $prevBottom = null;
@@ -86,18 +152,27 @@ final class WordTable
             }
             [$top, $bottom, $height] = self::extent($line);
 
-            $cells = self::place($line, count($columns), $edges);
-            if ($cells === null) {
+            $placed = self::place($line, count($columns), $edges);
+            if ($placed === null) {
                 continue; // a sentence running across the columns: a note or footer, not a row
             }
+            [$cells, $cellConf] = $placed;
 
             $filled = array_keys(array_filter($cells, fn ($c) => $c !== ''));
             $close = $prevBottom !== null && $top - $prevBottom < 0.8 * $height;
-            if ($lastData !== null && $close && count($filled) === 1 && $filled[0] > 0) {
+            $prevFilledCount = $lastData !== null ? count(array_filter($rows[$lastData], fn ($c) => $c !== '')) : 0;
+            $canWrapCol0 = $filled === [0]
+                && $prevFilledCount >= 2
+                && ($rows[$lastData][0] ?? '') !== ''
+                && ! preg_match('/^(\d+[\.\)]|[A-Z]{2,6}-\d{2,}|total|sub\s*-?\s*total|grand\s+total)\b/iu', $cells[0]);
+
+            if ($lastData !== null && $close && count($filled) === 1 && ($filled[0] > 0 || $canWrapCol0)) {
                 // A long cell wrapped onto the next line.
                 $rows[$lastData][$filled[0]] = trim($rows[$lastData][$filled[0]].' '.$cells[$filled[0]]);
+                $conf[$lastData][$filled[0]] = min($conf[$lastData][$filled[0]] ?? 100.0, $cellConf[$filled[0]]);
             } else {
                 $rows[] = $cells;
+                $conf[] = $cellConf;
                 $lastData = array_key_last($rows);
             }
             $prevBottom = $bottom;
@@ -158,7 +233,7 @@ final class WordTable
      * part with no data. Such an empty column is joined to a neighbour whose header is only a
      * space away.
      */
-    private static function joinEmptyColumns(array &$rows, int $headerRow, array $columns, float $letter): void
+    private static function joinEmptyColumns(array &$rows, array &$conf, int $headerRow, array $columns, float $letter): void
     {
         for ($j = count($columns) - 1; $j >= 0; $j--) {
             $empty = true;
@@ -181,6 +256,9 @@ final class WordTable
                 : $rows[$headerRow][$j].' '.$rows[$headerRow][$into];
             for ($r = $headerRow; $r < count($rows); $r++) {
                 array_splice($rows[$r], $j, 1);
+                if (isset($conf[$r])) {
+                    array_splice($conf[$r], $j, 1);
+                }
             }
             $columns[$into]['x0'] = min($columns[$into]['x0'], $columns[$j]['x0']);
             $columns[$into]['x1'] = max($columns[$into]['x1'], $columns[$j]['x1']);
@@ -201,8 +279,9 @@ final class WordTable
     }
 
     /**
-     * Put each word in the column it sits in. Null when the line is a sentence running across
-     * columns (3+ words with normal spacing over 2+ columns), which is a note or footer, not a row.
+     * Put each word in the column it sits in: [cells, lowest word confidence per cell]. Null when
+     * the line is a sentence running across columns (3+ words with normal spacing over 2+
+     * columns), which is a note or footer, not a row.
      */
     private static function place(array $line, int $count, array $edges): ?array
     {
@@ -223,12 +302,14 @@ final class WordTable
         }
 
         $cells = array_fill(0, $count, '');
+        $conf = array_fill(0, $count, 100.0);
         foreach ($line as $w) {
             $c = $column($w);
             $cells[$c] = trim($cells[$c].' '.$w['text']);
+            $conf[$c] = min($conf[$c], (float) ($w['conf'] ?? 100));
         }
 
-        return $cells;
+        return [$cells, $conf];
     }
 
     /** @return array<int, array<int, array{text: string, x0: float, x1: float, y0: float, y1: float, line: string}>> words per page */
@@ -245,7 +326,8 @@ final class WordTable
         $pages = [];
         foreach ($lines as $raw) {
             $f = explode("\t", $raw);
-            $text = trim($f[$head['text']] ?? '');
+            // Table borders read by OCR ("|", "Name|") are never content.
+            $text = trim(preg_replace('/^[|¦‖]+|[|¦‖]+$/u', '', trim($f[$head['text']] ?? '')) ?? '');
             if (($f[$head['level']] ?? '') !== '5' || $text === '' || str_starts_with($text, '###')) {
                 continue;
             }
@@ -259,6 +341,8 @@ final class WordTable
             $pages[(int) $f[$head['page_num']]][] = [
                 'text' => $text, 'x0' => $x, 'x1' => $x + (float) $f[$head['width']],
                 'y0' => $y, 'y1' => $y + (float) $f[$head['height']], 'line' => $line,
+                // Text-layer words (pdftotext) report -1 or 100: only OCR words can be unsure.
+                'conf' => isset($head['conf']) && (float) ($f[$head['conf']] ?? -1) >= 0 ? (float) $f[$head['conf']] : 100.0,
             ];
         }
         ksort($pages);
@@ -296,6 +380,33 @@ final class WordTable
         }
         unset($line);
         usort($lines, fn ($a, $b) => self::extent($a)[0] <=> self::extent($b)[0]);
+
+        if ($tesseractLines && count($lines) > 1) {
+            $merged = [];
+            foreach ($lines as $line) {
+                $last = array_key_last($merged);
+                if ($last !== null) {
+                    [$topA, $botA, $hA] = self::extent($merged[$last]);
+                    [$topB, $botB, $hB] = self::extent($line);
+                    $midA = ($topA + $botA) / 2;
+                    $midB = ($topB + $botB) / 2;
+                    $minXA = min(array_column($merged[$last], 'x0'));
+                    $maxXA = max(array_column($merged[$last], 'x1'));
+                    $minXB = min(array_column($line, 'x0'));
+                    $maxXB = max(array_column($line, 'x1'));
+                    $disjointX = $maxXA <= $minXB || $maxXB <= $minXA;
+
+                    if ($disjointX && abs($midA - $midB) <= 0.5 * max($hA, $hB)) {
+                        $merged[$last] = array_merge($merged[$last], $line);
+                        usort($merged[$last], fn ($a, $b) => $a['x0'] <=> $b['x0']);
+
+                        continue;
+                    }
+                }
+                $merged[] = $line;
+            }
+            $lines = $merged;
+        }
 
         return $lines;
     }

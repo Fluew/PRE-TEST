@@ -55,6 +55,26 @@ class PurchaseOrder extends Model
     /** Statuses in which goods may still be received. */
     public const RECEIVABLE = [self::SENT, self::PARTIAL];
 
+    /**
+     * How each status is shown: receiving progress reads Pending → Partially Received → Received.
+     * (The stored values are unchanged, so existing records and rules keep working.)
+     */
+    public const STATUS_LABELS = [
+        self::DRAFT => 'Draft',
+        self::SENT => 'Pending',
+        self::PARTIAL => 'Partially Received',
+        self::FULL => 'Received',
+        self::CLOSED => 'Closed',
+        self::CANCELLED => 'Cancelled',
+    ];
+
+    protected $appends = ['status_label'];
+
+    public function getStatusLabelAttribute(): string
+    {
+        return self::STATUS_LABELS[$this->status] ?? (string) $this->status;
+    }
+
     protected $casts = [
         'po_date' => 'date',
         'promised_delivery_date' => 'date',

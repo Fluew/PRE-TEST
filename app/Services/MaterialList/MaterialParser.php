@@ -21,6 +21,12 @@ class MaterialParser
         .'boxes|box|bx|sets|set|lots|lot|pairs|pair|kg|kgs|g|lengths|length|lgth|coils|coil|spools|spool|packs|pack|pkt|'
         .'bags|bag|cans|can|gallons|gallon|gal|liters|liter|litres|litre|l|bundles|bundle|reels|reel|sheets|sheet|doz|dozen|nos|no';
 
+    /** Labels of document details ("Date:", "Quotation No.", "Tel:"): their numbers are never quantities. */
+    private const DETAIL_LABELS = 'date|tel|telephone|phone|mobile|cell|fax|e-?mail|tin|vat\s+reg(?:istration)?|quotation|quote|invoice|'
+        .'p\.?\s?o\.?|purchase\s+order|sales\s+order|order|ref|reference|project|client|customer|supplier|vendor|company|address|'
+        .'attention|attn|contact|prepared\s+by|approved\s+by|checked\s+by|requested\s+by|received\s+by|delivery\s+date|due\s+date|'
+        .'valid\s+until|validity|terms|page';
+
     // ---------------------------------------------------------------------------------- cleaning
 
     /**
@@ -64,7 +70,7 @@ class MaterialParser
             }
             foreach ($counts as $l => $n) {
                 if ($n >= max(2, (int) ceil(count($perPage) * 0.6)) && mb_strlen($l) <= 80
-                    && count(HeaderMapper::map(explode("\t", $l))) < 2) {
+                    && ! HeaderMapper::isHeaderRow(explode("\t", $l))) {
                     $repeated[$l] = true;
                 }
             }
@@ -105,10 +111,12 @@ class MaterialParser
         ));
 
         $autoDetect = $mapping === null;
+        $headerDetected = ! $autoDetect && $headerIndex !== null;
         if ($autoDetect) {
             $found = HeaderMapper::findHeaderRow($rows);
             $mapping = $found['mapping'];
             $headerIndex = $found['index'];
+            $headerDetected = $headerIndex !== null;
         }
 
         // No header row recognised: label the columns with the first row and suggest it as the
@@ -129,17 +137,19 @@ class MaterialParser
             'confident' => HeaderMapper::isConfident($mapping),
             'mapping' => (object) $mapping,
             'header_index' => $headerIndex,
+            'header_detected' => $headerDetected,
             'columns' => $columns,
-            'preview' => array_slice($rows, 0, 8),
+            // Enough rows to choose the header row and columns by hand (the header may sit below a letterhead).
+            'preview' => array_slice($rows, 0, min(40, max(15, ($headerIndex ?? 0) + 6))),
+            'missing' => HeaderMapper::missingRequired($mapping),
             'items' => [],
             'unparsed_lines' => [],
             'warnings' => [],
         ];
 
         if (! $result['confident']) {
-            $result['warnings'][] = isset($mapping['description'])
-                ? 'We found the item column but not the quantity column. Please choose which column holds the quantity.'
-                : 'We could not recognise the columns in this file. Please choose which columns hold the item description and quantity.';
+            // Name exactly which required columns are missing, and the headers that were found.
+            $result['warnings'][] = HeaderMapper::describeMissing($mapping, $headerDetected ? $columns : []);
 
             return $result;
         }
@@ -147,7 +157,7 @@ class MaterialParser
         $start = $headerIndex === null ? 0 : $headerIndex + 1;
         foreach (array_slice($rows, $start, null, true) as $i => $row) {
             // Header rows repeated on later pages, and subtotal/total lines, are not items.
-            if (HeaderMapper::isConfident(HeaderMapper::map($row))) {
+            if (HeaderMapper::isMaterialHeader($row)) {
                 continue;
             }
             $get = fn (string $f) => isset($mapping[$f]) ? trim((string) ($row[$mapping[$f]] ?? '')) : '';
@@ -159,6 +169,9 @@ class MaterialParser
                 continue;
             }
             if (preg_match('/^(sub\s*-?\s*total|grand\s*total|total|vat|tax)\b/i', $description)) {
+                continue;
+            }
+            if ($description !== '' && HeaderMapper::exactFieldFor($description) === 'description' && self::parseQuantity($get('quantity'))[0] === null) {
                 continue;
             }
 
@@ -213,22 +226,44 @@ class MaterialParser
             $l = preg_replace('/^\d{1,3}[.)]\s+(?=\D)/', '', $l) ?? $l; // list numbering "1." / "2)"
             // OCR often reads 0 as O and 1 as l/I in a leading quantity ("1O pcs"). Fix it only when
             // the token already has a real digit and is followed by a unit or "x", so words are untouched.
+            $ocrLeadingRaw = null;
             $l = preg_replace_callback(
                 "/^(?=[OoIl]*\d)([\dOoIl][\dOoIl,]*)(?=\s*(?:(?:{$units})\.?|[x×])\s)/iu",
-                fn ($m) => strtr($m[1], ['O' => '0', 'o' => '0', 'I' => '1', 'l' => '1']),
+                function ($m) use (&$ocrLeadingRaw) {
+                    if (preg_match('/[OoIl]/', $m[1])) {
+                        $ocrLeadingRaw = $m[1];
+                    }
+
+                    return strtr($m[1], ['O' => '0', 'o' => '0', 'I' => '1', 'l' => '1']);
+                },
                 $l
             ) ?? $l;
             $m = null;
+
+            // Document details are not materials: "Date: 2026-10-01" is not 1 of "Date: 2026-10".
+            if (self::isDocumentDetail($l)) {
+                $result['unparsed_lines'][] = str_replace("\t", ' | ', $line);
+
+                continue;
+            }
 
             if (preg_match("/^(?<qty>{$num})\s*(?<unit>{$units})\.?[_~-]*\s+(?:of\s+|x\s+|[-_~]+\s+)?(?<desc>[\p{L}].+)$/iu", $l, $m)      // 10 pcs Breaker 60A
                 || preg_match("/^(?<qty>{$num})\s*[x×]\s*(?<desc>[\p{L}].+)$/iu", $l, $m)                                          // 10 x Breaker 60A
                 || preg_match("/^(?<desc>.*[\p{L}].*?)\s*(?:[-:x×=]|qty\.?:?)\s*(?<qty>{$num})\s*(?<unit>{$units})?\.?$/iu", $l, $m) // Breaker 60A - 10 pcs
                 || preg_match("/^(?<desc>.*[\p{L}].*?)\s+(?<qty>{$num})\s*(?<unit>{$units})\.?$/iu", $l, $m)) {                   // Breaker 60A 10 pcs
-                $item = self::makeItem($n + 1, trim($m['desc'], ' -:,'), $m['qty'], $source);
+                $descText = trim($m['desc'], ' -:,');
+                // The last part of a date, phone or reference number ("2026-10-01", "0917-555-1234") is not a quantity.
+                $joined = preg_match('/\d[-\/.]'.preg_quote($m['qty'], '/')."\s*(?:(?:{$units})\.?)?$/iu", $l);
+                if ($joined || HeaderMapper::exactFieldFor($descText) === 'description') {
+                    $result['unparsed_lines'][] = str_replace("\t", ' | ', $line);
+
+                    continue;
+                }
+                $item = self::makeItem($n + 1, $descText, $ocrLeadingRaw ?? $m['qty'], $source);
                 $item['unit'] = ($m['unit'] ?? '') !== '' ? strtolower($m['unit']) : null;
                 $item['needs_review'] = true;
                 $result['items'][] = self::finishItem($item);
-            } elseif (! HeaderMapper::isConfident(HeaderMapper::map(explode("\t", $line)))) {
+            } elseif (! HeaderMapper::isMaterialHeader(explode("\t", $line))) {
                 $result['unparsed_lines'][] = str_replace("\t", ' | ', $line);
             }
 
@@ -247,9 +282,19 @@ class MaterialParser
 
     // ---------------------------------------------------------------------------------- helpers
 
+    /** "Date: 2026-10-01", "Quotation No. 123", "Tel: 0917-555-1234", "PO # 4500": a document detail line. */
+    private static function isDocumentDetail(string $line): bool
+    {
+        $labels = self::DETAIL_LABELS;
+
+        return (bool) preg_match("/^\s*(?:{$labels})\s*(?:no\.?|number|#|date|name|ref\.?)?\s*[:#]/iu", $line)
+            || (bool) preg_match("/^\s*(?:{$labels})\s+(?:no\.?|number)\s*\d/iu", $line);
+    }
+
     private static function makeItem(int $line, string $description, string $quantityRaw, string $source): array
     {
         [$qty, $unitFromQty] = self::parseQuantity($quantityRaw);
+        $hadOcrFix = $qty !== null && preg_match('/[OoIl]/', $quantityRaw);
 
         return [
             'line' => $line,
@@ -264,8 +309,9 @@ class MaterialParser
             'item_code' => null,
             'client_price' => null,
             'errors' => [],   // block submission until fixed
-            'warnings' => [], // shown, but do not block
-            'needs_review' => false,
+            'warnings' => $hadOcrFix ? ["Quantity read as \"{$quantityRaw}\" and taken as {$qty}. Please verify against the original document."] : [],
+            'needs_review' => (bool) $hadOcrFix,
+            'extraction_confidence' => $hadOcrFix ? 'low' : (in_array($source, ['ocr', 'pdf-ocr', 'text'], true) ? 'medium' : 'high'),
         ];
     }
 
@@ -286,6 +332,9 @@ class MaterialParser
         }
         if ($item['errors'] !== []) {
             $item['needs_review'] = true;
+            $item['extraction_confidence'] = 'low';
+        } elseif (($item['needs_review'] ?? false) && ($item['extraction_confidence'] ?? 'high') === 'high') {
+            $item['extraction_confidence'] = 'medium';
         }
         foreach (['unit' => 30, 'brand' => 100, 'specs' => 500, 'remarks' => 500, 'item_code' => 60] as $f => $max) {
             $item[$f] = $item[$f] !== null ? mb_substr((string) $item[$f], 0, $max) : null;

@@ -23,11 +23,11 @@ use App\Models\User;
 use App\Services\CustomerEmails;
 use App\Services\Delivery\FulfillmentService;
 use App\Services\Inventory\StockLedger;
-use App\Services\Notifications\CustomerNotifier;
 use App\Services\Quotations\QuotationWorkflow;
 use App\Services\ResendService;
 use App\Services\Sales\PaymentService;
 use App\Services\Sales\SalesOrderService;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Storage;
@@ -74,6 +74,8 @@ function swQuotation(Team $team, QuotationStatus $status, array $lines, ?string 
         'quotation_date' => now()->toDateString(), 'valid_until' => now()->addDays(15)->toDateString(),
         'subtotal' => $subtotal, 'discount' => 0, 'tax_rate' => 12, 'tax_amount' => round($subtotal * 0.12, 2),
         'grand_total' => round($subtotal * 1.12, 2), 'status' => $status, 'terms_and_conditions' => 'Net 30.',
+        // A priced Draft made by these helpers is already waiting for approval.
+        'submitted_for_approval_at' => $status === QuotationStatus::Draft ? now() : null,
     ]);
     foreach ($lines as [$product, $qty]) {
         $quotation->items()->create([
@@ -89,7 +91,7 @@ function swQuotation(Team $team, QuotationStatus $status, array $lines, ?string 
 /** Approved by an administrator, not sent yet (e.g. approved before the email address was added). */
 function swApproved(Team $team, array $lines, ?string $email = 'buyer@example.com'): Quotation
 {
-    $quotation = swQuotation($team, QuotationStatus::ForApproval, $lines, $email);
+    $quotation = swQuotation($team, QuotationStatus::Draft, $lines, $email);
     $quotation->update(['approved_at' => now(), 'approved_by_id' => User::where('role', 'admin')->value('id')]);
 
     return $quotation->fresh();
@@ -140,18 +142,65 @@ function swEmails(string $type): Collection
 
 // =============================================================================== quotations
 
+it('dates a new quotation itself, stores the fixed terms, and sets Valid Until only on approval', function () {
+    $product = swProduct($this->team, 50, 250);
+    $url = "/{$this->team->slug}/quotations";
+    $line = ['product_id' => $product->id, 'sku' => $product->sku, 'product_name' => $product->name, 'quantity' => 2, 'unit_price' => 250];
+
+    // Dates sent by the browser are ignored; no VAT unless staff enter one.
+    $this->actingAs($this->quoter)->withCookies($this->quoterCookies)->post($url, [
+        'client_name' => 'Metro Builders Inc.', 'email' => 'buyer@example.com',
+        'quotation_date' => '2020-01-01', 'valid_until' => '2020-01-31', 'status' => 'draft',
+        'terms_and_conditions' => 'Anything typed here', 'items' => [$line],
+    ])->assertSessionHasNoErrors();
+
+    $quotation = Quotation::sole();
+    expect($quotation->quotation_date->toDateString())->toBe(now()->toDateString())
+        ->and($quotation->valid_until)->toBeNull()
+        ->and((float) $quotation->tax_rate)->toBe(0.0)
+        ->and((float) $quotation->grand_total)->toBe(500.0)
+        ->and($quotation->terms_and_conditions)->toStartWith("TERMS AND CONDITIONS\n1. 100% ADVANCE PAYMENT")
+        ->and($quotation->terms_and_conditions)->toContain('ACCOUNT NO.: 100952000262')->not->toContain('Anything typed here');
+
+    app(QuotationWorkflow::class)->submitForApproval($quotation, $this->quoter);
+    app(QuotationWorkflow::class)->approve($quotation->fresh(), $this->admin);
+    expect($quotation->fresh()->valid_until->toDateString())->toBe(now()->addDays(3)->toDateString());
+
+    // Editing clears the approval, and with it the validity date, until it is approved again.
+    $this->actingAs($this->quoter)->withCookies($this->quoterCookies)->put("{$url}/{$quotation->id}", [
+        'client_name' => 'Metro Builders Inc.', 'email' => 'buyer@example.com', 'status' => 'draft', 'items' => [$line],
+    ])->assertSessionHasNoErrors();
+    expect($quotation->fresh()->valid_until)->toBeNull()
+        ->and($quotation->fresh()->quotation_date->toDateString())->toBe(now()->toDateString());
+});
+
+it('explains why an unpriced quotation cannot be submitted, and still lets staff reject it', function () {
+    $quotation = swQuotation($this->team, QuotationStatus::Draft, [[swProduct($this->team, 5), 1]]);
+    $quotation->items()->update(['unit_price' => 0, 'product_name' => '4 SIEMENS CONTACTOR 45A']);
+    $quotation->update(['submitted_for_approval_at' => null]); // a fresh Draft, not submitted yet
+    $url = "/{$this->team->slug}/quotations/{$quotation->id}/status";
+    $as = fn () => $this->actingAs($this->quoter)->withCookies($this->quoterCookies);
+
+    $as()->patch($url, ['status' => 'submit_for_approval'])->assertSessionHasErrors('error');
+    expect(session('errors')->first('error'))->toContain('Set a selling price for every line first')->toContain('4 SIEMENS CONTACTOR 45A')
+        ->and($quotation->fresh()->submitted_for_approval_at)->toBeNull();
+
+    $as()->patch($url, ['status' => 'rejected', 'remarks' => 'Customer cancelled'])->assertSessionHasNoErrors()->assertSessionHas('success');
+    expect($quotation->fresh()->status)->toBe(QuotationStatus::Rejected);
+});
+
 it('keeps the supplier cost and supplier of each line when staff prepare a quotation (5)', function () {
     $product = swProduct($this->team, 50, 250);
 
     $this->actingAs($this->quoter)->withCookies($this->quoterCookies)->post("/{$this->team->slug}/quotations", [
         'client_name' => 'Metro Builders Inc.', 'email' => 'buyer@example.com',
         'quotation_date' => now()->toDateString(), 'valid_until' => now()->addDays(10)->toDateString(),
-        'status' => 'preparing',
+        'status' => 'draft',
         'items' => [['product_id' => $product->id, 'sku' => $product->sku, 'product_name' => $product->name, 'quantity' => 4, 'unit_price' => 250]],
     ])->assertSessionHasNoErrors();
 
     $item = Quotation::sole()->items->sole();
-    expect(Quotation::sole()->status)->toBe(QuotationStatus::Preparing)
+    expect(Quotation::sole()->status)->toBe(QuotationStatus::Draft)
         ->and((float) $item->unit_cost)->toBe(150.0)
         ->and($item->supplier_id)->toBe($product->supplier_id);
 
@@ -173,29 +222,31 @@ it('never shows supplier costs on customer documents or emails (6)', function ()
         ->and($email['attachments'])->toHaveCount(1);
 });
 
-it('lets only administrators approve; approving records who and when, and sends the quotation (7, 9)', function () {
-    $quotation = swQuotation($this->team, QuotationStatus::ForApproval, [[swProduct($this->team, 5), 1]]);
+it('lets only administrators approve; approving records who and when, and emails nothing (7, 9)', function () {
+    $quotation = swQuotation($this->team, QuotationStatus::Draft, [[swProduct($this->team, 5), 1]]);
     $url = "/{$this->team->slug}/quotations/{$quotation->id}/approve";
 
     $this->actingAs($this->quoter)->withCookies($this->quoterCookies)->post($url)->assertForbidden();
-    expect($quotation->fresh()->status)->toBe(QuotationStatus::ForApproval)->and(NotificationLog::count())->toBe(0);
+    expect($quotation->fresh()->status)->toBe(QuotationStatus::Draft)->and(NotificationLog::count())->toBe(0);
 
     $this->actingAs($this->admin)->withCookies($this->adminCookies)->post($url)->assertSessionHasNoErrors();
     $quotation->refresh();
-    expect($quotation->status)->toBe(QuotationStatus::Sent)
+    expect($quotation->status)->toBe(QuotationStatus::Draft)
+        ->and($quotation->is_approved)->toBeTrue()
         ->and($quotation->approved_by_id)->toBe($this->admin->id)
         ->and($quotation->approved_at)->not->toBeNull()
-        ->and($quotation->email_status)->toBe(EmailStatus::Sent)
-        ->and(swEmails('quotation_sent'))->toHaveCount(1);
+        ->and(NotificationLog::count())->toBe(0);
 });
 
-it('keeps the approval when the quotation cannot be sent automatically, and sends it later', function () {
-    $quotation = swQuotation($this->team, QuotationStatus::ForApproval, [[swProduct($this->team, 5), 1]], email: null);
+it('refuses to send a quotation without an email address, and sends it once one is added', function () {
+    $quotation = swQuotation($this->team, QuotationStatus::Draft, [[swProduct($this->team, 5), 1]], email: null);
 
     $this->actingAs($this->admin)->withCookies($this->adminCookies)->post("/{$this->team->slug}/quotations/{$quotation->id}/approve")
-        ->assertSessionHas('warning');
+        ->assertSessionHasNoErrors();
+    $this->actingAs($this->quoter)->withCookies($this->quoterCookies)->post("/{$this->team->slug}/quotations/{$quotation->id}/send")
+        ->assertSessionHasErrors('email');
     $quotation->refresh();
-    expect($quotation->status)->toBe(QuotationStatus::ForApproval)
+    expect($quotation->status)->toBe(QuotationStatus::Draft)
         ->and($quotation->is_approved)->toBeTrue()
         ->and(NotificationLog::count())->toBe(0);
 
@@ -205,11 +256,11 @@ it('keeps the approval when the quotation cannot be sent automatically, and send
 });
 
 it('refuses to send a quotation that is not approved (8)', function () {
-    $quotation = swQuotation($this->team, QuotationStatus::ForApproval, [[swProduct($this->team, 5), 1]]);
+    $quotation = swQuotation($this->team, QuotationStatus::Draft, [[swProduct($this->team, 5), 1]]);
 
     $this->actingAs($this->quoter)->withCookies($this->quoterCookies)->post("/{$this->team->slug}/quotations/{$quotation->id}/send")
         ->assertSessionHasErrors(['error' => 'Only approved quotations can be sent to the customer.']);
-    expect($quotation->fresh()->status)->toBe(QuotationStatus::ForApproval)->and(NotificationLog::count())->toBe(0);
+    expect($quotation->fresh()->status)->toBe(QuotationStatus::Draft)->and(NotificationLog::count())->toBe(0);
 });
 
 it('emails an approved quotation with its PDF and records the email status (9)', function () {
@@ -226,14 +277,15 @@ it('emails an approved quotation with its PDF and records the email status (9)',
         ->and(Storage::disk('local')->exists($quotation->sent_pdf_path))->toBeTrue();
 });
 
-it('records a failed quotation email without undoing the sending step (10, 48)', function () {
+it('records a failed quotation email and leaves the quotation approved, not Sent (10, 48)', function () {
     swFailingMailer();
     $quotation = swApproved($this->team, [[swProduct($this->team, 5), 1]]);
 
     app(QuotationWorkflow::class)->send($quotation, $this->quoter);
 
     $quotation->refresh();
-    expect($quotation->status)->toBe(QuotationStatus::Sent)
+    expect($quotation->status)->toBe(QuotationStatus::Draft)
+        ->and($quotation->is_approved)->toBeTrue()
         ->and($quotation->email_status)->toBe(EmailStatus::Failed)
         ->and(swEmails('quotation_sent')->sole()->error)->toContain('Mail server unreachable');
 });
@@ -251,26 +303,16 @@ it('records the customer acceptance or rejection with source and staff (11)', fu
         ->assertSessionHasNoErrors();
 
     $accepted->refresh();
-    expect($accepted->status)->toBe(QuotationStatus::Converted) // the acceptance created the Sales Order
+    expect($accepted->status)->toBe(QuotationStatus::Accepted)
         ->and($accepted->customer_decision_source)->toBe('email')
         ->and($accepted->customer_decision_by_id)->toBe($this->quoter->id)
-        ->and($accepted->sale->status)->toBe(SalesOrderStatus::Pending)
-        ->and($accepted->sale->quotation_id)->toBe($accepted->id)
         ->and($rejected->fresh()->status)->toBe(QuotationStatus::Rejected)
-        ->and(Sale::count())->toBe(1)
-        ->and(swEmails('quotation_accepted'))->toHaveCount(1)
-        ->and(swEmails('sales_order_created'))->toHaveCount(1);
-});
-
-it('keeps the acceptance when the Sales Order cannot be created automatically', function () {
-    $quotation = swQuotation($this->team, QuotationStatus::Sent, [[swProduct($this->team, 5), 1]]);
-    $quotation->items()->delete(); // nothing to order
-
-    $this->actingAs($this->quoter)->withCookies($this->quoterCookies)
-        ->post("/{$this->team->slug}/quotations/{$quotation->id}/decision", ['decision' => 'accepted', 'source' => 'email'])
-        ->assertSessionHas('warning');
-
-    expect($quotation->fresh()->status)->toBe(QuotationStatus::Accepted)->and(Sale::count())->toBe(0);
+        // The acceptance does not create the Sales Order: staff create it in Sales → New Sales Order.
+        ->and($accepted->converted_to_sale_id)->toBeNull()
+        ->and(Sale::count())->toBe(0)
+        // Neither "quotation accepted" nor "sales order created" is emailed (removed 2026-11-09).
+        ->and(swEmails('quotation_accepted'))->toHaveCount(0)
+        ->and(swEmails('sales_order_created'))->toHaveCount(0);
 });
 
 it('converts only accepted quotations (12)', function (QuotationStatus $status) {
@@ -279,7 +321,7 @@ it('converts only accepted quotations (12)', function (QuotationStatus $status) 
     $this->actingAs($this->quoter)->withCookies($this->quoterCookies)->post("/{$this->team->slug}/quotations/{$quotation->id}/convert-to-sale")
         ->assertSessionHasErrors('error');
     expect(Sale::count())->toBe(0);
-})->with([QuotationStatus::ForApproval, QuotationStatus::Sent, QuotationStatus::Rejected, QuotationStatus::Preparing]);
+})->with([QuotationStatus::Draft, QuotationStatus::Sent, QuotationStatus::Rejected]);
 
 it('converts an accepted quotation once into a pending-payment Sales Order with the same details (13, 14, 15, 17)', function () {
     $product = swProduct($this->team, 20, 100);
@@ -301,7 +343,7 @@ it('converts an accepted quotation once into a pending-payment Sales Order with 
         ->and($sale->status)->toBe(SalesOrderStatus::Pending)
         ->and($sale->payment_status)->toBe(PaymentStatus::Unpaid)
         ->and($sale->invoice_number)->toBeNull()
-        ->and($quotation->status)->toBe(QuotationStatus::Converted)
+        ->and($quotation->status)->toBe(QuotationStatus::Accepted)
         ->and($quotation->converted_by_id)->toBe($this->quoter->id)
         // Nothing reserved, nothing taken out, no delivery record yet.
         ->and($product->fresh()->stock)->toBe(20)
@@ -310,19 +352,16 @@ it('converts an accepted quotation once into a pending-payment Sales Order with 
         ->and($sale->fulfillment)->toBeNull();
 });
 
-it('emails the Sales Order with the quotation and order PDFs, once (16)', function () {
+it('does not email the customer when a Sales Order is created (16)', function () {
     $sale = swOrder($this->team, $this->quoter, [[swProduct($this->team, 5), 1]]);
 
-    $log = swEmails('sales_order_created')->sole();
-    $mail = app(CustomerEmails::class)->build('sales_order_created', $sale);
-    expect($log->status)->toBe(EmailStatus::Sent)
-        ->and($log->subject)->toBe("Your Sales Order Has Been Created – {$sale->order_number}")
-        ->and($mail['attachments'])->toHaveCount(2)
-        ->and($mail['html'])->toContain('not confirmed yet');
+    expect(swEmails('sales_order_created'))->toHaveCount(0)
+        ->and(NotificationLog::where('notifiable_type', 'Sale')->where('notifiable_id', $sale->id)->count())->toBe(0);
 
-    // The same event again does not send another email.
-    app(CustomerNotifier::class)->notify('sales_order_created', $sale, "sales_order_created:{$sale->id}");
-    expect(swEmails('sales_order_created'))->toHaveCount(1);
+    // Emails of this type sent before the change can still be shown and resent from the history.
+    $mail = app(CustomerEmails::class)->build('sales_order_created', $sale);
+    expect($mail['subject'])->toBe("Your Sales Order Has Been Created – {$sale->order_number}")
+        ->and($mail['attachments'])->toHaveCount(2);
 });
 
 // ================================================================================= payments
@@ -370,8 +409,8 @@ it('verifies a payment against the actual transaction, issues a receipt and conf
         ->and($sale->confirmed_at)->not->toBeNull()
         ->and(SalesInvoice::where('sale_id', $sale->id)->count())->toBe(1)
         ->and($sale->invoice_number)->toBe(SalesInvoice::sole()->invoice_number)
-        ->and($sale->fulfillment->status)->toBe(DeliveryStatus::OrderConfirmed)
-        ->and($sale->fulfillment->attemptLogs()->sole()->new_status)->toBe('order_confirmed')
+        ->and($sale->fulfillment->status)->toBe(DeliveryStatus::Pending)
+        ->and($sale->fulfillment->attemptLogs()->sole()->new_status)->toBe('pending')
         // Confirmation reserves stock; nothing is taken out yet.
         ->and($sale->items->sole()->reserved_quantity)->toBe(2)
         ->and($product->fresh()->stock)->toBe(10)
@@ -458,23 +497,24 @@ it('confirms an approved credit-term order without marking it paid (29)', functi
         ->and($sale->payment_status)->toBe(PaymentStatus::Unpaid)
         ->and($sale->terms_approved_by_id)->toBe($this->admin->id)
         ->and($sale->credit_due_date?->toDateString())->toBe(now()->addDays(30)->toDateString())
-        ->and($sale->fulfillment->status)->toBe(DeliveryStatus::OrderConfirmed);
+        ->and($sale->fulfillment->status)->toBe(DeliveryStatus::Pending);
 });
 
 // ==================================================================== delivery and inventory
 
 it('never takes stock during quotation creation, approval, sending or conversion (36)', function () {
     $product = swProduct($this->team, 10);
-    $quotation = swQuotation($this->team, QuotationStatus::ForApproval, [[$product, 4]]);
+    $quotation = swQuotation($this->team, QuotationStatus::Draft, [[$product, 4]]);
 
     app(QuotationWorkflow::class)->approve($quotation, $this->admin);
+    app(QuotationWorkflow::class)->send($quotation, $this->admin);
     app(QuotationWorkflow::class)->recordDecision($quotation->fresh(), true, 'email', null, $this->admin);
-    expect($quotation->fresh()->status)->toBe(QuotationStatus::Converted);
+    expect($quotation->fresh()->status)->toBe(QuotationStatus::Accepted);
 
     expect($product->fresh()->stock)->toBe(10)->and($product->fresh()->availableStock())->toBe(10)->and(StockMovement::count())->toBe(0);
 });
 
-it('walks a delivery through preparation, dispatch and delivery, taking stock out once (32, 33, 35, 38)', function () {
+it('walks a delivery through preparation, dispatch and delivery, taking stock out once, on delivery (32, 33, 35, 38)', function () {
     $product = swProduct($this->team, 10);
     $sale = swConfirmed($this->team, $this->admin, [[$product, 4]]);
     $fulfillment = $sale->fulfillment;
@@ -486,12 +526,11 @@ it('walks a delivery through preparation, dispatch and delivery, taking stock ou
     $service->markReady($release, $this->warehouse);
     $fulfillment->update(['handled_by_id' => $this->driver->id]);
 
+    // Preparing and dispatching take nothing out of stock; the 4 stay reserved while on the road.
+    expect($product->fresh()->stock)->toBe(10)->and(StockMovement::count())->toBe(0);
     $this->actingAs($this->driver)->withCookies($this->driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/start")->assertSessionHasNoErrors();
-    expect($product->fresh()->stock)->toBe(6)->and($fulfillment->fresh()->status)->toBe(DeliveryStatus::OutForDelivery);
-
-    // Taking it out again for the same release changes nothing.
-    app(StockLedger::class)->deductForRelease($release->fresh(), $this->admin);
-    expect($product->fresh()->stock)->toBe(6)->and(StockMovement::where('delivery_release_id', $release->id)->count())->toBe(1);
+    expect($product->fresh()->stock)->toBe(10)->and($product->fresh()->availableStock())->toBe(6)
+        ->and($fulfillment->fresh()->status)->toBe(DeliveryStatus::InTransit)->and(StockMovement::count())->toBe(0);
 
     $this->actingAs($this->driver)->withCookies($this->driverCookies)->post("/{$this->team->slug}/deliveries/fulfillments/{$fulfillment->id}/deliver", [
         'proof_of_delivery' => UploadedFile::fake()->image('dr.jpg', 400, 400), 'recipient_name' => 'Site Engr. Lito',
@@ -502,8 +541,14 @@ it('walks a delivery through preparation, dispatch and delivery, taking stock ou
         ->and($line->fresh()->delivered_quantity)->toBe(4)
         ->and($line->fresh()->reserved_quantity)->toBe(0)
         ->and($product->fresh()->stock)->toBe(6)
+        ->and(StockMovement::where('delivery_release_id', $release->id)->sole()->only(['type', 'quantity', 'previous_stock', 'new_stock']))
+        ->toBe(['type' => 'sale_release', 'quantity' => -4, 'previous_stock' => 10, 'new_stock' => 6])
         ->and(NotificationLog::where('type', 'delivery_status')->pluck('context')->pluck('status')->all())
-        ->toBe(['ready_for_delivery', 'out_for_delivery', 'delivered']);
+        ->toBe(['ready_for_delivery', 'in_transit', 'delivered']);
+
+    // Taking it out again for the same release changes nothing.
+    app(StockLedger::class)->deductDelivered($release->fresh(), $this->admin);
+    expect($product->fresh()->stock)->toBe(6)->and(StockMovement::where('delivery_release_id', $release->id)->count())->toBe(1);
 
     // Everything delivered and paid: the order completed itself, and the customer was told.
     expect($sale->fresh()->status)->toBe(SalesOrderStatus::Completed)
@@ -527,7 +572,7 @@ it('tracks partial deliveries over several releases and only completes when noth
     $service->dispatch($first, $this->driver);
     $status = $service->recordReceipt($first, [], 'Site Engr. Lito', null, null, $this->driver);
 
-    expect($status)->toBe(DeliveryStatus::Preparing) // part delivered: back to Preparing, never Delivered
+    expect($status)->toBe(DeliveryStatus::Pending) // part delivered: back to Preparing, never Delivered
         ->and($lines['CB']->fresh()->remaining_quantity)->toBe(10)
         ->and($lines['PVC']->fresh()->remaining_quantity)->toBe(50)
         ->and($lines['WIRE']->fresh()->remaining_quantity)->toBe(0)
@@ -549,7 +594,7 @@ it('tracks partial deliveries over several releases and only completes when noth
         ->and(StockMovement::where('sale_id', $sale->id)->sum('quantity'))->toBe(-170);
 });
 
-it('puts goods that were not received back in stock and holds them for the order (43, 44)', function () {
+it('takes out only what the customer received; the rest stays in stock, held for the order (43, 44)', function () {
     $product = swProduct($this->team, 10);
     $sale = swConfirmed($this->team, $this->admin, [[$product, 5]]);
     $line = $sale->items->sole();
@@ -558,25 +603,82 @@ it('puts goods that were not received back in stock and holds them for the order
     $release = $service->prepareRelease($sale->fulfillment, [$line->id => 5], $this->admin);
     $service->markReady($release, $this->admin);
     $service->dispatch($release, $this->admin);
-    expect($product->fresh()->stock)->toBe(5);
+    expect($product->fresh()->stock)->toBe(10);
 
-    // Customer accepted 3, refused 2: the 2 come back.
+    // Customer accepted 3, refused 2: only 3 leave stock; the 2 stay reserved.
     $service->recordReceipt($release, [$line->id => 3], 'Receiver', null, 'Two damaged boxes refused', $this->admin);
     expect($product->fresh()->stock)->toBe(7)
         ->and($line->fresh()->delivered_quantity)->toBe(3)
+        ->and($line->fresh()->deducted_quantity)->toBe(3)
         ->and($line->fresh()->reserved_quantity)->toBe(2)
         ->and($product->fresh()->availableStock())->toBe(5)
-        ->and($sale->fulfillment->fresh()->status)->toBe(DeliveryStatus::Preparing);
+        ->and($sale->fulfillment->fresh()->status)->toBe(DeliveryStatus::Pending);
 
-    // A whole trip returned.
+    // A whole trip returned: nothing left stock, so nothing comes back.
     $again = $service->prepareRelease($sale->fulfillment->fresh(), [$line->id => 2], $this->admin);
     $service->markReady($again, $this->admin);
     $service->dispatch($again, $this->admin);
     $service->returnRelease($again, 'Site closed', $this->admin);
     expect($product->fresh()->stock)->toBe(7)
+        ->and($line->fresh()->reserved_quantity)->toBe(2)
         ->and($again->fresh()->status)->toBe(DeliveryRelease::RETURNED)
-        ->and($sale->fulfillment->fresh()->status)->toBe(DeliveryStatus::Preparing)
-        ->and(StockMovement::where('type', 'return')->sum('quantity'))->toBe(4);
+        ->and($sale->fulfillment->fresh()->status)->toBe(DeliveryStatus::Pending)
+        ->and(StockMovement::where('type', 'return')->count())->toBe(0)
+        ->and(StockMovement::where('sale_id', $sale->id)->sum('quantity'))->toBe(-3);
+});
+
+it('keeps units on the road reserved when the rest of the order is cancelled', function () {
+    $product = swProduct($this->team, 10);
+    $sale = swConfirmed($this->team, $this->admin, [[$product, 6]]);
+    $line = $sale->items->sole();
+    $service = app(FulfillmentService::class);
+
+    $release = $service->prepareRelease($sale->fulfillment, [$line->id => 4], $this->admin);
+    $service->markReady($release, $this->admin);
+    $service->dispatch($release, $this->admin);
+
+    // The 2 not on the truck are cancelled: only they are freed.
+    app(SalesOrderService::class)->cancelRemaining($sale->fresh(), null, 'Customer reduced the order', $this->admin);
+    expect($line->fresh()->reserved_quantity)->toBe(4)->and($product->fresh()->availableStock())->toBe(6)->and($product->fresh()->stock)->toBe(10);
+
+    $service->recordReceipt($release->fresh(), [], 'Receiver', null, null, $this->admin);
+    expect($product->fresh()->stock)->toBe(6)->and($line->fresh()->reserved_quantity)->toBe(0)->and($product->fresh()->availableStock())->toBe(6);
+});
+
+it('never lets a manual Stock Out take units reserved for a sales order', function () {
+    $product = swProduct($this->team, 10);
+    swConfirmed($this->team, $this->admin, [[$product, 8]]);
+    $url = "/{$this->team->slug}/inventory/stock-out";
+    $as = fn () => $this->actingAs($this->admin)->withCookies($this->adminCookies);
+
+    $as()->post($url, ['product_id' => $product->id, 'quantity' => 3, 'reason' => 'Damaged / Write-off'])->assertSessionHasErrors('quantity');
+    $as()->post($url, ['product_id' => $product->id, 'quantity' => 2, 'reason' => 'Damaged / Write-off'])->assertSessionHasNoErrors();
+    expect($product->fresh()->stock)->toBe(8)->and($product->fresh()->availableStock())->toBe(0);
+});
+
+it('settles a release dispatched under the old rule (stock taken at dispatch) without double counting', function () {
+    $product = swProduct($this->team, 10);
+    $sale = swConfirmed($this->team, $this->admin, [[$product, 5]]);
+    $line = $sale->items->sole();
+    $service = app(FulfillmentService::class);
+    $release = $service->prepareRelease($sale->fulfillment, [$line->id => 5], $this->admin);
+    $service->markReady($release, $this->admin);
+    $service->dispatch($release, $this->admin);
+
+    // As the old code left it: 5 already taken out at dispatch.
+    $item = $release->items()->sole();
+    $item->update(['deducted_quantity' => 5]);
+    $line->fresh()->forceFill(['deducted_quantity' => 5, 'reserved_quantity' => 0])->save();
+    $product->update(['stock' => 5]);
+    StockMovement::create(['team_id' => $this->team->id, 'product_id' => $product->id, 'sale_id' => $sale->id, 'delivery_release_id' => $release->id,
+        'movement_key' => "release:{$release->id}:item:{$item->id}:out", 'type' => 'sale_release', 'quantity' => -5, 'previous_stock' => 10, 'new_stock' => 5, 'movement_date' => now()]);
+
+    // Customer received 3: the 2 not received go back; nothing is taken out twice.
+    $service->recordReceipt($release->fresh(), [$line->id => 3], 'Receiver', null, null, $this->admin);
+    expect($product->fresh()->stock)->toBe(7)
+        ->and($line->fresh()->deducted_quantity)->toBe(3)
+        ->and($line->fresh()->reserved_quantity)->toBe(2)
+        ->and(StockMovement::where('sale_id', $sale->id)->sum('quantity'))->toBe(-3);
 });
 
 it('enforces the 3-attempt limit until an administrator reschedules (32)', function () {
@@ -593,14 +695,16 @@ it('enforces the 3-attempt limit until an administrator reschedules (32)', funct
             $service->retryDispatch($fulfillment->fresh(), $this->admin);
         }
     }
-    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::DeliveryAttemptFailed)
+    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::ReadyForDelivery)
         ->and(fn () => $service->retryDispatch($fulfillment->fresh(), $this->admin))->toThrow(WorkflowException::class, '3-attempt limit');
 
     $service->reschedule($fulfillment->fresh(), now()->addDay()->toDateTimeString(), true, 'Customer asked for Monday', null, $this->admin);
     expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::ReadyForDelivery);
     $service->retryDispatch($fulfillment->fresh(), $this->admin);
-    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::OutForDelivery)->and($fulfillment->fresh()->attempt_count)->toBe(0)
-        ->and(NotificationLog::where('type', 'delivery_status')->get()->pluck('context.status')->filter(fn ($s) => $s === 'delivery_attempt_failed')->count())->toBe(3);
+    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::InTransit)->and($fulfillment->fresh()->attempt_count)->toBe(0)
+        // Ready (1), rescheduled (1), and each failed attempt (3), which is emailed as "could not deliver".
+        ->and(NotificationLog::where('type', 'delivery_status')->get()->pluck('context')->filter(fn ($c) => $c['status'] === 'ready_for_delivery')->count())->toBe(5)
+        ->and(NotificationLog::where('type', 'delivery_status')->get()->pluck('context')->filter(fn ($c) => ! empty($c['attempt_failed']))->count())->toBe(3);
 });
 
 it('prevents overselling between orders through reservations (37)', function () {
@@ -709,7 +813,7 @@ it('keeps the order saved when its emails fail (48)', function () {
     $sale = swConfirmed($this->team, $this->admin, [[swProduct($this->team, 10), 1]]);
 
     expect($sale->status)->toBe(SalesOrderStatus::Confirmed)
-        ->and(NotificationLog::where('status', 'failed')->count())->toBeGreaterThanOrEqual(3)
+        ->and(NotificationLog::where('status', 'failed')->count())->toBeGreaterThanOrEqual(2) // payment received, order confirmed
         ->and(Payment::sole()->status)->toBe(PaymentRecordStatus::Verified);
 });
 
@@ -728,27 +832,6 @@ it('keeps sales and payment actions away from other modules (49)', function () {
     $this->post("/{$this->team->slug}/sales/{$sale->id}/payments", [])->assertRedirect();
 });
 
-it('records counter sales as paid, confirmed and handed over, without double stock deduction', function () {
-    $product = swProduct($this->team, 10, 100);
-
-    $this->actingAs($this->sales)->withCookies($this->salesCookies)->post("/{$this->team->slug}/sales", [
-        'customer' => 'Walk-in Juan', 'payment_method' => 'GCash', 'payment_reference' => 'GC-COUNTER-1',
-        'amount_paid' => 300, 'payment_date' => now()->toDateString(),
-        'items' => [['product_id' => $product->id, 'qty' => 3]],
-    ])->assertSessionHasNoErrors();
-
-    $sale = Sale::with('items', 'fulfillment')->sole();
-    expect($sale->channel)->toBe(Sale::CHANNEL_COUNTER)
-        ->and($sale->status)->toBe(SalesOrderStatus::Completed)
-        ->and($sale->payment_status)->toBe(PaymentStatus::Paid)
-        ->and($sale->invoice_number)->toStartWith('SI-')
-        ->and($sale->fulfillment->status)->toBe(DeliveryStatus::Delivered)
-        ->and($product->fresh()->stock)->toBe(7)
-        ->and(StockMovement::count())->toBe(1)
-        ->and(PaymentReceipt::count())->toBe(1)
-        ->and(NotificationLog::count())->toBe(0); // walk-in: no customer emails
-});
-
 // ======================================================================= pages render
 
 it('renders the quotation, sales order and delivery pages with workflow data', function () {
@@ -759,7 +842,7 @@ it('renders the quotation, sales order and delivery pages with workflow data', f
     $service->markReady($release, $this->admin);
     $service->dispatch($release, $this->admin);
     $service->recordReceipt($release, [], 'Receiver', null, null, $this->admin);
-    swQuotation($this->team, QuotationStatus::ForApproval, [[$product, 1]]);
+    swQuotation($this->team, QuotationStatus::Draft, [[$product, 1]]);
     $slug = $this->team->slug;
 
     $this->actingAs($this->admin)->withCookies($this->adminCookies)->get("/{$slug}/quotations")->assertOk()
@@ -769,7 +852,7 @@ it('renders the quotation, sales order and delivery pages with workflow data', f
             ->where('quotations.data.0.allowed_actions', fn ($actions) => collect($actions)->contains('approve')));
 
     $this->actingAs($this->sales)->withCookies($this->salesCookies)->get("/{$slug}/sales?status=processing")->assertOk()
-        ->assertInertia(fn ($page) => $page->component('Sales/Index')->has('sales.data', 1)->where('sales.data.0.delivery_status_label', 'Preparing'));
+        ->assertInertia(fn ($page) => $page->component('Sales/Index')->has('sales.data', 1)->where('sales.data.0.delivery_status_label', 'Pending'));
 
     $this->actingAs($this->sales)->withCookies($this->salesCookies)->get("/{$slug}/sales/{$sale->id}")->assertOk()
         ->assertInertia(fn ($page) => $page->component('Sales/Show')
@@ -780,7 +863,7 @@ it('renders the quotation, sales order and delivery pages with workflow data', f
 
     $this->actingAs($this->admin)->withCookies($this->adminCookies)->get("/{$slug}/deliveries")->assertOk()
         ->assertInertia(fn ($page) => $page->component('Deliveries/Index')
-            ->where('outboundDeliveries.data.0.status', 'preparing')
+            ->where('outboundDeliveries.data.0.status', 'pending')
             ->where('outboundDeliveries.data.0.allowed_actions', fn ($a) => collect($a)->contains('prepare')));
 
     foreach (["/{$slug}/sales/{$sale->id}/pdf", "/{$slug}/sales/{$sale->id}/invoices/".SalesInvoice::sole()->id.'/pdf', "/{$slug}/sales/{$sale->id}/receipts/".PaymentReceipt::sole()->id.'/pdf', "/{$slug}/deliveries/releases/{$release->id}/pdf"] as $url) {
@@ -809,10 +892,11 @@ it('lets the assigned delivery staff and admins move a delivery through Update s
     // Warehouse staff cannot dispatch (not the driver); the assigned driver can.
     $this->actingAs($this->warehouse)->withCookies($this->warehouseCookies)->post($url, ['action' => 'dispatch'])->assertForbidden();
     $this->actingAs($this->driver)->withCookies($this->driverCookies)->post($url, ['action' => 'dispatch'])->assertSessionHasNoErrors();
-    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::OutForDelivery)->and($product->fresh()->stock)->toBe(8);
+    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::InTransit)->and($product->fresh()->stock)->toBe(10);
 
+    // A failed attempt changes no stock.
     $this->actingAs($this->driver)->withCookies($this->driverCookies)->post($url, ['action' => 'attempt', 'reason' => 'Customer unavailable', 'remarks' => 'Gate closed'])->assertSessionHasNoErrors();
-    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::DeliveryAttemptFailed);
+    expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::ReadyForDelivery)->and($product->fresh()->stock)->toBe(10);
 
     // Only an admin reschedules.
     $this->actingAs($this->driver)->withCookies($this->driverCookies)->post($url, ['action' => 'reschedule', 'delivery_schedule' => now()->addDay()->toDateTimeString()])->assertForbidden();
@@ -826,6 +910,7 @@ it('lets the assigned delivery staff and admins move a delivery through Update s
 
     expect($fulfillment->fresh()->status)->toBe(DeliveryStatus::Delivered)
         ->and($sale->fresh()->status)->toBe(SalesOrderStatus::Completed)
+        ->and($product->fresh()->stock)->toBe(8)
         // A status that does not apply any more is refused.
         ->and($this->actingAs($this->admin)->withCookies($this->adminCookies)->post($url, ['action' => 'dispatch'])->status())->toBe(403);
 });
@@ -851,4 +936,43 @@ it('keeps the order status while it is on hold, and holds back confirmation and 
 
     app(SalesOrderService::class)->resume($sale->fresh(), $this->admin);
     expect($sale->fresh()->status)->toBe(SalesOrderStatus::Confirmed)->and($sale->fresh()->is_on_hold)->toBeFalse();
+});
+
+// ================================================================= no duplicate records
+
+it('keeps one delivery record per Sales Order, even if confirmation runs again', function () {
+    $sale = swConfirmed($this->team, $this->admin, [[swProduct($this->team, 10), 2]]);
+
+    app(SalesOrderService::class)->confirm($sale->fresh(), $this->admin);
+    app(FulfillmentService::class)->initialize($sale->fresh(), $this->admin);
+
+    expect($sale->fresh()->status)->toBe(SalesOrderStatus::Confirmed)
+        ->and($sale->fulfillment()->count())->toBe(1)
+        ->and($sale->fulfillment->status)->toBe(DeliveryStatus::Pending)
+        ->and($sale->fulfillment->attemptLogs()->count())->toBe(1);
+});
+
+it('lets the database refuse a second Sales Order for a quotation and a second delivery record for an order', function () {
+    $sale = swConfirmed($this->team, $this->admin, [[swProduct($this->team, 10), 1]]);
+
+    expect(fn () => Sale::create($sale->replicate(['order_number'])->toArray() + ['order_number' => 'SO-DUP']))->toThrow(UniqueConstraintViolationException::class)
+        ->and(fn () => $sale->fulfillment->replicate(['fulfillment_number'])->fill(['fulfillment_number' => 'FUL-DUP'])->save())->toThrow(UniqueConstraintViolationException::class);
+});
+
+it('needs a fresh approval after an approved Draft is edited', function () {
+    $product = swProduct($this->team, 10);
+    $quotation = swQuotation($this->team, QuotationStatus::Draft, [[$product, 1]], email: null);
+    app(QuotationWorkflow::class)->approve($quotation, $this->admin);
+    expect($quotation->fresh()->approved_at)->not->toBeNull();
+
+    $this->actingAs($this->admin)->withCookies($this->adminCookies)->put("/{$this->team->slug}/quotations/{$quotation->id}", [
+        'client_name' => 'Metro Builders Inc.', 'quotation_date' => now()->toDateString(), 'valid_until' => now()->addDays(10)->toDateString(),
+        'status' => 'submit_for_approval',
+        'items' => [['product_id' => $product->id, 'sku' => $product->sku, 'product_name' => $product->name, 'quantity' => 2, 'unit_price' => 300]],
+    ])->assertSessionHasNoErrors();
+
+    $quotation->refresh();
+    expect($quotation->status)->toBe(QuotationStatus::Draft)
+        ->and($quotation->approved_at)->toBeNull()
+        ->and($quotation->submitted_for_approval_at)->not->toBeNull();
 });

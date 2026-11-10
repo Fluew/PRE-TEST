@@ -8,6 +8,7 @@ use App\Exceptions\WorkflowException;
 use App\Models\Delivery;
 use App\Models\DeliveryAttemptLog;
 use App\Models\DeliveryRelease;
+use App\Models\InboundDelivery;
 use App\Models\OrderFulfillment;
 use App\Models\Product;
 use App\Models\PurchaseOrder;
@@ -17,9 +18,10 @@ use App\Models\User;
 use App\Services\AuditLogger;
 use App\Services\Delivery\FulfillmentService;
 use App\Services\Documents\DocumentPdf;
+use App\Services\Procurement\InboundReceiving;
 use App\Services\Procurement\ProcurementWorkflow;
 use App\Services\Sales\SalesOrderService;
-use Carbon\Carbon;
+use App\Support\DateNormalizer;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -52,6 +54,7 @@ class DeliveryController extends Controller
         // ---------------------------------------------------------
         $outboundQuery = OrderFulfillment::where('team_id', $team->id)
             ->with([
+                'team:id,slug', // proof_url needs the team slug on every row
                 'sale:id,order_number,invoice_number,client_name,grand_total,sale_date,status,channel,fulfillment_type,hold_reason',
                 'sale.items:id,sale_id,sku,product_name,quantity,unit_price,reserved_quantity,deducted_quantity,released_quantity,delivered_quantity,cancelled_quantity',
                 'releases.items.saleItem:id,sku,product_name',
@@ -104,18 +107,17 @@ class DeliveryController extends Controller
         // Outbound Metrics - computed in a single aggregate query
         $toPrepareList = "'".implode("','", self::STATUS_GROUPS['to_prepare'])."'";
         $deliveredList = "'".implode("','", self::STATUS_GROUPS['delivered'])."'";
-        $problemsList = "'".implode("','", self::STATUS_GROUPS['problems'])."'";
         $maxAttempts = OrderFulfillment::MAX_ATTEMPTS;
 
         $metricsRow = OrderFulfillment::where('team_id', $team->id)
             ->when($isDeliveryStaff, fn ($q) => $q->where('handled_by_id', $user->id))
             ->selectRaw("
                 COUNT(*) as total_assigned,
-                SUM(CASE WHEN status IN ({$toPrepareList}) THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN status = 'out_for_delivery' THEN 1 ELSE 0 END) as in_transit,
+                SUM(CASE WHEN status IN ({$toPrepareList}) AND attempt_count = 0 THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN status = 'in_transit' THEN 1 ELSE 0 END) as in_transit,
                 SUM(CASE WHEN status IN ({$deliveredList}) THEN 1 ELSE 0 END) as delivered,
-                SUM(CASE WHEN status IN ({$problemsList}) THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN status = 'out_for_delivery' AND attempt_count < {$maxAttempts} THEN 1 ELSE 0 END) as attempts_remaining
+                SUM(CASE WHEN status = 'ready_for_delivery' AND attempt_count > 0 THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN status = 'in_transit' AND attempt_count < {$maxAttempts} THEN 1 ELSE 0 END) as attempts_remaining
             ")
             ->first();
 
@@ -131,7 +133,11 @@ class DeliveryController extends Controller
         $outboundDeliveries->getCollection()->each(function (OrderFulfillment $f) use ($user) {
             $f->setAttribute('allowed_actions', $this->allowedActions($f, $user));
             $f->setAttribute('status_choices', $this->statusChoices($f, $user));
-            $f->setAttribute('open_release', $f->releases->first(fn ($r) => in_array($r->status, DeliveryRelease::OPEN, true)));
+            $open = $f->releases->first(fn ($r) => in_array($r->status, DeliveryRelease::OPEN, true));
+            $f->setAttribute('open_release', $open);
+            $f->setAttribute('needs_reschedule', $f->needsReschedule($open));
+            // Delete button state (admins only; the server checks again on delete).
+            $f->setAttribute('delete_blocked_reason', $user->isAdmin() ? self::fulfillmentDeleteBlockedReason($f) : null);
         });
         // Available Delivery Staff list (for Admin assignment dropdown)
         $deliveryStaffList = [];
@@ -157,21 +163,21 @@ class DeliveryController extends Controller
         $purchaseOrders = [];
 
         if (! $isDeliveryStaff) {
-            $inboundQuery = Delivery::where('team_id', $team->id)
-                ->with([
-                    'supplier:id,name',
-                    'purchaseOrder:id,po_number,promised_delivery_date,quantity,status',
-                    'receivedBy:id,name',
-                    'inspectedBy:id,name',
-                    'postedBy:id,name',
-                    'invoices:id,delivery_id,invoice_number,status',
-                ]);
+            // One row per delivery record (Delivery Date, Delivery #); its products are opened with View.
+            $inboundQuery = InboundDelivery::where('team_id', $team->id)
+                ->whereHas('items')
+                ->with(['supplier:id,name', 'confirmedBy:id,name'])
+                ->withCount('items')
+                ->withSum(['items as received_total' => fn ($q) => $q->where(fn ($w) => $w->whereNull('status')->orWhere('status', '!=', 'Cancelled'))], 'quantity')
+                ->withSum('items as accepted_total', 'accepted_quantity')
+                ->withSum('items as rejected_total', 'rejected_quantity')
+                ->withCount(['items as uninspected_count' => fn ($q) => $q->whereNull('inspection_result')]);
 
             if ($search && $activeTab === 'inbound') {
                 $inboundQuery->where(function ($q) use ($search) {
                     $q->where('delivery_number', 'like', "%{$search}%")
                         ->orWhere('purchase_order_number', 'like', "%{$search}%")
-                        ->orWhere('description', 'like', "%{$search}%")
+                        ->orWhereHas('items', fn ($iq) => $iq->where('description', 'like', "%{$search}%"))
                         ->orWhereHas('supplier', fn ($sq) => $sq->where('name', 'like', "%{$search}%"));
                 });
             }
@@ -184,14 +190,24 @@ class DeliveryController extends Controller
             }
 
             $inboundDeliveries = $inboundQuery->latest('delivery_date')->latest('id')->paginate(15, ['*'], 'inbound_page')->withQueryString();
-            $inboundDeliveries->getCollection()->each(fn (Delivery $d) => $d->setAttribute('inspection_status', $d->inspectionStatus()));
+            $inboundDeliveries->getCollection()->each(function (InboundDelivery $d) {
+                $d->setAttribute('quality_status', match (true) {
+                    $d->isCancelled() => 'Cancelled',
+                    (int) $d->uninspected_count > 0 => 'Pending Inspection',
+                    (int) $d->rejected_total === 0 => 'Passed',
+                    (int) $d->accepted_total === 0 => 'Failed',
+                    default => 'Partially Passed',
+                });
+            });
 
-            $inboundRow = Delivery::where('team_id', $team->id)
+            $inboundRow = InboundDelivery::where('inbound_deliveries.team_id', $team->id)->where('inbound_deliveries.status', InboundDelivery::CONFIRMED)
+                ->join('deliveries', 'deliveries.inbound_delivery_id', '=', 'inbound_deliveries.id')
+                ->whereNull('deliveries.deleted_at')
                 ->selectRaw("
-                    COUNT(*) as total_deliveries,
-                    COALESCE(SUM(quantity), 0) as total_qty,
-                    COUNT(DISTINCT CASE WHEN purchase_order_number IS NOT NULL AND purchase_order_number != '' THEN purchase_order_number END) as linked_pos,
-                    SUM(CASE WHEN status = 'Delivered' THEN 1 ELSE 0 END) as delivered_count
+                    COUNT(DISTINCT inbound_deliveries.id) as total_deliveries,
+                    COALESCE(SUM(deliveries.quantity), 0) as total_qty,
+                    COUNT(DISTINCT CASE WHEN inbound_deliveries.purchase_order_number IS NOT NULL AND inbound_deliveries.purchase_order_number != '' THEN inbound_deliveries.purchase_order_number END) as linked_pos,
+                    COUNT(DISTINCT CASE WHEN deliveries.inspection_result IS NOT NULL THEN inbound_deliveries.id END) as delivered_count
                 ")
                 ->first();
 
@@ -202,10 +218,10 @@ class DeliveryController extends Controller
                 'deliveredCount' => (int) ($inboundRow->delivered_count ?? 0),
             ];
 
+            // For linking a received product that is not in inventory yet (incomplete products included).
             $products = Product::where('team_id', $team->id)
-                ->where('is_active', true)
                 ->orderBy('name')
-                ->get(['id', 'name', 'sku', 'cost_price', 'stock']);
+                ->get(['id', 'name', 'sku', 'cost_price', 'stock', 'unit', 'is_active']);
 
             $suppliers = Supplier::where('team_id', $team->id)
                 ->where('status', 'Active')
@@ -236,6 +252,9 @@ class DeliveryController extends Controller
             'products' => $products,
             'suppliers' => $suppliers,
             'purchaseOrders' => $purchaseOrders,
+            // "Record Inbound P.O. Delivery": orders with goods still owed, grouped by PO number.
+            'receivableOrders' => fn () => $isDeliveryStaff ? [] : app(InboundReceiving::class)->receivableOrders($team->id),
+            'productCategories' => fn () => $isDeliveryStaff ? [] : Product::where('team_id', $team->id)->whereNotNull('category')->distinct()->orderBy('category')->pluck('category'),
             'filters' => [
                 'tab' => $activeTab,
                 'search' => $search,
@@ -249,22 +268,21 @@ class DeliveryController extends Controller
 
     /** Delivery status filters on the page → status codes. */
     private const STATUS_GROUPS = [
-        'to_prepare' => ['order_confirmed', 'preparing', 'ready_for_delivery'],
-        'problems' => ['delivery_attempt_failed'],
+        'to_prepare' => ['pending', 'ready_for_delivery'],
         'delivered' => ['delivered'],
     ];
 
     /** What each "Update status" choice does, the status it leads to, and what it asks for. */
     private const STATUS_CHOICES = [
-        'prepare' => ['status' => 'preparing', 'label' => 'Preparing: start preparing the items', 'needs' => 'quantities'],
+        'prepare' => ['status' => 'pending', 'label' => 'Pending: start preparing the items', 'needs' => 'quantities'],
         'ready' => ['status' => 'ready_for_delivery', 'label' => 'Ready for Delivery', 'needs' => null],
-        'dispatch' => ['status' => 'out_for_delivery', 'label' => 'Out for Delivery', 'needs' => null],
-        'retry' => ['status' => 'out_for_delivery', 'label' => 'Out for Delivery: try again', 'needs' => null],
+        'dispatch' => ['status' => 'in_transit', 'label' => 'In Transit', 'needs' => null],
+        'retry' => ['status' => 'in_transit', 'label' => 'In Transit: try again', 'needs' => null],
         'deliver' => ['status' => 'delivered', 'label' => 'Delivered (customer received it)', 'needs' => 'receipt'],
         'handover' => ['status' => 'delivered', 'label' => 'Delivered (customer picked it up)', 'needs' => 'receipt'],
-        'attempt' => ['status' => 'delivery_attempt_failed', 'label' => 'Delivery Attempt Failed', 'needs' => 'attempt'],
+        'attempt' => ['status' => 'ready_for_delivery', 'label' => 'Ready for Delivery: delivery attempt failed', 'needs' => 'attempt'],
         'reschedule' => ['status' => 'ready_for_delivery', 'label' => 'Ready for Delivery: new delivery date', 'needs' => 'schedule'],
-        'return' => ['status' => 'preparing', 'label' => 'Preparing: the goods came back to the warehouse', 'needs' => 'reason'],
+        'return' => ['status' => 'pending', 'label' => 'Pending: the goods came back to the warehouse', 'needs' => 'reason'],
         'cancel_release' => ['status' => null, 'label' => 'Undo: cancel the release being prepared', 'needs' => 'reason'],
         'cancel_delivery' => ['status' => 'cancelled', 'label' => 'Cancelled: stop delivering what is left', 'needs' => 'reason'],
     ];
@@ -523,7 +541,7 @@ class DeliveryController extends Controller
         $orderOpen = in_array($f->sale?->status, [SalesOrderStatus::Confirmed, SalesOrderStatus::Processing], true);
         $actions = [];
 
-        if ($warehouse && $orderOpen && ! $open && $status->canMoveTo(DeliveryStatus::Preparing, $pickup)) {
+        if ($warehouse && $orderOpen && ! $open && $status === DeliveryStatus::Pending) {
             $actions[] = 'prepare';
         }
         if ($warehouse && $open?->status === DeliveryRelease::PREPARING) {
@@ -538,25 +556,25 @@ class DeliveryController extends Controller
         if ($pickup && $warehouse && $open?->status === DeliveryRelease::READY) {
             $actions[] = 'handover';
         }
-        if (! $pickup && $driver && $status === DeliveryStatus::OutForDelivery) {
+        if (! $pickup && $driver && $status === DeliveryStatus::InTransit) {
             $actions[] = 'deliver';
             if ($f->attempt_count < OrderFulfillment::MAX_ATTEMPTS) {
                 $actions[] = 'attempt';
             }
         }
-        $onTruck = $open?->status === DeliveryRelease::DISPATCHED;
-        $rescheduled = $status === DeliveryStatus::ReadyForDelivery && $onTruck;
-        if (! $pickup && $driver && (($status === DeliveryStatus::DeliveryAttemptFailed && $f->attempt_count < OrderFulfillment::MAX_ATTEMPTS) || $rescheduled)) {
+        // Goods still on the truck while Ready for Delivery: after a failed attempt or a reschedule.
+        $onTruck = $f->goodsOnTruck($open);
+        if (! $pickup && $driver && $status === DeliveryStatus::ReadyForDelivery && $onTruck && ! $f->needsReschedule($open)) {
             $actions[] = 'retry';
         }
-        if (! $pickup && $driver && $onTruck && $status !== DeliveryStatus::OutForDelivery) {
+        if (! $pickup && $driver && $onTruck && $status !== DeliveryStatus::InTransit) {
             $actions[] = 'return';
         }
-        if ($user->isAdmin() && $status === DeliveryStatus::DeliveryAttemptFailed) {
+        if ($user->isAdmin() && $f->awaitingRedelivery($open)) {
             $actions[] = 'reschedule';
         }
         $owed = $f->sale?->items?->contains(fn ($l) => $l->releasable_quantity > 0) ?? false;
-        if ($user->isAdmin() && $orderOpen && ! $open && $owed && in_array($status, [DeliveryStatus::OrderConfirmed, DeliveryStatus::Preparing], true)) {
+        if ($user->isAdmin() && $orderOpen && ! $open && $owed && $status === DeliveryStatus::Pending) {
             $actions[] = 'cancel_delivery';
         }
         if ($user->isAdmin() && ! $status->isFinal()) {
@@ -703,13 +721,78 @@ class DeliveryController extends Controller
      */
     public function destroy(Request $request, mixed $current_team = null, mixed $delivery = null): RedirectResponse
     {
+        abort_unless($request->user()?->isAdmin(), 403, 'Only administrators can delete records.');
+        if ($request->has('confirmation')) {
+            $request->validate(['confirmation' => ['required', 'string', Rule::in(['YES'])]]);
+        }
         $delivery = $this->resolveDelivery($delivery, $current_team, $request);
         $team = $this->getTeam($request, $current_team);
         abort_if(! $team || $delivery->team_id !== $team->id, 403);
 
+        if ($delivery->posted_at !== null) {
+            return back()->withErrors(['delivery' => 'Deliveries whose accepted units have already been posted to inventory cannot be deleted.']);
+        }
+
         $delivery->delete();
 
         return back()->with('success', 'Delivery record deleted successfully.');
+    }
+
+    /**
+     * Archive (soft delete) a customer delivery record. Admin only: the route also has the
+     * `admin_delete` middleware. The record goes to the Recycle Bin, where an Admin can restore it.
+     */
+    public function destroyFulfillment(Request $request, mixed $current_team = null, mixed $fulfillment = null): RedirectResponse
+    {
+        $user = $request->user();
+        abort_unless($user?->isAdmin(), 403, 'Only administrators can delete records.');
+        $request->validate(['confirmation' => ['sometimes', 'required', 'string', Rule::in(['YES'])]]);
+
+        $fulfillment = $this->authorizedFulfillment($request, $fulfillment, $current_team);
+        $fulfillment->loadMissing('releases');
+
+        if ($reason = $this->fulfillmentDeleteBlockedReason($fulfillment)) {
+            return back()->with('error', "Delivery {$fulfillment->fulfillment_number} cannot be deleted: {$reason}");
+        }
+
+        $fulfillment->delete();
+
+        AuditLogger::audit(
+            'delivery.customer_delivery_deleted',
+            "Moved customer delivery {$fulfillment->fulfillment_number} to the Recycle Bin.",
+            $user,
+            null,
+            [
+                'order_fulfillment_id' => $fulfillment->id,
+                'fulfillment_number' => $fulfillment->fulfillment_number,
+                'sale_id' => $fulfillment->sale_id,
+                'status' => $fulfillment->status?->value,
+                'deleted_at' => $fulfillment->deleted_at?->toIso8601String(),
+            ],
+            'success',
+            $request
+        );
+
+        return back()->with('success', "Delivery {$fulfillment->fulfillment_number} was moved to the Recycle Bin.");
+    }
+
+    /**
+     * Why a customer delivery must not be deleted yet, or null if it can be.
+     *
+     * Only finished deliveries (delivered or cancelled, with no trip being prepared or on the road)
+     * can be archived, so an order is never left without its delivery record mid-workflow.
+     */
+    public static function fulfillmentDeleteBlockedReason(OrderFulfillment $fulfillment): ?string
+    {
+        if (! in_array($fulfillment->status, [DeliveryStatus::Delivered, DeliveryStatus::Cancelled], true)) {
+            return 'only delivered or cancelled deliveries can be deleted.';
+        }
+
+        if ($fulfillment->releases->contains(fn ($r) => in_array($r->status, DeliveryRelease::OPEN, true))) {
+            return 'a release is still being prepared or is on the road.';
+        }
+
+        return null;
     }
 
     /**
@@ -806,20 +889,15 @@ class DeliveryController extends Controller
             $parsedDate = null;
             $displayDate = $rawDate;
 
-            if ($rawDate === '') {
+            // Like the other CSV templates, the DATE column is MONTH-DAY-YEAR; that order settles
+            // ambiguous dates, and invalid dates (13-40-2026) are rejected instead of being saved.
+            $date = DateNormalizer::parse($rawDate, DateNormalizer::MDY);
+            if ($date['status'] === DateNormalizer::EMPTY) {
                 $errors[] = 'Date is required.';
+            } elseif ($date['value'] === null) {
+                $errors[] = $date['problem'];
             } else {
-                if (preg_match('/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/', $rawDate, $m)) {
-                    $parsedDate = sprintf('%04d-%02d-%02d', $m[3], $m[1], $m[2]);
-                } elseif (preg_match('/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/', $rawDate, $m)) {
-                    $parsedDate = sprintf('%04d-%02d-%02d', $m[1], $m[2], $m[3]);
-                } else {
-                    try {
-                        $parsedDate = Carbon::parse($rawDate)->toDateString();
-                    } catch (\Exception $e) {
-                        $errors[] = "Invalid date format '{$rawDate}'.";
-                    }
-                }
+                $parsedDate = $date['value'];
             }
 
             $delNumber = $delNumIdx !== -1 && isset($row[$delNumIdx]) ? trim($row[$delNumIdx]) : '';
@@ -856,6 +934,7 @@ class DeliveryController extends Controller
                 $validRows[] = [
                     'row' => $rowNumber,
                     'delivery_date' => $parsedDate,
+                    'original_date' => $rawDate,
                     'delivery_number' => $delNumber,
                     'purchase_order_number' => $poNumber,
                     'quantity' => $qty,

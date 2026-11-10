@@ -21,7 +21,7 @@ const pctOrDash = (v: number | null | undefined) => (v != null ? `${Number(v).to
             <div><dt class="text-xs text-gray-500">Completed deliveries</dt><dd class="font-mono">{{ c('delivery')?.inputs?.completed_deliveries ?? 0 }}</dd></div>
             <div><dt class="text-xs text-gray-500">On-time rate</dt><dd class="font-mono">{{ pctOrDash(c('delivery')?.inputs?.on_time_rate) }}</dd></div>
             <div><dt class="text-xs text-gray-500">Quantity fulfillment</dt><dd class="font-mono">{{ pctOrDash(c('delivery')?.inputs?.fulfillment_rate) }}</dd></div>
-            <div><dt class="text-xs text-gray-500">Comparable quotes</dt><dd class="font-mono">{{ c('price')?.inputs?.comparisons?.length ?? 0 }}</dd></div>
+            <div><dt class="text-xs text-gray-500">Comparable purchased products</dt><dd class="font-mono">{{ c('price')?.inputs?.comparisons?.length ?? 0 }}</dd></div>
             <div><dt class="text-xs text-gray-500">Accepted units</dt><dd class="font-mono">{{ c('quality')?.inputs?.accepted ?? 0 }}</dd></div>
             <div><dt class="text-xs text-gray-500">Rejected units</dt><dd class="font-mono">{{ c('quality')?.inputs?.rejected ?? 0 }}</dd></div>
             <div><dt class="text-xs text-gray-500">Quality acceptance</dt><dd class="font-mono">{{ c('quality')?.available ? pctOrDash(c('quality')!.score) : '—' }}</dd></div>
@@ -42,11 +42,13 @@ const pctOrDash = (v: number | null | undefined) => (v != null ? `${Number(v).to
                     </table>
                 </template>
                 <template v-if="cr.key === 'price'">
-                    <p v-if="cr.inputs?.excluded_expired || cr.inputs?.excluded_unverified">Excluded: {{ cr.inputs.excluded_unverified }} unverified and {{ cr.inputs.excluded_expired }} expired quotes from this supplier.</p>
                     <div v-for="cmp in cr.inputs?.comparisons ?? []" :key="cmp.product.id + cmp.basis" class="mt-2">
                         <p class="font-medium text-gray-800">{{ cmp.product.name }} ({{ cmp.basis }}): score {{ cmp.score.toFixed(2) }}</p>
                         <ul class="list-disc pl-4">
-                            <li v-for="q in cmp.quotes" :key="q.supplier_id">{{ q.supplier }}: {{ q.unit_price.toFixed(2) }} — {{ q.reference || 'no reference' }}, quoted {{ q.quoted_on }}{{ q.valid_until ? `, valid until ${q.valid_until}` : '' }}</li>
+                            <li v-for="p in cmp.prices" :key="p.supplier_id">
+                                {{ p.supplier }}: {{ p.unit_price.toFixed(2) }} average over {{ p.quantity }} units —
+                                {{ (p.receipts ?? []).map((i: any) => `${i.delivery_number} / PO ${i.po_number} (${i.delivery_date}, ${i.quantity} × ${i.unit_cost.toFixed(2)})`).join(', ') }}
+                            </li>
                         </ul>
                     </div>
                 </template>

@@ -16,17 +16,24 @@ use Carbon\CarbonInterface;
  * and the weighted results are added. A criterion without enough data is reported as unavailable
  * with the reason: it is never treated as 0 and its weight is never moved to other criteria, so
  * such a product gets no final score or classification.
+ *
+ * The 0–100 weighted sum is also expressed on the 1–5 AHP priority scale (1 + 4 × score / 100);
+ * the classification uses that 1–5 value (4.21–5.00 Very High — Reorder Immediately, …).
  */
 class ProductPrioritizer
 {
     public function __construct(private SmaForecaster $forecaster) {}
 
-    /** @return array<int, array> keyed by product id, highest complete score first */
-    public function forTeam(int $teamId, ?CarbonInterface $now = null): array
+    /**
+     * @param  int|null  $forecastMonths  forecasting period chosen by staff (3, 6 or 12): the SMA window and the months the reorder advice covers
+     * @return array<int, array> keyed by product id, highest complete score first
+     */
+    public function forTeam(int $teamId, ?CarbonInterface $now = null, ?int $forecastMonths = null): array
     {
         $now = Carbon::instance($now ?? now());
         $config = config('evaluation.product_priority');
         $weights = $config['weights'];
+        $months = SmaForecaster::window($forecastMonths ?? SmaForecaster::DEFAULT_WINDOW);
 
         $products = Product::where('team_id', $teamId)->where('is_active', true)
             ->orderBy('name')->get(['id', 'name', 'sku', 'stock', 'unit', 'reorder_level', 'reorder_quantity', 'created_at']);
@@ -36,7 +43,7 @@ class ProductPrioritizer
         $ids = $products->pluck('id')->all();
 
         $reserved = Product::batchReservedQuantities($ids);
-        $forecasts = $this->forecaster->forProducts($teamId, $ids, SmaForecaster::DEFAULT_WINDOW, (int) $config['movement_months'], $now);
+        $forecasts = $this->forecaster->forProducts($teamId, $ids, $months, (int) $config['movement_months'], $now);
         $availability = $this->supplierAvailability($teamId, $ids);
 
         $available = [];
@@ -65,6 +72,7 @@ class ProductPrioritizer
             $complete = collect($criteria)->every(fn ($c) => $c['available']);
             $weightedSum = round(collect($criteria)->where('available', true)->sum('weighted'), 2);
             $missing = collect($criteria)->where('available', false)->pluck('label')->all();
+            $band = $complete ? $this->band($weightedSum) : null;
 
             $results[$p->id] = [
                 'product' => ['id' => $p->id, 'name' => $p->name, 'sku' => $p->sku, 'unit' => $p->unit ?: 'pcs'],
@@ -72,12 +80,28 @@ class ProductPrioritizer
                 'score' => $complete ? $weightedSum : null,
                 'partial_score' => $complete ? null : $weightedSum,
                 'weight_available' => round(collect($criteria)->where('available', true)->sum('weight') * 100),
-                'classification' => $complete ? $this->classify($weightedSum) : null,
+                'classification' => $band['label'] ?? null,
+                'scale' => $complete ? [
+                    'score' => $band['scale_score'],
+                    'min' => $band['min'],
+                    'max' => $band['max'],
+                    'range' => number_format($band['min'], 2).'–'.number_format($band['max'], 2),
+                    'action' => $band['action'],
+                    'formula' => '1 + 4 × ('.number_format($weightedSum, 2).' / 100) = '.number_format($band['scale_score'], 2),
+                ] : null,
                 'missing' => $missing,
                 'criteria' => $criteria,
                 'final_formula' => $complete
                     ? implode(' + ', array_map(fn ($c) => number_format($c['weighted'], 2), $criteria)).' = '.number_format($weightedSum, 2)
                     : null,
+                'available_stock' => $available[$p->id],
+                'forecast' => [
+                    'months' => $months,
+                    'period' => SmaForecaster::PERIOD_LABELS[$months],
+                    'monthly' => $f['forecast'],
+                    'period_total' => $f['period_forecast'],
+                    'reason' => $f['reason'],
+                ],
                 'reorder' => $this->reorderRecommendation($p, $available[$p->id], $f),
                 'calculated_at' => $now->toIso8601String(),
             ];
@@ -88,36 +112,62 @@ class ProductPrioritizer
         return $results;
     }
 
+    /** Classification of a 0–100 weighted score, via its 1–5 AHP scale value. */
     public function classify(float $score): string
     {
-        foreach (config('evaluation.product_priority.classes') as $min => $label) {
-            if ($score >= $min) {
-                return $label;
+        return $this->band($score)['label'];
+    }
+
+    /** 0–100 weighted score → 1–5 AHP priority scale: 1 + 4 × (score / 100), rounded to 2 decimals. */
+    public static function toScale(float $score): float
+    {
+        $scale = config('evaluation.product_priority.scale');
+        $min = (float) $scale['min'];
+        $max = (float) $scale['max'];
+
+        return round(min($max, max($min, $min + ($max - $min) * ($score / 100))), 2);
+    }
+
+    /**
+     * The 1–5 band of a 0–100 weighted score (bands from config/evaluation.php).
+     *
+     * @return array{label: string, action: ?string, min: float, max: float, scale_score: float}
+     */
+    public function band(float $score): array
+    {
+        $value = self::toScale($score);
+        $classes = config('evaluation.product_priority.classes');
+        foreach ($classes as $class) {
+            if ($value >= (float) $class['min']) {
+                return ['label' => $class['label'], 'action' => $class['action'] ?? null, 'min' => (float) $class['min'], 'max' => (float) $class['max'], 'scale_score' => $value];
             }
         }
+        $last = end($classes);
 
-        return 'Very Low Priority';
+        return ['label' => $last['label'], 'action' => $last['action'] ?? null, 'min' => (float) $last['min'], 'max' => (float) $last['max'], 'scale_score' => $value];
     }
 
     /**
      * Reorder recommendation from the product's own reorder settings and its SMA forecast.
-     * Reorder when available stock is at or below the reorder level, or below next month's
-     * forecasted demand. Suggested quantity = the larger of the reorder quantity and the
-     * forecast shortfall. It is advice only; purchasing still goes through Procurement.
+     * Reorder when available stock is at or below the reorder level, or below the demand
+     * forecast for the chosen period (SMA × months). Suggested quantity = the larger of the
+     * reorder quantity and the forecast shortfall. It is advice only; purchasing still goes
+     * through Procurement.
      */
     private function reorderRecommendation(Product $p, int $available, array $f): array
     {
         $level = (int) ($p->reorder_level ?? 0);
         $qty = (int) ($p->reorder_quantity ?? 0);
-        $forecast = $f['available'] ? (int) $f['forecast'] : null;
+        $forecast = $f['available'] ? (int) $f['period_forecast'] : null;
         $shortfall = $forecast !== null ? max(0, $forecast - $available) : null;
+        $period = SmaForecaster::PERIOD_LABELS[$f['window']] ?? "{$f['window']} months";
 
         $reasons = [];
         if ($available <= $level) {
             $reasons[] = "available stock {$available} ≤ reorder level {$level}";
         }
         if ($shortfall) {
-            $reasons[] = "available stock {$available} < SMA forecast {$forecast}";
+            $reasons[] = "available stock {$available} < forecast demand {$forecast} for the next {$period}";
         }
         $needed = $reasons !== [];
         $suggested = $needed ? max($qty, (int) $shortfall) : 0;
@@ -132,7 +182,7 @@ class ProductPrioritizer
             'shortfall' => $shortfall,
             'basis' => $needed
                 ? 'Reorder because '.implode(' and ', $reasons).". Suggested = max(reorder quantity {$qty}, forecast shortfall ".($shortfall ?? 0).") = {$suggested}."
-                : "Available stock {$available} is above the reorder level {$level}".($forecast !== null ? " and covers the SMA forecast {$forecast}" : ' (no SMA forecast: insufficient sales history)').'.',
+                : "Available stock {$available} is above the reorder level {$level}".($forecast !== null ? " and covers the forecast demand {$forecast} for the next {$period}" : ' (no SMA forecast: insufficient sales history)').'.',
         ];
     }
 

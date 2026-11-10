@@ -3,9 +3,8 @@ import { Head, router, usePage } from '@inertiajs/vue3';
 import { useCanDelete } from '@/composables/useCanDelete';
 import { useCurrency } from '@/composables/useCurrency';
 import { showToast } from '@/composables/useFlashToast';
-import { ref, computed, watch } from 'vue';
+import { ref, computed, watch, defineAsyncComponent } from 'vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
-import ImportWizard from '@/components/import/ImportWizard.vue';
 import StatusBadge from '@/components/ui/StatusBadge.vue';
 import GlideSelect from '@/components/vue-bits/GlideSelect.vue';
 import { 
@@ -41,6 +40,9 @@ import {
     Paperclip,
 } from '@lucide/vue';
 
+// The import wizard is a modal: it downloads after the page renders, not before.
+const ImportWizard = defineAsyncComponent(() => import('@/components/import/ImportWizard.vue'));
+
 interface QuotationItem {
     id?: number;
     product_id?: number | null;
@@ -54,6 +56,8 @@ interface QuotationItem {
     available_stock?: number;
     shortage?: number;
     stock_status?: string;
+    // The purchase raised for this quotation for the line's product (Draft quotations only).
+    purchase?: { number: string; status: string } | null;
     // Internal: supplier cost when the line was priced. Never on customer documents.
     unit_cost?: number | null;
     supplier_id?: number | null;
@@ -82,6 +86,9 @@ interface Quotation {
     email_status_label?: string;
     allowed_actions?: string[];
     is_approved?: boolean;
+    submitted_for_approval_at?: string | null;
+    /** Short products still being purchased for this Draft: it stays Draft until they arrive. */
+    waiting_for_stock?: string[];
     approved_by?: { name: string } | null;
     approved_at?: string | null;
     sent_by?: { name: string } | null;
@@ -105,8 +112,20 @@ interface Quotation {
         source?: 'public_form' | 'staff_import';
         project_type?: string;
         timeline?: string;
-        brands?: { brand: string; details: string }[];
+        // quantity and brand_name (the brand of an "Others" row) only on requests that gave them.
+        brands?: { brand: string; details: string; quantity?: number; brand_name?: string }[];
         unlisted_brands?: string | null;
+        // Products the client read from their uploaded lists and confirmed.
+        // unit: as written in the client's file, or null (staff verify units when quoting).
+        product_list?: { description: string; quantity: number; unit: string | null; source?: string | null }[] | null;
+        // Rows read from each uploaded list when the request was sent (never reviewed by the client).
+        extracted_products?: {
+            file: string;
+            status: 'read' | 'columns_not_found' | 'not_read';
+            method: string | null;
+            message: string | null;
+            rows: { ref: string; description: string; quantity: number | null; unit: string | null; issues: string[] }[];
+        }[] | null;
         file_name?: string;
         imported_by?: string | null;
         submitted_at?: string;
@@ -167,8 +186,23 @@ const props = defineProps<{
     formStatuses: { value: string; label: string }[];
     decisionSources: Record<string, string>;
     canApprove: boolean;
-    suppliers?: { id: number; name: string }[];
+    /** Registered suppliers: the line "Select Supplier" dropdown (all) and the supplier quotation import (active only). */
+    suppliers?: { id: number; name: string; status?: string }[];
+    /** Latest purchase cost per product and supplier (deliveries, purchase orders, verified supplier quotes, product cost). */
+    supplierCosts?: { product_id: number; supplier_id: number; unit_cost: number; source: string; reference: string | null; date: string | null }[];
+    /** Days a quotation is valid after it is approved (config company.quotation_validity_days). */
+    quotationValidityDays?: number;
+    /** The fixed Terms and Conditions every quotation carries (App\Support\QuotationTerms). */
+    quotationTerms?: string[];
 }>();
+
+/** YYYY-MM-DD in the browser's time zone, `days` from today (toISOString() would give the UTC date). */
+const localDate = (days = 0) => {
+    const d = new Date();
+    d.setDate(d.getDate() + days);
+
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
 
 const statusLabel = (value: string) => props.statusOptions.find((o) => o.value === value)?.label ?? value;
 const can = (quote: Quotation | null, action: string) => !!quote?.allowed_actions?.includes(action);
@@ -195,7 +229,8 @@ const applyFilters = () => {
                 date_from: dateFrom.value || undefined,
                 date_to: dateTo.value || undefined,
             },
-            { preserveState: true, preserveScroll: true, replace: true },
+            // Only the list changes; the form's product, client and supplier lists are kept.
+            { preserveState: true, preserveScroll: true, replace: true, only: ['quotations', 'filters', 'metrics'] },
         );
     }, 350);
 };
@@ -224,6 +259,18 @@ const activeQuotation = ref<Quotation | null>(null);
 
 // Create / Edit Form State
 const selectedExistingClientId = ref<string>('');
+
+// Floating labels (Client / Customer Information). A label sits inside its empty field and moves up
+// on focus, or when the field has a value (typed, loaded with the quotation, or filled in by "Load
+// Existing Client"). Text fields use an empty placeholder (" ") with Tailwind's peer-placeholder-shown;
+// the dropdown has no placeholder, so its label follows its focus and selected value.
+const FLOAT_FIELD = 'field-control peer pt-5 pb-1.5';
+const FLOAT_LABEL_UP = '-translate-y-2.5 scale-75';
+const FLOAT_LABEL =
+    'pointer-events-none absolute top-3.5 left-3.5 origin-[0] text-sm font-medium text-gray-500 transition-all duration-200 ' +
+    `${FLOAT_LABEL_UP} peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]`;
+const existingClientFocused = ref(false);
+const existingClientLabelUp = computed(() => existingClientFocused.value || selectedExistingClientId.value !== '');
 const form = ref<{
     id?: number;
     client_name: string;
@@ -231,21 +278,23 @@ const form = ref<{
     email: string;
     phone: string;
     address: string;
+    /** Shown only: the server sets it (today for a new quotation). */
     quotation_date: string;
-    valid_until: string;
+    /** Shown only: set when the quotation is approved (approval date + validity days). */
+    valid_until: string | null;
     status: string;
     notes: string;
-    terms_and_conditions: string;
-    tax_rate: number;
-    discount: number;
+    tax_rate: number | null;
+    discount: number | null;
     items: {
         product_id: number | null;
         sku: string;
         product_name: string;
-        quantity: number;
-        unit_price: number;
-        discount: number;
-        stock: number;
+        quantity: number | null;
+        unit_price: number | null;
+        discount: number | null;
+        /** null until a product from inventory is chosen. */
+        stock: number | null;
         unit_cost: number | null;
         supplier_id: number | null;
     }[];
@@ -255,13 +304,12 @@ const form = ref<{
     email: '',
     phone: '',
     address: '',
-    quotation_date: new Date().toISOString().slice(0, 10),
-    valid_until: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
-    status: 'under_preparation',
+    quotation_date: localDate(),
+    valid_until: null,
+    status: 'draft',
     notes: '',
-    terms_and_conditions: "1. Price Validity: Quotation is valid until the stated expiration date.\n2. Payment Terms: 50% down payment upon confirmation, 50% upon delivery.\n3. Delivery: 5-7 business days from receipt of purchase order.\n4. Warranty: 1-Year standard manufacturer warranty on electrical equipment.\n5. To accept, please sign and return via email.",
-    tax_rate: 12.00,
-    discount: 0,
+    tax_rate: 0,
+    discount: null,
     items: []
 });
 
@@ -306,28 +354,50 @@ const formStatusChoices = computed(() => {
     return list;
 });
 
+// Line subtotal: (unit price − discount) × quantity, blank fields counting as 0.
+const lineSubtotal = (item: { unit_price: number | null; discount: number | null; quantity: number | null }) =>
+    Math.max(0, ((Number(item.unit_price) || 0) - (Number(item.discount) || 0)) * (Number(item.quantity) || 0));
+
 // Margin over supplier cost, for staff only.
-const lineMargin = (item: { unit_price: number; discount: number; unit_cost: number | null }) => {
+const lineMargin = (item: { unit_price: number | null; discount: number | null; unit_cost: number | null }) => {
     if (item.unit_cost == null || !(Number(item.unit_price) > 0)) return null;
     const net = Number(item.unit_price) - (Number(item.discount) || 0);
     return Math.round(((net - Number(item.unit_cost)) / net) * 1000) / 10;
 };
 
-// Line Items Methods
+// Line Items Methods: a new line is blank until a product is chosen.
 const addItem = () => {
-    // Default to first product if available
-    const firstProd = props.products[0];
     form.value.items.push({
-        product_id: firstProd ? firstProd.id : null,
-        sku: firstProd ? firstProd.sku : 'SKU-001',
-        product_name: firstProd ? firstProd.name : '',
-        quantity: 1,
-        unit_price: firstProd ? Number(firstProd.price) : 0,
-        discount: 0,
-        stock: firstProd ? firstProd.stock : 0,
-        unit_cost: firstProd?.cost_price != null ? Number(firstProd.cost_price) : null,
-        supplier_id: firstProd?.supplier_id ?? null,
+        product_id: null,
+        sku: '',
+        product_name: '',
+        quantity: null,
+        unit_price: null,
+        discount: null,
+        stock: null,
+        unit_cost: null,
+        supplier_id: null,
     });
+};
+
+// Supplier cost per line: choosing a supplier fills Unit Cost with that supplier's own latest cost
+// (never another supplier's). The customer's selling price (Unit Price) is never changed by it.
+const costIndex = computed(() => new Map((props.supplierCosts ?? []).map((c) => [`${c.product_id}:${c.supplier_id}`, c])));
+const supplierCostFor = (item: { product_id: number | null; supplier_id: number | null }) =>
+    item.product_id && item.supplier_id ? costIndex.value.get(`${item.product_id}:${item.supplier_id}`) ?? null : null;
+const costSourceLabels: Record<string, string> = { delivery: 'delivery', purchase_order: 'purchase order', supplier_quote: 'supplier quotation', inventory: 'inventory cost' };
+const costNote = (item: { product_id: number | null; supplier_id: number | null; unit_cost: number | null }) => {
+    if (!item.supplier_id) return null;
+    const c = supplierCostFor(item);
+    if (!c) return { missing: true, text: 'No Supplier Price Available' };
+    if (item.unit_cost !== null && Number(item.unit_cost) !== Number(c.unit_cost)) return { missing: false, text: 'Entered manually' };
+    return { missing: false, text: `Latest ${costSourceLabels[c.source] ?? c.source}${c.reference ? ` ${c.reference}` : ''}${c.date ? ` · ${c.date}` : ''}` };
+};
+const activeSuppliers = computed(() => (props.suppliers ?? []).filter((s) => !s.status || s.status === 'Active'));
+const onSupplierSelect = (index: number) => {
+    const item = form.value.items[index];
+    const c = supplierCostFor(item);
+    item.unit_cost = c ? Number(c.unit_cost) : null;
 };
 
 const onProductSelect = (index: number, productId: number | null) => {
@@ -339,8 +409,10 @@ const onProductSelect = (index: number, productId: number | null) => {
         form.value.items[index].product_name = prod.name;
         form.value.items[index].unit_price = Number(prod.price);
         form.value.items[index].stock = prod.stock;
-        form.value.items[index].unit_cost = prod.cost_price != null ? Number(prod.cost_price) : null;
         form.value.items[index].supplier_id = prod.supplier_id ?? null;
+        // The product's supplier's latest recorded cost; without a supplier, the product's own cost.
+        const recorded = supplierCostFor(form.value.items[index]);
+        form.value.items[index].unit_cost = recorded ? Number(recorded.unit_cost) : (!prod.supplier_id && prod.cost_price != null ? Number(prod.cost_price) : null);
     }
 };
 
@@ -358,13 +430,12 @@ const openCreateModal = () => {
         email: '',
         phone: '',
         address: '',
-        quotation_date: new Date().toISOString().slice(0, 10),
-        valid_until: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
-        status: 'under_preparation',
+        quotation_date: localDate(),
+        valid_until: null,
+        status: 'draft',
         notes: '',
-        terms_and_conditions: "1. Price Validity: Quotation is valid until the stated expiration date.\n2. Payment Terms: 50% down payment upon confirmation, 50% upon delivery.\n3. Delivery: 5-7 business days from receipt of purchase order.\n4. Warranty: 1-Year standard manufacturer warranty on electrical equipment.\n5. To accept, please sign and return via email.",
-        tax_rate: 12.00,
-        discount: 0,
+        tax_rate: 0,
+        discount: null,
         items: []
     };
     addItem();
@@ -382,10 +453,10 @@ const openEditModal = (quote: Quotation) => {
         phone: quote.phone || '',
         address: quote.address || '',
         quotation_date: toInputDate(quote.quotation_date),
-        valid_until: toInputDate(quote.valid_until),
-        status: quote.status,
+        valid_until: quote.valid_until ? toInputDate(quote.valid_until) : null,
+        // A Draft already waiting for approval stays submitted when it is saved again.
+        status: quote.status === 'draft' && quote.submitted_for_approval_at ? 'submit_for_approval' : quote.status,
         notes: quote.notes || '',
-        terms_and_conditions: quote.terms_and_conditions || '',
         tax_rate: Number(quote.tax_rate),
         discount: Number(quote.discount),
         items: quote.items.map(item => {
@@ -452,14 +523,10 @@ const promptSaveQuotation = () => {
         formError.value = 'At least one line item must be added to the quotation.';
         return;
     }
-    if (toInputDate(form.value.valid_until) < toInputDate(form.value.quotation_date)) {
-        formError.value = 'Valid Until date cannot be earlier than the Quotation date.';
-        return;
-    }
     for (let i = 0; i < form.value.items.length; i++) {
         const item = form.value.items[i];
         if (!item.product_name.trim() || !item.sku.trim()) {
-            formError.value = `Item #${i + 1} must have a product name and SKU.`;
+            formError.value = `Item #${i + 1}: select a product from inventory, or enter a description and SKU.`;
             return;
         }
         if (Number(item.quantity) <= 0) {
@@ -491,11 +558,27 @@ const promptSaveQuotation = () => {
     });
 };
 
+// What is saved: blank amounts count as 0; dates and terms are set by the server.
+const savePayload = () => {
+    const { quotation_date: _date, valid_until: _validUntil, ...data } = form.value;
+    return {
+        ...data,
+        tax_rate: Number(data.tax_rate) || 0,
+        discount: Number(data.discount) || 0,
+        items: data.items.map(({ stock: _stock, ...item }) => ({
+            ...item,
+            quantity: Number(item.quantity) || 0,
+            unit_price: Number(item.unit_price) || 0,
+            discount: Number(item.discount) || 0,
+        })),
+    };
+};
+
 const saveQuotation = () => {
     isSubmitting.value = true;
 
     if (isEditing.value && form.value.id) {
-        router.put(`/${teamSlug.value}/quotations/${form.value.id}`, form.value, {
+        router.put(`/${teamSlug.value}/quotations/${form.value.id}`, savePayload(), {
             onSuccess: () => {
                 showCreateEditModal.value = false;
                 isSubmitting.value = false;
@@ -506,7 +589,7 @@ const saveQuotation = () => {
             }
         });
     } else {
-        router.post(`/${teamSlug.value}/quotations`, form.value, {
+        router.post(`/${teamSlug.value}/quotations`, savePayload(), {
             onSuccess: () => {
                 showCreateEditModal.value = false;
                 isSubmitting.value = false;
@@ -526,19 +609,46 @@ const manualStatusOptions = computed(() =>
     (activeQuotation.value?.allowed_actions ?? [])
         .filter((a) => a.startsWith('status:'))
         .map((a) => a.slice(7))
-        .map((value) => props.statusOptions.find((o) => o.value === value) ?? { value, label: value, badgeClass: '' }),
+        .map((value) => props.statusOptions.find((o) => o.value === value)
+            ?? { value, label: value === 'submit_for_approval' ? 'Submit for approval' : value, badgeClass: '' }),
 );
+// Lines without a selling price (e.g. a customer request's free descriptions): they block approval.
+const unpricedLines = (quote: Quotation | null) => (quote?.items ?? []).filter((i) => !(Number(i.unit_price) > 0)).map((i) => i.product_name);
+/** Why a status cannot be chosen right now (checked again by the server), or null. */
+const statusBlockedReason = (value: string): string | null => {
+    const missing = unpricedLines(activeQuotation.value);
+    return value === 'submit_for_approval' && missing.length
+        ? `Set a selling price for every line first. Missing: ${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ` and ${missing.length - 3} more` : ''}.`
+        : null;
+};
+const statusError = ref<string | null>(null);
 const openStatusModal = (quote: Quotation) => {
     activeQuotation.value = quote;
-    targetStatus.value = manualStatusOptions.value[0]?.value ?? '';
+    targetStatus.value = manualStatusOptions.value.find((o) => !statusBlockedReason(o.value))?.value ?? '';
     statusRemarks.value = '';
+    statusError.value = null;
     showStatusModal.value = true;
+};
+const priceFromStatus = () => {
+    if (!activeQuotation.value) return;
+    const quote = activeQuotation.value;
+    showStatusModal.value = false;
+    openEditModal(quote);
 };
 
 const isUpdatingStatus = ref(false);
 
 const promptUpdateStatus = () => {
-    if (!activeQuotation.value || !targetStatus.value) return;
+    statusError.value = null;
+    if (!activeQuotation.value || !targetStatus.value) {
+        statusError.value = 'Choose the new status first.';
+        return;
+    }
+    const blocked = statusBlockedReason(targetStatus.value);
+    if (blocked) {
+        statusError.value = blocked;
+        return;
+    }
     openConfirmModal({
         title: 'Confirm Status Change',
         description: `Change quotation ${activeQuotation.value.quotation_number} to "${statusLabel(targetStatus.value)}"?`,
@@ -564,6 +674,10 @@ const updateStatusSubmit = () => {
         onSuccess: () => {
             showStatusModal.value = false;
         },
+        // Refused by the server (e.g. a rule changed meanwhile): say why, in the dialog.
+        onError: (errors) => {
+            statusError.value = (Object.values(errors)[0] as string) || 'The status could not be changed.';
+        },
         onFinish: () => {
             isUpdatingStatus.value = false;
         },
@@ -585,46 +699,57 @@ const postWorkflow = (quote: Quotation, action: string, data: Record<string, any
 // Admin approval: does not email the customer and does not touch stock.
 const promptApprove = (quote: Quotation) => {
     openConfirmModal({
-        title: 'Approve and Send',
-        description: quote.email
-            ? `Approve ${quote.quotation_number}? It is emailed to ${quote.email} as a PDF straight away and becomes Sent.`
-            : `Approve ${quote.quotation_number}? It has no customer email address, so it stays approved until you add one and use Send.`,
+        title: 'Approve Quotation',
+        description: `Approve ${quote.quotation_number}? Nothing is emailed yet: once approved, use Send Quotation to email it to the customer.`,
         details: [
             { label: 'Total', value: formatCurrency(quote.grand_total) },
             { label: 'Valid until', value: formatDate(quote.valid_until) },
         ],
-        confirmText: 'Approve and Send',
+        confirmText: 'Approve',
         action: () => postWorkflow(quote, 'approve'),
     });
 };
 
-const promptSend = (quote: Quotation) => {
+// Products are short: one purchase request per short product, for admin approval. Stays Draft.
+const promptRequestStock = (quote: Quotation) => {
+    const short = (quote.items ?? []).filter((i) => i.product_id && ['Insufficient Stock', 'Not Available'].includes(i.stock_status ?? '') && !i.purchase);
     openConfirmModal({
-        title: quote.status === 'sent' ? 'Send Quotation Again' : 'Send Quotation',
-        description: quote.email
-            ? `Email ${quote.quotation_number} as a PDF to ${quote.email}? The PDF shows customer prices only.`
-            : 'This quotation has no customer email address. Edit it first, or add the email to the client.',
+        title: 'Request Stock',
+        description: `Create purchase requests for the products ${quote.quotation_number} is short of? An administrator approves them, and a purchase order is then drafted for the supplier. The quotation stays Draft until the stock arrives; it is not sent to the customer.`,
+        details: short.map((i) => ({ label: i.product_name, value: `${i.quantity} needed` })),
+        confirmText: 'Request Stock',
+        action: () => postWorkflow(quote, 'request-stock'),
+    });
+};
+
+// "Send Quotation" (approved) or "Resend" (already sent: an explicit second send).
+const promptSend = (quote: Quotation) => {
+    const resend = quote.status === 'sent';
+    openConfirmModal({
+        title: resend ? 'Resend Quotation' : 'Send Quotation',
+        description: !quote.email
+            ? 'This quotation has no customer email address. Edit it first, or add the email to the client.'
+            : resend
+              ? `${quote.quotation_number} was already emailed on ${formatDate(quote.sent_at ?? null)}. Send the PDF to ${quote.email} again?`
+              : `Email ${quote.quotation_number} as a PDF to ${quote.email}? It becomes Sent once the email goes out. The PDF shows customer prices only.`,
         details: [
             { label: 'To', value: quote.email || '—' },
             { label: 'Total', value: formatCurrency(quote.grand_total) },
             { label: 'Valid until', value: formatDate(quote.valid_until) },
         ],
-        confirmText: 'Send Email',
-        action: () => postWorkflow(quote, 'send'),
+        confirmText: resend ? 'Send Again' : 'Send Quotation',
+        action: () => postWorkflow(quote, 'send', resend ? { resend: true } : {}, () => (showViewModal.value = false)),
     });
 };
 
 // Customer's answer (recorded by staff: customers have no accounts)
 const showDecisionModal = ref(false);
-// An acceptance creates the Sales Order straight away, so it asks how the order is fulfilled.
+// An acceptance only records the answer: the Sales Order is created in Sales → New Sales Order.
 const decision = ref({
     decision: 'accepted' as 'accepted' | 'rejected',
     source: 'email',
     decided_on: new Date().toISOString().slice(0, 10),
     remarks: '',
-    fulfillment_type: 'delivery' as 'delivery' | 'pickup',
-    delivery_address: '',
-    delivery_instructions: '',
 });
 const openDecisionModal = (quote: Quotation) => {
     activeQuotation.value = quote;
@@ -633,24 +758,17 @@ const openDecisionModal = (quote: Quotation) => {
         source: 'email',
         decided_on: new Date().toISOString().slice(0, 10),
         remarks: '',
-        fulfillment_type: 'delivery',
-        delivery_address: quote.address || '',
-        delivery_instructions: '',
     };
     showDecisionModal.value = true;
 };
 const submitDecision = () => {
     if (!activeQuotation.value) return;
     const d = decision.value;
-    const accepted = d.decision === 'accepted';
     postWorkflow(activeQuotation.value, 'decision', {
         decision: d.decision,
         source: d.source,
         decided_on: d.decided_on,
         remarks: d.remarks || undefined,
-        fulfillment_type: accepted ? d.fulfillment_type : undefined,
-        delivery_address: accepted && d.fulfillment_type === 'delivery' ? d.delivery_address || undefined : undefined,
-        delivery_instructions: accepted ? d.delivery_instructions || undefined : undefined,
     }, () => {
         showDecisionModal.value = false;
     });
@@ -735,24 +853,112 @@ const showSupplierQuoteImport = ref(false);
 // ------------------------------------------------------------------ material-list import
 
 const MATERIAL_EXTENSIONS = ['pdf', 'xlsx', 'xls', 'csv', 'jpg', 'jpeg', 'png'];
+type MaterialField = { key: string; label: string; required: boolean };
+// The first rows of the file and the columns found, for choosing the columns by hand.
+type MaterialColumnChoice = {
+    columns: string[];
+    preview: string[][];
+    header_index: number | null;
+    header_detected: boolean;
+    mapping: Record<string, number>;
+    missing: string[];
+    fields: MaterialField[];
+};
 const showMaterialImportModal = ref(false);
 const materialImport = ref({ file: null as File | null, clientId: '', clientName: '', contactPerson: '', email: '', phone: '' });
-const materialPreview = ref<{
+const materialPreview = ref<({
     method: string;
     warning: string | null;
     valid_count: number;
     invalid_count: number;
     unparsed_count: number;
-    items: { description: string; quantity: number | null; unit: string | null; brand: string | null; errors: string[]; match: { sku: string; name: string; price: number | null } | null }[];
-} | null>(null);
+    confident: boolean;
+    items: { description: string; quantity: number | null; unit: string | null; brand: string | null; specs?: string | null; item_code?: string | null; confidence?: string; needs_review?: boolean; warnings?: string[]; skip?: boolean; errors: string[]; match: { sku: string; name: string; price: number | null } | null }[];
+} & MaterialColumnChoice) | null>(null);
 const materialImportError = ref<string | null>(null);
 const isReadingMaterials = ref(false);
 const isCreatingFromMaterials = ref(false);
+
+// Columns chosen by hand: the column index per field ('' = not in the file) and the header row ('' = none).
+const materialColumns = ref<MaterialColumnChoice | null>(null);
+const showMaterialColumns = ref(false);
+const materialMapping = ref<Record<string, string>>({});
+const materialHeaderRow = ref('');
+const useMaterialMapping = ref(false); // send the chosen columns when reading and creating
+
+const columnLetter = (index: number): string => {
+    let letters = '';
+    for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) letters = String.fromCharCode(65 + ((n - 1) % 26)) + letters;
+    return letters;
+};
+const shorten = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}…` : text);
+const materialColumnCount = computed(() => {
+    const choice = materialColumns.value;
+    if (!choice) return 0;
+    return Math.min(40, Math.max(choice.columns.length, ...choice.preview.map((row) => row.length)));
+});
+const materialHeaderLabel = (col: number): string => {
+    const row = materialHeaderRow.value === '' ? null : materialColumns.value?.preview[Number(materialHeaderRow.value)];
+    return row ? String(row[col] ?? '').trim() : '';
+};
+const materialColumnOption = (col: number) => {
+    const label = materialHeaderLabel(col);
+    return `Column ${columnLetter(col)}${label ? ` · ${shorten(label, 30)}` : ''}`;
+};
+const materialFieldForColumn = (col: number) => materialColumns.value?.fields.find((f) => materialMapping.value[f.key] === String(col))?.label ?? null;
+const materialRowOption = (row: string[], index: number) => {
+    const text = row.filter((c) => String(c).trim() !== '').join(' | ');
+    return `Row ${index + 1}${text ? ` · ${shorten(text, 50)}` : ''}`;
+};
+// Why the chosen columns cannot be applied yet (null when they can).
+const materialMappingProblem = computed((): string | null => {
+    const fields = materialColumns.value?.fields ?? [];
+    const missing = fields.filter((f) => f.required && !materialMapping.value[f.key]);
+    if (missing.length) return `Choose the ${missing.map((f) => f.label.toLowerCase()).join(' and ')} column${missing.length > 1 ? 's' : ''}.`;
+    const used = new Map<string, string>();
+    for (const f of fields) {
+        const col = materialMapping.value[f.key] ?? '';
+        if (col === '') continue;
+        if (used.has(col)) return `${used.get(col)} and ${f.label} are both set to column ${columnLetter(Number(col))}. Choose a different column for each.`;
+        used.set(col, f.label);
+    }
+    return null;
+});
+const setMaterialColumns = (data: MaterialColumnChoice | null) => {
+    materialColumns.value = data?.preview?.length
+        ? { columns: data.columns ?? [], preview: data.preview, header_index: data.header_index ?? null, header_detected: !!data.header_detected, mapping: data.mapping ?? {}, missing: data.missing ?? [], fields: data.fields ?? [] }
+        : null;
+    materialMapping.value = Object.fromEntries((materialColumns.value?.fields ?? []).map((f) => [f.key, data?.mapping?.[f.key] != null ? String(data.mapping[f.key]) : '']));
+    materialHeaderRow.value = data?.header_index != null ? String(data.header_index) : '';
+};
+const resetMaterialColumns = () => {
+    setMaterialColumns(null);
+    showMaterialColumns.value = false;
+    useMaterialMapping.value = false;
+};
+
+const validateMaterialPreviewItem = (item: { description: string; quantity: number | null; errors: string[] }) => {
+    const errs: string[] = [];
+    if (!item.description || !String(item.description).trim()) {
+        errs.push('Missing item description.');
+    }
+    const q = Number(item.quantity);
+    if (item.quantity === null || item.quantity === ('' as any) || Number.isNaN(q) || q <= 0) {
+        errs.push('Quantity must be greater than zero.');
+    }
+    item.errors = errs;
+    if (materialPreview.value) {
+        const active = materialPreview.value.items.filter((i) => !i.skip);
+        materialPreview.value.valid_count = active.filter((i) => i.errors.length === 0).length;
+        materialPreview.value.invalid_count = active.filter((i) => i.errors.length > 0).length;
+    }
+};
 
 const openMaterialImportModal = () => {
     materialImport.value = { file: null, clientId: '', clientName: '', contactPerson: '', email: '', phone: '' };
     materialPreview.value = null;
     materialImportError.value = null;
+    resetMaterialColumns();
     showMaterialImportModal.value = true;
 };
 
@@ -771,6 +977,7 @@ const onMaterialFileChange = (event: Event) => {
     input.value = '';
     materialPreview.value = null;
     materialImportError.value = null;
+    resetMaterialColumns();
     if (!chosen) return;
     const ext = chosen.name.split('.').pop()?.toLowerCase() ?? '';
     if (!MATERIAL_EXTENSIONS.includes(ext)) {
@@ -792,10 +999,19 @@ const materialFormData = (execute: boolean) => {
     if (materialImport.value.email.trim()) data.append('email', materialImport.value.email.trim());
     if (materialImport.value.phone.trim()) data.append('phone', materialImport.value.phone.trim());
     data.append('execute', execute ? '1' : '0');
+    if (useMaterialMapping.value && materialColumns.value) {
+        const chosen = Object.fromEntries(materialColumns.value.fields.map((f) => [f.key, materialMapping.value[f.key] ? Number(materialMapping.value[f.key]) : null]));
+        data.append('mapping', JSON.stringify(chosen));
+        data.append('header_row', materialHeaderRow.value === '' ? '-1' : materialHeaderRow.value);
+    }
+    if (execute && materialPreview.value?.items) {
+        data.append('items', JSON.stringify(materialPreview.value.items));
+    }
     return data;
 };
 
-const readMaterialFile = async () => {
+// Read the file; withColumns = use the columns chosen by hand instead of finding them from the headers.
+const readMaterialFile = async (withColumns = false) => {
     if (!materialImport.value.file) {
         materialImportError.value = 'Please choose a file first.';
         return;
@@ -807,6 +1023,7 @@ const readMaterialFile = async () => {
     isReadingMaterials.value = true;
     materialImportError.value = null;
     materialPreview.value = null;
+    useMaterialMapping.value = withColumns && !!materialColumns.value;
     try {
         const response = await fetch(`/${teamSlug.value}/quotations/import-materials`, {
             method: 'POST',
@@ -820,15 +1037,29 @@ const readMaterialFile = async () => {
         const data = await response.json().catch(() => ({}));
         if (response.ok && data.success) {
             materialPreview.value = data;
+            setMaterialColumns(data); // the columns used, for "Change columns"
+            showMaterialColumns.value = false;
         } else {
             const firstError = data?.errors ? (Object.values(data.errors).flat()[0] as string) : null;
             materialImportError.value = firstError || data.message || 'The file could not be read.';
+            if (data?.needs_mapping) {
+                // The columns could not be found (or the chosen ones hold no materials): let staff choose them.
+                setMaterialColumns(data);
+                showMaterialColumns.value = !!materialColumns.value;
+            } else if (!withColumns) {
+                resetMaterialColumns();
+            }
         }
     } catch {
         materialImportError.value = 'Network error. Please check your connection and try again.';
     } finally {
         isReadingMaterials.value = false;
     }
+};
+
+const applyMaterialColumns = () => {
+    if (materialMappingProblem.value || isReadingMaterials.value) return;
+    readMaterialFile(true);
 };
 
 const createFromMaterials = () => {
@@ -848,13 +1079,56 @@ const createFromMaterials = () => {
     });
 };
 
+// The official quotation document: the preview, Print, the PDF download and the PNG/JPG export
+// all come from the same server-rendered PDF, so they always match.
+const documentFrame = ref<HTMLIFrameElement | null>(null);
+const documentError = ref('');
+const imageBusy = ref<'' | 'png' | 'jpg'>('');
+const documentUrl = (kind: 'pdf' | 'png' | 'jpg', download = false) => {
+    const id = activeQuotation.value?.id;
+    if (!id) return '#';
+
+    return kind === 'pdf'
+        ? `/${teamSlug.value}/quotations/${id}/pdf${download ? '?download=1' : ''}`
+        : `/${teamSlug.value}/quotations/${id}/image?format=${kind}`;
+};
+
 const openPrintModal = (quote: Quotation) => {
     activeQuotation.value = quote;
+    documentError.value = '';
     showPrintModal.value = true;
 };
 
+// Prints the PDF shown in the preview (no page navigation or buttons on paper).
 const triggerPrint = () => {
-    window.print();
+    try {
+        documentFrame.value?.contentWindow?.focus();
+        documentFrame.value?.contentWindow?.print();
+    } catch {
+        // The browser's PDF viewer would not print from the preview: open the PDF to print it there.
+        window.open(documentUrl('pdf'), '_blank', 'noopener');
+    }
+};
+
+const downloadImage = async (format: 'png' | 'jpg') => {
+    imageBusy.value = format;
+    documentError.value = '';
+    try {
+        const res = await fetch(documentUrl(format), { credentials: 'same-origin' });
+        if (!res.ok) {
+            const body = await res.json().catch(() => null);
+            throw new Error(body?.message || `The ${format.toUpperCase()} could not be created (error ${res.status}). Download the PDF instead.`);
+        }
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(await res.blob());
+        link.download = `Quotation-${activeQuotation.value?.quotation_number}.${format}`;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    } catch (e: any) {
+        documentError.value = e.message;
+    } finally {
+        imageBusy.value = '';
+    }
 };
 
 // Delete
@@ -865,8 +1139,9 @@ const openDeleteModal = (quote: Quotation) => {
 };
 
 const confirmDelete = () => {
-    if (!activeQuotation.value) return;
+    if (!activeQuotation.value || deleteConfirmInput.value !== 'YES') return;
     router.delete(`/${teamSlug.value}/quotations/${activeQuotation.value.id}`, {
+        data: { confirmation: deleteConfirmInput.value },
         onSuccess: () => {
             showDeleteModal.value = false;
         }
@@ -908,7 +1183,7 @@ const formatDate = (dateStr: string | null | undefined): string => {
 };
 
 const isExpired = (validUntil: string | null | undefined, status: string): boolean => {
-    if (!validUntil || ['converted', 'cancelled', 'expired', 'rejected', 'accepted'].includes(status)) return false;
+    if (!validUntil || ['expired', 'rejected', 'accepted'].includes(status)) return false;
     const cleanDate = toInputDate(validUntil);
     const today = new Date().toISOString().slice(0, 10);
     return cleanDate < today;
@@ -1105,12 +1380,12 @@ const executeCsvImport = () => {
 
     <div class="workspace-page">
         <!-- Page Title & Main Action -->
-        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
+        <div class="page-header">
             <div>
                 <h1 class="page-title">Quotation Management</h1>
                 <p class="page-subtitle">Estimates, client approvals and conversion to sales.</p>
             </div>
-            <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
+            <div class="page-actions">
                 <div class="rounded-xl border border-gray-200 bg-white p-[3px]" data-test="quotation-import-menu">
                     <GlideSelect
                         :options="importOptions"
@@ -1164,7 +1439,7 @@ const executeCsvImport = () => {
         </div>
 
         <!-- Filter & Search Controls -->
-        <div class="flex flex-col md:flex-row gap-3 items-center justify-between">
+        <div class="flex flex-col md:flex-row gap-3 items-center justify-between rounded-xl border border-gray-200 bg-white p-4">
             <div class="flex flex-col sm:flex-row gap-3 w-full md:w-auto flex-1">
                 <!-- Search -->
                 <div class="relative flex-1 sm:max-w-xs">
@@ -1172,13 +1447,13 @@ const executeCsvImport = () => {
                     <input v-model="search"
                            type="text"
                            placeholder="Search quote #, client, email..."
-                           class="w-full pl-9 pr-4 py-2 bg-white border border-gray-200 rounded-lg text-sm text-gray-900 focus:border-gray-400 focus:outline-none" />
+                           class="field-control w-full pl-9 pr-4" />
                 </div>
 
                 <!-- Status Filter -->
                 <div class="w-full sm:w-44">
                     <select v-model="selectedStatus"
-                            class="w-full py-2 px-3 bg-white border border-gray-200 rounded-lg text-sm text-gray-900 focus:border-gray-400 focus:outline-none">
+                            class="field-control w-full">
                         <option value="All">All Statuses</option>
                         <option v-for="opt in statusOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
                     </select>
@@ -1186,9 +1461,9 @@ const executeCsvImport = () => {
 
                 <!-- Date Range -->
                 <div class="flex items-center gap-2">
-                    <input v-model="dateFrom" type="date" title="Quotation Date From" class="py-2 px-2.5 bg-white border border-gray-200 rounded-lg text-xs text-gray-700 focus:border-gray-400 focus:outline-none" />
+                    <input v-model="dateFrom" type="date" title="Quotation Date From" class="field-control sm:w-auto" />
                     <span class="text-gray-400 text-xs">to</span>
-                    <input v-model="dateTo" type="date" title="Quotation Date To" class="py-2 px-2.5 bg-white border border-gray-200 rounded-lg text-xs text-gray-700 focus:border-gray-400 focus:outline-none" />
+                    <input v-model="dateTo" type="date" title="Quotation Date To" class="field-control sm:w-auto" />
                 </div>
             </div>
 
@@ -1244,7 +1519,9 @@ const executeCsvImport = () => {
                                             <span class="font-mono text-xs sm:text-sm font-semibold text-gray-900 block">{{ quote.quotation_number }}</span>
                                             <div class="flex items-center gap-1.5 mt-0.5">
                                                 <StatusBadge :status="quote.status_label ?? quote.status" size="sm" />
-                                                <span v-if="quote.status === 'for_approval' && quote.is_approved" class="rounded-md border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700">Approved, not sent</span>
+                                                <span v-if="quote.status === 'draft' && quote.is_approved" class="rounded-md border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700">Approved, not sent</span>
+                                                <span v-else-if="quote.status === 'draft' && quote.submitted_for_approval_at" class="rounded-md border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">Awaiting approval</span>
+                                                <span v-else-if="quote.waiting_for_stock?.length" class="rounded-md border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700" :title="`Being purchased: ${quote.waiting_for_stock.join(', ')}`">Waiting for stock</span>
                                                 <span class="text-[11px] text-gray-500 truncate max-w-[130px]" :title="quote.client_name">{{ quote.client_name }}</span>
                                             </div>
                                         </div>
@@ -1313,6 +1590,9 @@ const executeCsvImport = () => {
                                 <td class="py-4 text-right whitespace-nowrap">
                                     <div class="inline-flex items-center gap-1.5">
                                         <!-- The next step for this quotation -->
+                                        <SpecularButton v-if="can(quote, 'request_stock')" variant="secondary" size="sm" :radius="8" :disabled="workflowBusy" @click="promptRequestStock(quote)" title="Some products are short: request a purchase for the missing quantities">
+                                            <span>Request stock</span>
+                                        </SpecularButton>
                                         <SpecularButton v-if="can(quote, 'approve')" variant="brand" size="sm" :radius="8" :disabled="workflowBusy" @click="promptApprove(quote)" title="Approve this quotation (administrator)">
                                             <CheckCircle2 class="w-3.5 h-3.5" />
                                             <span>Approve</span>
@@ -1358,7 +1638,7 @@ const executeCsvImport = () => {
 
                                         <!-- Print / Preview -->
                                         <button @click="openPrintModal(quote)" 
-                                                title="Print / Preview Quotation"
+                                                title="Quotation document: preview, print, PDF, PNG/JPG"
                                                 class="p-1.5 text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors">
                                             <Printer class="w-4 h-4 text-[#4b5320]" />
                                         </button>
@@ -1396,6 +1676,7 @@ const executeCsvImport = () => {
                                                     <th class="pb-1 font-medium text-center">Quantity</th>
                                                     <th class="pb-1 font-medium text-right">Unit Price</th>
                                                     <th class="pb-1 font-medium text-right">Amount</th>
+                                                    <th v-if="quote.status === 'draft'" class="pb-1 pl-3 font-medium">Stock</th>
                                                 </tr>
                                             </thead>
                                             <tbody class="divide-y divide-gray-50">
@@ -1405,6 +1686,9 @@ const executeCsvImport = () => {
                                                     <td class="py-1.5 text-center font-semibold text-gray-800">{{ item.quantity }}</td>
                                                     <td class="py-1.5 text-right text-gray-700">{{ formatCurrency(item.unit_price) }}</td>
                                                     <td class="py-1.5 text-right font-semibold text-gray-900">{{ formatCurrency(item.subtotal || (item.quantity * item.unit_price)) }}</td>
+                                                    <td v-if="quote.status === 'draft'" class="py-1.5 pl-3 text-[11px]" :class="['Insufficient Stock', 'Not Available'].includes(item.stock_status ?? '') ? 'text-amber-700' : 'text-gray-500'">
+                                                        {{ item.stock_status ?? '—' }}<template v-if="item.purchase"> · {{ item.purchase.number }} ({{ item.purchase.status }})</template>
+                                                    </td>
                                                 </tr>
                                             </tbody>
                                         </table>
@@ -1438,7 +1722,7 @@ const executeCsvImport = () => {
                     <button v-for="(link, i) in quotations.links" 
                             :key="i"
                             :disabled="!link.url || link.active"
-                            @click="link.url && router.get(link.url)"
+                            @click="link.url && router.get(link.url, {}, { only: ['quotations', 'filters', 'metrics'] })"
                             v-html="link.label"
                             :class="[
                                 link.active ? 'bg-[#4b5320] text-white font-semibold' : 'bg-white text-gray-700 border border-gray-200 hover:bg-gray-50',
@@ -1489,92 +1773,56 @@ const executeCsvImport = () => {
                             <span>Client / Customer Information</span>
                         </h4>
 
-                        <!-- Quick Select Existing Client -->
-                        <div class="flex items-center gap-2 w-full sm:w-auto">
-                            <span class="text-xs text-gray-500">Load Existing:</span>
-                            <select v-model="selectedExistingClientId" class="py-1 px-2.5 bg-white border border-gray-300 rounded text-xs text-gray-800 focus:border-[#F8B803] focus:outline-none">
-                                <option value="">-- Choose Existing Client --</option>
+                        <!-- Quick Select Existing Client (floating label driven by focus and the selected value) -->
+                        <div class="relative w-full sm:w-64" data-test="existing-client">
+                            <select
+                                id="q_existing_client"
+                                v-model="selectedExistingClientId"
+                                class="field-control pt-5 pb-1.5"
+                                @focus="existingClientFocused = true"
+                                @blur="existingClientFocused = false"
+                            >
+                                <!-- Empty while the label sits inside the field, so the two never overlap -->
+                                <option value="">{{ existingClientLabelUp ? '-- Choose Existing Client --' : '' }}</option>
                                 <option v-for="c in clients" :key="c.id" :value="c.id">{{ c.company_name }}</option>
                             </select>
+                            <label
+                                for="q_existing_client"
+                                class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] text-sm font-medium transition-all duration-200"
+                                :class="[existingClientLabelUp ? FLOAT_LABEL_UP : '', existingClientFocused ? 'text-[#4b5320]' : 'text-gray-500']"
+                            >
+                                Load Existing Client
+                            </label>
                         </div>
                     </div>
 
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                        <!-- Company / Client Name -->
                         <div class="relative">
-                            <input id="q_client_name"
-                                   v-model="form.client_name" 
-                                   type="text" 
-                                   placeholder=" " 
-                                   class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm" 
-                                   required />
-                            <label for="q_client_name"
-                                   class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                   :class="form.client_name ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                                Company / Client Name
-                            </label>
+                            <input id="q_client_name" v-model="form.client_name" type="text" placeholder=" " :class="FLOAT_FIELD" required />
+                            <label for="q_client_name" :class="FLOAT_LABEL">Company / Client Name <span class="text-rose-600">*</span></label>
                         </div>
-
-                        <!-- Contact Person -->
                         <div class="relative">
-                            <input id="q_contact_person"
-                                   v-model="form.contact_person" 
-                                   type="text" 
-                                   placeholder=" " 
-                                   class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm" />
-                            <label for="q_contact_person"
-                                   class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                   :class="form.contact_person ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                                Contact Person
-                            </label>
+                            <input id="q_contact_person" v-model="form.contact_person" type="text" placeholder=" " :class="FLOAT_FIELD" />
+                            <label for="q_contact_person" :class="FLOAT_LABEL">Contact Person</label>
                         </div>
-
-                        <!-- Email Address -->
                         <div class="relative">
-                            <input id="q_email"
-                                   v-model="form.email" 
-                                   type="email" 
-                                   placeholder=" " 
-                                   class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm" />
-                            <label for="q_email"
-                                   class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                   :class="form.email ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                                Email Address
-                            </label>
+                            <input id="q_email" v-model="form.email" type="email" placeholder=" " :class="FLOAT_FIELD" />
+                            <label for="q_email" :class="FLOAT_LABEL">Email Address</label>
                         </div>
-
-                        <!-- Contact / Phone Number -->
                         <div class="relative">
-                            <input id="q_phone"
-                                   v-model="form.phone" 
-                                   type="text" 
-                                   placeholder=" " 
-                                   class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm" />
-                            <label for="q_phone"
-                                   class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                   :class="form.phone ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                                Contact / Phone Number
-                            </label>
+                            <input id="q_phone" v-model="form.phone" type="text" placeholder=" " :class="FLOAT_FIELD" />
+                            <label for="q_phone" :class="FLOAT_LABEL">Contact / Phone Number</label>
                         </div>
-
-                        <!-- Project Site / Billing Address -->
                         <div class="relative md:col-span-2">
-                            <input id="q_address"
-                                   v-model="form.address" 
-                                   type="text" 
-                                   placeholder=" " 
-                                   class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm" />
-                            <label for="q_address"
-                                   class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                   :class="form.address ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                                Project Site / Billing Address
-                            </label>
+                            <input id="q_address" v-model="form.address" type="text" placeholder=" " :class="FLOAT_FIELD" />
+                            <label for="q_address" :class="FLOAT_LABEL">Project Site / Billing Address</label>
                         </div>
                     </div>
                 </div>
 
                 <!-- Section 2: Quotation Metadata -->
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <h4 class="sm:col-span-3 text-xs font-semibold text-gray-700">Quotation Details</h4>
                     <!-- Quotation Number Badge Preview -->
                     <div class="sm:col-span-3 px-3.5 py-2 rounded-xl border border-amber-200/80 bg-amber-50/50 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
                         <div class="flex items-center gap-2">
@@ -1584,44 +1832,29 @@ const executeCsvImport = () => {
                         <span class="text-[11px] text-gray-500">Format: Q&lt;MMDDYY&gt;-&lt;PRODUCT_ID&gt; (eg Q010423-068SSCR2)</span>
                     </div>
 
-                    <!-- Quotation Date -->
-                    <div class="relative">
-                        <input id="q_date"
-                               v-model="form.quotation_date" 
-                               type="date" 
-                               class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm" 
-                               required />
-                        <label for="q_date"
-                               class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-[#4b5320]">
-                            Quotation Date
-                        </label>
+                    <!-- Quotation Date: set by the system -->
+                    <div>
+                        <span class="field-label">Quotation Date</span>
+                        <div class="field-control flex items-center bg-gray-50 text-gray-700">{{ formatDate(form.quotation_date) }}</div>
+                        <p class="mt-1 text-[11px] text-gray-500">{{ isEditing ? 'Set when the quotation was created.' : 'Auto-generated: today.' }}</p>
                     </div>
 
-                    <!-- Valid Until -->
-                    <div class="relative">
-                        <input id="q_valid_until"
-                               v-model="form.valid_until" 
-                               type="date" 
-                               :min="form.quotation_date" 
-                               class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm" 
-                               required />
-                        <label for="q_valid_until"
-                               class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-[#4b5320]">
-                            Valid Until / Expiration
-                        </label>
+                    <!-- Valid Until: set when approved -->
+                    <div>
+                        <span class="field-label">Valid Until</span>
+                        <div class="field-control flex items-center bg-gray-50" :class="form.valid_until ? 'text-gray-700' : 'text-gray-400'">
+                            {{ form.valid_until ? formatDate(form.valid_until) : 'Set when approved' }}
+                        </div>
+                        <p class="mt-1 text-[11px] text-gray-500">Automatically {{ quotationValidityDays ?? 3 }} days after the quotation is approved.</p>
                     </div>
 
-                    <!-- Initial Status -->
-                    <div class="relative">
-                        <select id="q_status"
-                                v-model="form.status" 
-                                class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm">
+                    <!-- Status: a new quotation is a Draft; approval is a separate step -->
+                    <div>
+                        <label for="q_status" class="field-label">Status</label>
+                        <div v-if="!isEditing" class="field-control flex items-center bg-gray-50 text-gray-700">Draft</div>
+                        <select v-else id="q_status" v-model="form.status" class="field-control">
                             <option v-for="s in formStatusChoices" :key="s.value" :value="s.value">{{ s.label }}</option>
                         </select>
-                        <label for="q_status"
-                               class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-[#4b5320]">
-                            Status (approval is a separate step)
-                        </label>
                     </div>
                 </div>
 
@@ -1641,14 +1874,14 @@ const executeCsvImport = () => {
                     </div>
 
                     <!-- Items Table -->
-                    <div class="border border-gray-200 rounded-xl overflow-hidden">
+                    <div class="border border-gray-200 rounded-xl overflow-x-auto">
                         <table class="w-full text-left text-xs border-collapse">
                             <thead class="bg-gray-50 text-gray-600 border-b border-gray-200">
                                 <tr>
-                                    <th class="p-2.5 font-semibold w-5/12">Product Selection / SKU</th>
+                                    <th class="p-2.5 font-semibold w-5/12">Description</th>
                                     <th class="p-2.5 font-semibold w-24 text-center">Stock</th>
-                                    <th class="p-2.5 font-semibold w-20">Qty *</th>
-                                    <th class="p-2.5 font-semibold w-28" title="Internal only: never shown to the customer">Supplier Cost (USD)</th>
+                                    <th class="p-2.5 font-semibold w-20">Quantity *</th>
+                                    <th class="p-2.5 font-semibold w-44" title="Internal only: never shown to the customer">Supplier &amp; Unit Cost (USD)</th>
                                     <th class="p-2.5 font-semibold w-28">Unit Price (USD)</th>
                                     <th class="p-2.5 font-semibold w-24">Discount (USD)</th>
                                     <th class="p-2.5 font-semibold text-right w-28">Subtotal</th>
@@ -1668,20 +1901,23 @@ const executeCsvImport = () => {
                                             </option>
                                         </select>
                                         <div class="flex items-center gap-2">
-                                            <input v-model="item.product_name" type="text" placeholder="Custom Product Name" class="flex-1 bg-gray-50/50 border border-gray-200 rounded p-1 text-[11px] text-gray-900 focus:outline-none" />
+                                            <input v-model="item.product_name" type="text" placeholder="Description" aria-label="Description" class="flex-1 bg-gray-50/50 border border-gray-200 rounded p-1 text-[11px] text-gray-900 focus:outline-none" />
                                             <input v-model="item.sku" type="text" placeholder="SKU" class="w-28 font-mono bg-gray-50/50 border border-gray-200 rounded p-1 text-[11px] text-gray-500 focus:outline-none" />
                                         </div>
                                     </td>
 
                                     <!-- Stock & Stock Warning -->
                                     <td class="p-2.5 text-center">
-                                        <span :class="item.stock <= 0 ? 'bg-rose-100 text-rose-700' : (item.quantity > item.stock ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-700')"
-                                              class="px-2 py-0.5 rounded-full text-[10px] font-semibold block">
-                                            {{ item.stock }} available
-                                        </span>
-                                        <span v-if="item.quantity > item.stock" class="text-[10px] text-rose-600 font-semibold block mt-1 leading-tight">
-                                            ⚠️ Insufficient stock
-                                        </span>
+                                        <span v-if="item.stock === null" class="text-gray-400">—</span>
+                                        <template v-else>
+                                            <span :class="item.stock <= 0 ? 'bg-rose-100 text-rose-700' : ((Number(item.quantity) || 0) > item.stock ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-700')"
+                                                  class="px-2 py-0.5 rounded-full text-[10px] font-semibold block">
+                                                {{ item.stock }} available
+                                            </span>
+                                            <span v-if="(Number(item.quantity) || 0) > item.stock" class="text-[10px] text-rose-600 font-semibold block mt-1 leading-tight">
+                                                ⚠️ Insufficient stock
+                                            </span>
+                                        </template>
                                     </td>
 
                                     <!-- Qty -->
@@ -1691,7 +1927,13 @@ const executeCsvImport = () => {
 
                                     <!-- Supplier cost (internal) -->
                                     <td class="p-2.5">
+                                        <label class="sr-only" :for="`q-supplier-${index}`">Select Supplier</label>
+                                        <select :id="`q-supplier-${index}`" v-model="item.supplier_id" @change="onSupplierSelect(index)" class="mb-1 w-full bg-white border border-gray-200 rounded p-1.5 text-xs text-gray-900 focus:border-[#F8B803] focus:outline-none" data-test="line-supplier">
+                                            <option :value="null">Select Supplier</option>
+                                            <option v-for="s in suppliers ?? []" :key="s.id" :value="s.id">{{ s.name }}{{ s.status && s.status !== 'Active' ? ` (${s.status})` : '' }}</option>
+                                        </select>
                                         <input v-model.number="item.unit_cost" type="number" min="0" step="0.01" placeholder="—" class="w-full bg-gray-50 border border-gray-200 rounded p-1.5 text-xs text-right text-gray-700 focus:border-[#F8B803] focus:outline-none" />
+                                        <span v-if="costNote(item)" class="block text-[10px] mt-0.5 leading-tight" :class="costNote(item)?.missing ? 'text-amber-700 font-semibold' : 'text-gray-500'" data-test="cost-note">{{ costNote(item)?.text }}<template v-if="costNote(item)?.missing"> – enter the cost manually</template></span>
                                         <span v-if="lineMargin(item) !== null" class="block text-[10px] mt-0.5 text-right" :class="(lineMargin(item) ?? 0) < 0 ? 'text-rose-600 font-semibold' : 'text-gray-500'">Margin {{ lineMargin(item) }}%</span>
                                     </td>
 
@@ -1707,7 +1949,7 @@ const executeCsvImport = () => {
 
                                     <!-- Item Subtotal -->
                                     <td class="p-2.5 text-right font-mono font-semibold text-gray-900">
-                                        {{ formatCurrency(Math.max(0, (item.unit_price - item.discount) * item.quantity)) }}
+                                        {{ formatCurrency(lineSubtotal(item)) }}
                                     </td>
 
                                     <!-- Delete Item -->
@@ -1726,36 +1968,27 @@ const executeCsvImport = () => {
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2 border-t border-gray-100">
                     <!-- Left: Notes & Terms -->
                     <div class="space-y-3">
-                        <div class="relative">
-                            <textarea id="q_notes"
-                                      v-model="form.notes" 
-                                      rows="2" 
-                                      placeholder=" " 
-                                      class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-900 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm"></textarea>
-                            <label for="q_notes"
-                                   class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                   :class="form.notes ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                                Internal Notes / Scope Description
-                            </label>
+                        <h4 class="text-xs font-semibold text-gray-700">Additional Information</h4>
+                        <div>
+                            <label for="q_notes" class="field-label">Internal Notes / Scope Description</label>
+                            <textarea id="q_notes" v-model="form.notes" rows="3" placeholder="Enter notes" class="field-control"></textarea>
                         </div>
 
-                        <div class="relative">
-                            <textarea id="q_terms"
-                                      v-model="form.terms_and_conditions" 
-                                      rows="3" 
-                                      placeholder=" " 
-                                      class="peer block w-full rounded-xl border border-gray-200 bg-white px-3.5 pt-5 pb-2 text-xs text-gray-600 focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320] focus:outline-none sm:text-sm"></textarea>
-                            <label for="q_terms"
-                                   class="pointer-events-none absolute top-3.5 left-3.5 origin-[0] -translate-y-2.5 scale-75 transform text-xs font-semibold text-gray-500 duration-200 peer-placeholder-shown:translate-y-0 peer-placeholder-shown:scale-100 peer-focus:-translate-y-2.5 peer-focus:scale-75 peer-focus:text-[#4b5320]"
-                                   :class="form.terms_and_conditions ? '-translate-y-2.5 scale-75 text-[#4b5320]' : ''">
-                                Terms & Conditions
-                            </label>
+                        <!-- Fixed terms: the same on every quotation, not editable -->
+                        <div>
+                            <span class="field-label">Terms &amp; Conditions</span>
+                            <div class="max-h-56 overflow-y-auto rounded-xl border border-gray-200 bg-gray-50 px-3.5 py-3 text-[11px] leading-relaxed text-gray-700">
+                                <p class="mb-1.5 font-semibold text-gray-900">TERMS AND CONDITIONS</p>
+                                <ol class="list-decimal space-y-1 pl-4">
+                                    <li v-for="(term, i) in quotationTerms ?? []" :key="i" class="whitespace-pre-line">{{ term }}</li>
+                                </ol>
+                            </div>
                         </div>
                     </div>
 
                     <!-- Right: Dynamic Totals Panel -->
                     <div class="bg-gray-50/80 p-4 rounded-xl border border-gray-200 flex flex-col justify-between">
-                        <h4 class="text-xs font-semibold text-gray-700 mb-3">Calculated Quotation Summary</h4>
+                        <h4 class="text-xs font-semibold text-gray-700 mb-3">Quotation Summary</h4>
 
                         <div class="space-y-2 text-xs">
                             <div class="flex justify-between text-gray-600">
@@ -1764,16 +1997,16 @@ const executeCsvImport = () => {
                             </div>
 
                             <div class="flex justify-between items-center text-gray-600">
-                                <span>Quotation Discount (USD):</span>
-                                <input v-model.number="form.discount" type="number" min="0" step="0.01" class="w-24 bg-white border border-gray-200 rounded p-1 text-xs text-right font-mono font-semibold text-rose-600 focus:outline-none" />
+                                <label for="q_discount">Quotation Discount:</label>
+                                <input id="q_discount" v-model.number="form.discount" type="number" min="0" step="0.01" placeholder="0.00" class="w-24 bg-white border border-gray-200 rounded p-1 text-xs text-right font-mono font-semibold text-rose-600 focus:outline-none" />
                             </div>
 
                             <div class="flex justify-between items-center text-gray-600">
                                 <div class="flex items-center gap-1">
-                                    <span>Value Added Tax (VAT %):</span>
+                                    <label for="q_vat">VAT (%):</label>
                                 </div>
                                 <div class="flex items-center gap-2">
-                                    <input v-model.number="form.tax_rate" type="number" min="0" max="100" step="0.5" class="w-16 bg-white border border-gray-200 rounded p-1 text-xs text-right font-mono text-gray-800 focus:outline-none" />
+                                    <input id="q_vat" v-model.number="form.tax_rate" type="number" min="0" max="100" step="0.5" class="w-16 bg-white border border-gray-200 rounded p-1 text-xs text-right font-mono text-gray-800 focus:outline-none" />
                                     <span class="font-mono font-semibold">{{ formatCurrency(formTaxAmount) }}</span>
                                 </div>
                             </div>
@@ -1786,7 +2019,7 @@ const executeCsvImport = () => {
 
                         <div class="mt-4 p-2 bg-emerald-50 rounded-lg border border-emerald-200 text-[11px] text-emerald-800 flex items-center gap-1.5">
                             <CheckCircle2 class="w-3.5 h-3.5 shrink-0 text-emerald-600" />
-                            <span>Creating a quotation does not deduct inventory stock until converted to sale.</span>
+                            <span>Creating a quotation does not deduct inventory stock.</span>
                         </div>
                     </div>
                 </div>
@@ -1830,14 +2063,25 @@ const executeCsvImport = () => {
                 <label class="block text-xs font-semibold text-gray-700">Select New Status</label>
                 <p class="text-[11px] text-gray-500">Approval, sending and the customer's answer have their own buttons.</p>
                 <div class="grid grid-cols-1 gap-2">
-                    <label v-for="opt in manualStatusOptions" :key="opt.value" 
-                           :class="targetStatus === opt.value ? 'border-[#F8B803] bg-[#F8B803]/10 ring-1 ring-[#F8B803]' : 'border-gray-200 bg-white'"
-                           class="border rounded-xl p-3 cursor-pointer flex items-center justify-between transition-colors">
+                    <label v-for="opt in manualStatusOptions" :key="opt.value"
+                           :class="statusBlockedReason(opt.value)
+                               ? 'border-gray-200 bg-gray-50 cursor-not-allowed'
+                               : targetStatus === opt.value ? 'border-[#F8B803] bg-[#F8B803]/10 ring-1 ring-[#F8B803] cursor-pointer' : 'border-gray-200 bg-white cursor-pointer'"
+                           class="border rounded-xl p-3 transition-colors">
                         <div class="flex items-center gap-2">
-                            <input type="radio" v-model="targetStatus" :value="opt.value" class="accent-[#4b5320]" />
-                            <span class="text-sm font-semibold text-gray-900">{{ opt.label }}</span>
+                            <input type="radio" v-model="targetStatus" :value="opt.value" :disabled="!!statusBlockedReason(opt.value)" class="accent-[#4b5320]" @change="statusError = null" />
+                            <span class="text-sm font-semibold" :class="statusBlockedReason(opt.value) ? 'text-gray-400' : 'text-gray-900'">{{ opt.label }}</span>
                         </div>
+                        <p v-if="statusBlockedReason(opt.value)" class="mt-1.5 pl-6 text-xs text-amber-700">
+                            {{ statusBlockedReason(opt.value) }}
+                            <button type="button" class="font-semibold text-[#4b5320] underline hover:no-underline" @click.prevent="priceFromStatus">Edit &amp; price items</button>
+                        </p>
                     </label>
+                    <p v-if="!manualStatusOptions.length" class="text-sm text-gray-500">No status change is available for this quotation right now.</p>
+                </div>
+                <div v-if="statusError" role="alert" class="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
+                    <AlertCircle class="mt-0.5 size-4 shrink-0" />
+                    <span>{{ statusError }}</span>
                 </div>
                 <textarea v-model="statusRemarks" rows="2" maxlength="1000" placeholder="Remarks (optional), e.g. waiting for supplier price on item 3" class="field-control"></textarea>
             </div>
@@ -1857,7 +2101,7 @@ const executeCsvImport = () => {
                     variant="brand"
                     size="md"
                     :radius="10"
-                    :disabled="isUpdatingStatus"
+                    :disabled="isUpdatingStatus || !targetStatus"
                     @click="promptUpdateStatus"
                 >
                     {{ isUpdatingStatus ? 'Updating...' : 'Update Status' }}
@@ -1912,7 +2156,7 @@ const executeCsvImport = () => {
 
             <p class="mt-4 text-xs text-gray-600">
                 The order starts as <strong>Pending Payment</strong>. Nothing is taken from stock and no payment is recorded now.
-                The customer is emailed the Sales Order with the payment instructions.
+                The customer is not emailed at this step.
             </p>
 
             <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
@@ -1958,35 +2202,14 @@ const executeCsvImport = () => {
                     <label class="field-label" for="decision-remarks">Remarks (optional)</label>
                     <textarea id="decision-remarks" v-model="decision.remarks" rows="2" maxlength="1000" placeholder="e.g. PO number, who confirmed, reason for rejecting" class="field-control"></textarea>
                 </div>
-                <template v-if="decision.decision === 'accepted'">
-                    <div class="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
-                        Saving the acceptance emails the customer a confirmation and creates the Sales Order (Pending) with the payment instructions.
-                    </div>
-                    <div>
-                        <span class="field-label">Fulfillment</span>
-                        <div class="grid grid-cols-2 gap-2">
-                            <label v-for="opt in [{ v: 'delivery', l: 'Delivery' }, { v: 'pickup', l: 'Customer pickup' }]" :key="opt.v"
-                                   :class="decision.fulfillment_type === opt.v ? 'border-[#4b5320] bg-[#4b5320]/5' : 'border-gray-200'"
-                                   class="flex cursor-pointer items-center gap-2 rounded-xl border p-3 text-sm">
-                                <input v-model="decision.fulfillment_type" type="radio" :value="opt.v" class="accent-[#4b5320]" />
-                                {{ opt.l }}
-                            </label>
-                        </div>
-                    </div>
-                    <div v-if="decision.fulfillment_type === 'delivery'">
-                        <label class="field-label" for="decision-address">Delivery address</label>
-                        <textarea id="decision-address" v-model="decision.delivery_address" rows="2" maxlength="500" class="field-control"></textarea>
-                    </div>
-                    <div>
-                        <label class="field-label" for="decision-instructions">Delivery or pickup instructions (optional)</label>
-                        <textarea id="decision-instructions" v-model="decision.delivery_instructions" rows="2" maxlength="1000" class="field-control"></textarea>
-                    </div>
-                </template>
+                <div v-if="decision.decision === 'accepted'" class="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+                    The quotation becomes Accepted. Create its Sales Order next in Sales → New Sales Order. The customer is not emailed at this step.
+                </div>
             </div>
 
             <div class="mt-6 flex flex-col-reverse gap-3 border-t border-gray-200 pt-4 sm:flex-row sm:justify-end">
                 <button type="button" class="secondary-button" @click="showDecisionModal = false">Cancel</button>
-                <button type="submit" class="brand-button" :disabled="workflowBusy">{{ decision.decision === 'accepted' ? 'Save and create Sales Order' : 'Save answer' }}</button>
+                <button type="submit" class="brand-button" :disabled="workflowBusy">{{ decision.decision === 'accepted' ? 'Save acceptance' : 'Save answer' }}</button>
             </div>
         </form>
     </div>
@@ -2045,12 +2268,67 @@ const executeCsvImport = () => {
                     <h4 class="text-xs font-medium text-gray-500 mb-2">Brands requested</h4>
                     <ul class="space-y-1">
                         <li v-for="(b, i) in activeQuotation.request_details?.brands ?? []" :key="i" class="text-gray-900">
-                            <span class="font-medium">{{ b.brand }}</span><span v-if="b.details" class="text-gray-600"> — {{ b.details }}</span>
+                            <span class="font-medium">{{ b.brand }}</span><span v-if="b.brand_name" class="text-gray-900"> ({{ b.brand_name }})</span><span v-if="b.details" class="text-gray-600"> — {{ b.details }}</span><span v-if="b.quantity != null" class="text-gray-600"> · Qty {{ b.quantity }}</span>
                         </li>
                     </ul>
                     <p v-if="activeQuotation.request_details?.unlisted_brands" class="mt-1.5 whitespace-pre-line text-gray-700">
                         <span class="text-gray-500">Other brands (not in our catalog):</span> {{ activeQuotation.request_details.unlisted_brands }}
                     </p>
+                </section>
+
+                <section v-if="activeQuotation.request_details?.product_list?.length">
+                    <h4 class="text-xs font-medium text-gray-500 mb-2">Products from the client's list (confirmed by the client)</h4>
+                    <div class="overflow-x-auto border border-gray-200 rounded-lg">
+                        <table class="w-full text-left text-xs">
+                            <thead class="bg-gray-50 text-gray-500">
+                                <tr>
+                                    <th class="p-2 font-medium">Description</th>
+                                    <th class="p-2 font-medium text-right">Quantity</th>
+                                    <th class="p-2 font-medium">Unit</th>
+                                    <th class="p-2 font-medium">File</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-100">
+                                <tr v-for="(p, i) in activeQuotation.request_details.product_list" :key="i">
+                                    <td class="p-2 text-gray-900">{{ p.description }}</td>
+                                    <td class="p-2 text-right text-gray-900 tabular-nums">{{ p.quantity }}</td>
+                                    <td class="p-2 text-gray-700">{{ p.unit || '—' }}</td>
+                                    <td class="p-2 text-gray-500 truncate max-w-[10rem]" :title="p.source ?? ''">{{ p.source || 'Typed by the client' }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <section v-if="activeQuotation.request_details?.extracted_products?.length" data-test="extracted-products">
+                    <h4 class="text-xs font-medium text-gray-500 mb-1">Products read from the uploaded lists</h4>
+                    <p class="text-xs text-gray-500 mb-2">Read automatically and not checked by the client. Verify each row against the file before quoting.</p>
+                    <div v-for="(f, fi) in activeQuotation.request_details.extracted_products" :key="fi" class="mb-3 last:mb-0">
+                        <p class="text-xs font-medium text-gray-700 mb-1">
+                            {{ f.file }}<span v-if="f.method === 'ocr' || f.method === 'pdf-ocr'" class="font-normal text-gray-500"> · read by OCR</span>
+                        </p>
+                        <p v-if="f.message" class="text-xs text-amber-700">{{ f.message }}</p>
+                        <div v-if="f.rows.length" class="overflow-x-auto border border-gray-200 rounded-lg">
+                            <table class="w-full text-left text-xs">
+                                <thead class="bg-gray-50 text-gray-500">
+                                    <tr>
+                                        <th class="p-2 font-medium">Description</th>
+                                        <th class="p-2 font-medium text-right">Quantity</th>
+                                        <th class="p-2 font-medium">Unit</th>
+                                        <th class="p-2 font-medium">Check</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-100">
+                                    <tr v-for="(r, ri) in f.rows" :key="ri" :class="r.issues.length ? 'bg-amber-50/50' : ''">
+                                        <td class="p-2 text-gray-900">{{ r.description || '—' }}</td>
+                                        <td class="p-2 text-right text-gray-900 tabular-nums">{{ r.quantity ?? '—' }}</td>
+                                        <td class="p-2 text-gray-700">{{ r.unit || '—' }}</td>
+                                        <td class="p-2 text-amber-700">{{ r.issues.join(' ') }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 </section>
 
                 <section>
@@ -2118,9 +2396,15 @@ const executeCsvImport = () => {
             </div>
 
             <div class="px-6 py-4 border-t border-gray-100 bg-gray-50 flex flex-wrap justify-end gap-2">
-                <SpecularButton variant="secondary" size="md" :radius="10" @click="openPrintModal(activeQuotation)">Print</SpecularButton>
+                <SpecularButton variant="secondary" size="md" :radius="10" @click="openPrintModal(activeQuotation)">Print / Download</SpecularButton>
                 <SpecularButton variant="secondary" size="md" :radius="10" @click="statusFromReview">Update status</SpecularButton>
-                <SpecularButton variant="brand" size="md" :radius="10" @click="editFromReview">Edit &amp; price items</SpecularButton>
+                <SpecularButton :variant="can(activeQuotation, 'send') ? 'secondary' : 'brand'" size="md" :radius="10" @click="editFromReview">Edit &amp; price items</SpecularButton>
+                <SpecularButton v-if="can(activeQuotation, 'resend')" variant="secondary" size="md" :radius="10" :disabled="workflowBusy" @click="promptSend(activeQuotation)">
+                    <Mail class="w-4 h-4" /> Resend Quotation
+                </SpecularButton>
+                <SpecularButton v-if="can(activeQuotation, 'send')" variant="brand" size="md" :radius="10" :disabled="workflowBusy" @click="promptSend(activeQuotation)">
+                    <Mail class="w-4 h-4" /> Send Quotation
+                </SpecularButton>
             </div>
         </div>
     </div>
@@ -2182,30 +2466,146 @@ const executeCsvImport = () => {
                 <p v-if="materialImportError" class="text-xs font-medium text-red-600" role="alert">{{ materialImportError }}</p>
                 <p v-if="isReadingMaterials" class="text-xs text-gray-500" role="status">Reading the file… photos and scanned PDFs can take up to a minute.</p>
 
+                <!-- Choosing the columns by hand, when the headers are not recognised -->
+                <section v-if="showMaterialColumns && materialColumns" aria-labelledby="mi-columns-title" class="space-y-3 rounded-lg border border-gray-200 p-3">
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <h4 id="mi-columns-title" class="text-xs font-semibold text-gray-900">Choose the columns</h4>
+                            <p class="mt-0.5 text-xs text-gray-500">Pick the row with the column headers, then the column that holds each field. Rows above the header row are skipped.</p>
+                        </div>
+                        <button v-if="materialPreview" type="button" class="text-[11px] text-gray-500 underline hover:text-gray-800" @click="showMaterialColumns = false">Close</button>
+                    </div>
+
+                    <div class="border border-gray-200 rounded-lg overflow-auto max-h-56">
+                        <table class="w-full text-left text-xs">
+                            <caption class="sr-only">First rows of the file</caption>
+                            <thead class="bg-gray-50 text-gray-500 sticky top-0">
+                                <tr>
+                                    <th scope="col" class="px-2 py-1.5 font-medium w-10">Row</th>
+                                    <th v-for="col in materialColumnCount" :key="col" scope="col" class="px-2 py-1.5 font-medium align-bottom whitespace-nowrap">
+                                        <span class="font-mono">{{ columnLetter(col - 1) }}</span>
+                                        <span v-if="materialFieldForColumn(col - 1)" class="ml-1 rounded-full border border-[#4b5320]/30 bg-[#4b5320]/5 px-1.5 py-0.5 text-[10px] font-semibold text-[#4b5320]">{{ materialFieldForColumn(col - 1) }}</span>
+                                        <span v-if="materialHeaderLabel(col - 1)" class="block max-w-[10rem] truncate font-normal text-gray-500">{{ materialHeaderLabel(col - 1) }}</span>
+                                    </th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-100">
+                                <tr
+                                    v-for="(row, r) in materialColumns.preview"
+                                    :key="r"
+                                    :class="String(r) === materialHeaderRow ? 'bg-gray-50 font-semibold text-gray-900' : materialHeaderRow !== '' && r < Number(materialHeaderRow) ? 'text-gray-400' : 'text-gray-700'"
+                                >
+                                    <td class="px-2 py-1 font-mono text-gray-400">{{ r + 1 }}</td>
+                                    <td v-for="col in materialColumnCount" :key="col" class="px-2 py-1 max-w-[12rem] truncate" :title="row[col - 1] ?? ''">{{ row[col - 1] ?? '' }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div>
+                        <label for="mi-header-row" class="block text-xs font-medium text-gray-700 mb-1">Header row</label>
+                        <select id="mi-header-row" v-model="materialHeaderRow" class="w-full py-1.5 px-2 bg-white border border-gray-200 rounded-lg text-xs focus:border-gray-400 focus:outline-none">
+                            <option value="">No header row (every row is a material)</option>
+                            <option v-for="(row, r) in materialColumns.preview" :key="r" :value="String(r)">{{ materialRowOption(row, r) }}</option>
+                        </select>
+                    </div>
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div v-for="field in materialColumns.fields" :key="field.key">
+                            <label :for="`mi-col-${field.key}`" class="block text-xs font-medium text-gray-700 mb-1">{{ field.label }} <span v-if="field.required" class="text-red-600">*</span></label>
+                            <select :id="`mi-col-${field.key}`" v-model="materialMapping[field.key]" class="w-full py-1.5 px-2 bg-white border border-gray-200 rounded-lg text-xs focus:border-gray-400 focus:outline-none">
+                                <option value="">— Not in file —</option>
+                                <option v-for="col in materialColumnCount" :key="col" :value="String(col - 1)">{{ materialColumnOption(col - 1) }}</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-wrap items-center justify-end gap-3">
+                        <p v-if="materialMappingProblem" class="text-xs text-gray-500" aria-live="polite">{{ materialMappingProblem }}</p>
+                        <SpecularButton variant="brand" size="sm" :radius="8" :disabled="!!materialMappingProblem || isReadingMaterials" @click="applyMaterialColumns">
+                            {{ isReadingMaterials ? 'Reading…' : 'Apply columns' }}
+                        </SpecularButton>
+                    </div>
+                </section>
+
                 <div v-if="materialPreview" class="space-y-2">
-                    <p class="text-xs text-gray-600">
-                        {{ materialPreview.valid_count }} line(s) will be imported<template v-if="materialPreview.invalid_count">, {{ materialPreview.invalid_count }} skipped (missing description or quantity)</template><template v-if="materialPreview.unparsed_count">, {{ materialPreview.unparsed_count }} line(s) of the file not readable as materials</template>.
-                    </p>
+                    <div class="flex flex-wrap items-baseline justify-between gap-2">
+                        <p class="text-xs text-gray-600">
+                            {{ materialPreview.valid_count }} line(s) will be imported<template v-if="materialPreview.invalid_count">, {{ materialPreview.invalid_count }} skipped (missing description or quantity)</template><template v-if="materialPreview.unparsed_count">, {{ materialPreview.unparsed_count }} line(s) of the file not readable as materials</template>.
+                        </p>
+                        <button v-if="materialColumns && !showMaterialColumns" type="button" class="text-[11px] font-medium text-[#4b5320] underline hover:text-gray-900" @click="showMaterialColumns = true">Change columns</button>
+                    </div>
                     <p v-if="materialPreview.warning" class="text-xs text-amber-700">{{ materialPreview.warning }}</p>
                     <div class="border border-gray-200 rounded-lg overflow-x-auto max-h-64 overflow-y-auto">
                         <table class="w-full text-left text-xs">
                             <thead class="bg-gray-50 text-gray-500 sticky top-0">
                                 <tr>
                                     <th class="px-3 py-2 font-medium">Description</th>
-                                    <th class="px-3 py-2 font-medium text-right">Qty</th>
+                                    <th class="px-3 py-2 font-medium text-right w-24">Qty</th>
+                                    <th class="px-3 py-2 font-medium w-20">Unit</th>
                                     <th class="px-3 py-2 font-medium">Catalog match</th>
+                                    <th class="px-2 py-2 font-medium text-right"><span class="sr-only">Action</span></th>
                                 </tr>
                             </thead>
                             <tbody class="divide-y divide-gray-100">
-                                <tr v-for="(item, i) in materialPreview.items" :key="i" :class="item.errors.length ? 'text-gray-400' : ''">
-                                    <td class="px-3 py-2">
-                                        {{ item.description || '—' }}
-                                        <span v-if="item.errors.length" class="block text-[11px] text-red-600">{{ item.errors.join(' ') }}</span>
+                                <tr v-for="(item, i) in materialPreview.items" :key="i" :class="item.skip ? 'opacity-50 bg-gray-50' : item.errors.length ? 'bg-red-50/40' : ''">
+                                    <td class="px-3 py-1.5">
+                                        <input
+                                            v-model="item.description"
+                                            type="text"
+                                            :disabled="item.skip"
+                                            placeholder="NULL"
+                                            class="w-full rounded border px-2 py-1 text-xs placeholder:font-mono placeholder:text-[10px] placeholder:text-gray-300 focus:border-[#4b5320] focus:outline-none"
+                                            :class="item.errors.length && !item.description ? 'border-red-300 bg-red-50/40' : 'border-gray-200 bg-white'"
+                                            @input="validateMaterialPreviewItem(item)"
+                                        />
+                                        <span v-if="item.errors.length && !item.skip" class="mt-0.5 block text-[11px] text-red-600">{{ item.errors.join(' ') }}</span>
+                                        <span v-if="item.warnings?.length && !item.skip" class="mt-0.5 block text-[11px] text-amber-700">{{ item.warnings.join(' ') }}</span>
                                     </td>
-                                    <td class="px-3 py-2 text-right whitespace-nowrap">{{ item.quantity ?? '—' }} {{ item.unit || '' }}</td>
-                                    <td class="px-3 py-2">
-                                        <template v-if="item.match">{{ item.match.name }} <span class="font-mono text-[10px] text-gray-400">{{ item.match.sku }}</span></template>
-                                        <span v-else class="text-amber-700">Needs matching and a price</span>
+                                    <td class="px-3 py-1.5 text-right whitespace-nowrap">
+                                        <input
+                                            v-model.number="item.quantity"
+                                            type="number"
+                                            min="1"
+                                            step="any"
+                                            :disabled="item.skip"
+                                            placeholder="NULL"
+                                            class="w-20 rounded border px-2 py-1 text-right text-xs placeholder:font-mono placeholder:text-[10px] placeholder:text-gray-300 focus:border-[#4b5320] focus:outline-none"
+                                            :class="item.errors.length && (!item.quantity || item.quantity <= 0) ? 'border-red-300 bg-red-50/40' : 'border-gray-200 bg-white'"
+                                            @input="validateMaterialPreviewItem(item)"
+                                        />
+                                    </td>
+                                    <td class="px-3 py-1.5 whitespace-nowrap">
+                                        <input
+                                            v-model="item.unit"
+                                            type="text"
+                                            :disabled="item.skip"
+                                            placeholder="NULL"
+                                            class="w-16 rounded border border-gray-200 bg-white px-2 py-1 text-xs placeholder:font-mono placeholder:text-[10px] placeholder:text-gray-300 focus:border-[#4b5320] focus:outline-none"
+                                        />
+                                    </td>
+                                    <td class="px-3 py-1.5">
+                                        <div class="flex flex-wrap items-center gap-1">
+                                            <span
+                                                class="rounded-full border px-1.5 py-0.5 text-[10px]"
+                                                :class="item.errors.length || item.confidence === 'low' ? 'border-rose-200 bg-rose-50 text-rose-700' : item.confidence === 'medium' || item.needs_review ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-emerald-200 bg-emerald-50 text-emerald-700'"
+                                            >
+                                                {{ item.errors.length || item.confidence === 'low' ? 'Low · verify' : item.confidence === 'medium' || item.needs_review ? 'Medium' : 'High' }}
+                                            </span>
+                                            <template v-if="item.match">
+                                                <span class="font-medium">{{ item.match.name }}</span>
+                                                <span class="font-mono text-[10px] text-gray-400">{{ item.match.sku }}</span>
+                                            </template>
+                                            <span v-else class="text-amber-700">Needs matching and a price</span>
+                                        </div>
+                                    </td>
+                                    <td class="px-2 py-1.5 text-right whitespace-nowrap">
+                                        <button
+                                            type="button"
+                                            class="text-[11px] text-gray-500 underline hover:text-gray-800"
+                                            @click="item.skip = !item.skip; validateMaterialPreviewItem(item)"
+                                        >
+                                            {{ item.skip ? 'Restore' : 'Skip' }}
+                                        </button>
                                     </td>
                                 </tr>
                             </tbody>
@@ -2216,7 +2616,7 @@ const executeCsvImport = () => {
 
             <div class="px-6 py-4 border-t border-gray-100 bg-gray-50 flex flex-wrap justify-end gap-2">
                 <SpecularButton variant="secondary" size="md" :radius="10" @click="showMaterialImportModal = false">Cancel</SpecularButton>
-                <SpecularButton variant="secondary" size="md" :radius="10" :disabled="!materialImport.file || isReadingMaterials" @click="readMaterialFile">
+                <SpecularButton variant="secondary" size="md" :radius="10" :disabled="!materialImport.file || isReadingMaterials" @click="readMaterialFile(useMaterialMapping)">
                     {{ isReadingMaterials ? 'Reading…' : materialPreview ? 'Read again' : 'Read file' }}
                 </SpecularButton>
                 <SpecularButton variant="brand" size="md" :radius="10" :disabled="!materialPreview || isCreatingFromMaterials" @click="createFromMaterials">
@@ -2227,188 +2627,37 @@ const executeCsvImport = () => {
     </div>
 
     <!-- ========================================================================= -->
-    <!-- PROFESSIONAL PRINT / PREVIEW MODAL -->
+    <!-- OFFICIAL QUOTATION: preview, print, PDF and PNG/JPG are all the same document -->
     <!-- ========================================================================= -->
-    <div v-if="showPrintModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 overflow-y-auto print:p-0 print:bg-white print:static">
-        <div class="bg-white border border-gray-200 rounded-xl w-full max-w-4xl shadow-xl overflow-hidden flex flex-col max-h-[95vh] print:max-h-none print:shadow-none print:border-none">
-            <!-- Modal Actions Bar (Hidden in print) -->
-            <div class="px-6 py-3 border-b border-gray-100 bg-gray-50 flex justify-between items-center print:hidden">
-                <div class="flex items-center gap-2 text-sm font-semibold text-gray-700">
+    <div v-if="showPrintModal && activeQuotation" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-2 sm:p-3" role="dialog" aria-modal="true" aria-labelledby="quote-doc-title">
+        <div class="bg-white border border-gray-200 rounded-xl w-full max-w-[1600px] shadow-xl overflow-hidden flex flex-col h-[97vh]">
+            <div class="px-6 py-3 border-b border-gray-100 bg-gray-50 flex flex-wrap justify-between items-center gap-3">
+                <div id="quote-doc-title" class="flex items-center gap-2 text-sm font-semibold text-gray-700">
                     <Printer class="w-4 h-4 text-[#4b5320]" />
-                    <span>Print Preview — Quotation #{{ activeQuotation?.quotation_number }}</span>
+                    <span>Quotation #{{ activeQuotation.quotation_number }}</span>
                 </div>
-                <div class="flex items-center gap-3">
-                    <button @click="triggerPrint" class="px-4 py-2 bg-[#4b5320] text-white font-semibold text-xs rounded-lg hover:opacity-95 flex items-center gap-2">
+                <div class="flex flex-wrap items-center gap-2">
+                    <button type="button" @click="triggerPrint" class="px-4 py-2 bg-[#4b5320] text-white font-semibold text-xs rounded-lg hover:opacity-95 flex items-center gap-2">
                         <Printer class="w-4 h-4" />
-                        <span>Print Quotation</span>
+                        <span>Print</span>
                     </button>
-                    <button @click="showPrintModal = false" class="text-gray-400 hover:text-gray-600 p-1.5 rounded-lg hover:bg-gray-100">
+                    <a :href="documentUrl('pdf', true)" class="px-3 py-2 bg-white border border-gray-200 text-gray-700 font-semibold text-xs rounded-lg hover:bg-gray-50 flex items-center gap-1.5">
+                        <Download class="w-4 h-4" />
+                        <span>PDF</span>
+                    </a>
+                    <button type="button" :disabled="!!imageBusy" @click="downloadImage('png')" class="px-3 py-2 bg-white border border-gray-200 text-gray-700 font-semibold text-xs rounded-lg hover:bg-gray-50 disabled:opacity-60">
+                        {{ imageBusy === 'png' ? 'Preparing…' : 'PNG' }}
+                    </button>
+                    <button type="button" :disabled="!!imageBusy" @click="downloadImage('jpg')" class="px-3 py-2 bg-white border border-gray-200 text-gray-700 font-semibold text-xs rounded-lg hover:bg-gray-50 disabled:opacity-60">
+                        {{ imageBusy === 'jpg' ? 'Preparing…' : 'JPG' }}
+                    </button>
+                    <button type="button" aria-label="Close" @click="showPrintModal = false" class="text-gray-400 hover:text-gray-600 p-1.5 rounded-lg hover:bg-gray-100">
                         <X class="w-5 h-5" />
                     </button>
                 </div>
             </div>
-
-            <!-- Printable Quotation Sheet -->
-            <div id="quotation-print-sheet" class="p-8 sm:p-12 overflow-y-auto space-y-8 bg-white text-gray-900">
-                <!-- Branded Header -->
-                <div class="flex flex-col sm:flex-row justify-between items-start border-b-2 border-[#4b5320] pb-6 gap-4">
-                    <div>
-                        <h1 class="text-2xl sm:text-3xl font-black text-[#4b5320] tracking-tight">MR-PRIDE ELECTRICAL SUPPLIES</h1>
-                        <p class="text-xs text-gray-500 mt-1 uppercase font-semibold">Industrial & Commercial Electrical Solutions</p>
-                        <p class="text-xs text-gray-500 mt-1">Direct Electrical Importers & Authorized Distributor</p>
-                        <p class="text-xs text-gray-500">Contact: +63 (2) 8123-4567 | info@mrpelectrodesk.ph</p>
-                    </div>
-
-                    <div class="sm:text-right">
-                        <span class="inline-block px-3 py-1 bg-[#F8B803]/20 text-[#4b5320] font-black text-xl tracking-widest rounded-lg mb-2">
-                            QUOTATION
-                        </span>
-                        <p class="text-sm font-bold text-gray-900 font-mono">No: {{ activeQuotation?.quotation_number }}</p>
-                        <p class="text-xs text-gray-500 mt-1">Date: <strong class="text-gray-800">{{ formatDate(activeQuotation?.quotation_date) }}</strong></p>
-                        <p class="text-xs text-gray-500">Valid Until: <strong class="text-gray-800">{{ formatDate(activeQuotation?.valid_until) }}</strong></p>
-                        <p class="text-xs text-gray-500 mt-1">Status: <span class="font-bold uppercase text-[#4b5320]">{{ activeQuotation?.status }}</span></p>
-                    </div>
-                </div>
-
-                <!-- Client Information Block -->
-                <div class="bg-gray-50 p-5 rounded-xl border border-gray-200">
-                    <h4 class="text-xs font-bold uppercase text-[#4b5320] tracking-wider mb-3">CLIENT INFORMATION</h4>
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-                        <div>
-                            <p class="text-gray-400 font-semibold uppercase text-[10px]">Company Name</p>
-                            <p class="text-sm font-bold text-gray-900 mt-0.5">{{ activeQuotation?.client_name }}</p>
-                            <p v-if="activeQuotation?.contact_person" class="text-gray-600 mt-1">Attention: <strong>{{ activeQuotation?.contact_person }}</strong></p>
-                        </div>
-                        <div>
-                            <p class="text-gray-400 font-semibold uppercase text-[10px]">Contact Details</p>
-                            <p v-if="activeQuotation?.email" class="text-gray-700 mt-0.5">Email: {{ activeQuotation?.email }}</p>
-                            <p v-if="activeQuotation?.phone" class="text-gray-700">Phone: {{ activeQuotation?.phone }}</p>
-                            <p v-if="activeQuotation?.address" class="text-gray-700 mt-1">Address: {{ activeQuotation?.address }}</p>
-                        </div>
-                    </div>
-
-                    <!-- Client Attached Spec Document -->
-                    <div v-if="activeQuotation?.attachment_url" class="mt-4 pt-3 border-t border-gray-200 flex items-center justify-between print:hidden">
-                        <div class="flex items-center gap-2 text-xs text-gray-700">
-                            <Paperclip class="w-4 h-4 text-[#4b5320]" />
-                            <span class="font-bold">Attached Technical Drawing / BOQ / Specs</span>
-                        </div>
-                        <a
-                            :href="activeQuotation.attachment_url"
-                            target="_blank"
-                            class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#4b5320] text-white text-xs font-bold rounded-lg hover:opacity-90 transition-opacity"
-                        >
-                            <Download class="w-3.5 h-3.5" />
-                            <span>Download Specification File</span>
-                        </a>
-                    </div>
-
-                    <!-- Client's original material list (the file the line items were extracted from) -->
-                    <div v-if="(activeQuotation as any)?.material_file_url" class="mt-3 pt-3 border-t border-gray-200 flex items-center justify-between print:hidden">
-                        <div class="flex items-center gap-2 text-xs text-gray-700">
-                            <Paperclip class="w-4 h-4 text-[#4b5320]" />
-                            <span class="font-bold">Client's Material List</span>
-                            <span class="text-gray-500 truncate max-w-[12rem]">{{ (activeQuotation as any).material_file_name }}</span>
-                        </div>
-                        <a
-                            :href="(activeQuotation as any).material_file_url"
-                            target="_blank"
-                            class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#4b5320] text-white text-xs font-bold rounded-lg hover:opacity-90 transition-opacity"
-                        >
-                            <Download class="w-3.5 h-3.5" />
-                            <span>Download Original File</span>
-                        </a>
-                    </div>
-                </div>
-
-                <!-- Items Table -->
-                <div>
-                    <h4 class="text-xs font-bold uppercase text-[#4b5320] tracking-wider mb-2">QUOTED ITEMS & MATERIALS</h4>
-                    <table class="w-full text-left border-collapse text-xs">
-                        <thead>
-                            <tr class="bg-gray-100 text-gray-700 border-b border-gray-300">
-                                <th class="py-2.5 px-3 font-bold w-12 text-center">#</th>
-                                <th class="py-2.5 px-3 font-bold">Product Description</th>
-                                <th class="py-2.5 px-3 font-bold w-28">SKU</th>
-                                <th class="py-2.5 px-3 font-bold text-center w-16">Qty</th>
-                                <th class="py-2.5 px-3 font-bold text-right w-24">Unit Price</th>
-                                <th class="py-2.5 px-3 font-bold text-right w-20">Discount</th>
-                                <th class="py-2.5 px-3 font-bold text-right w-28">Subtotal</th>
-                            </tr>
-                        </thead>
-                        <tbody class="divide-y divide-gray-200">
-                            <tr v-for="(item, idx) in activeQuotation?.items" :key="idx" class="hover:bg-gray-50">
-                                <td class="py-3 px-3 text-center text-gray-400 font-mono">{{ idx + 1 }}</td>
-                                <td class="py-3 px-3">
-                                    <p class="font-bold text-gray-900">{{ item.product_name }}</p>
-                                    <div v-if="(item.shortage || 0) > 0" class="mt-1 inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200 print:hidden">
-                                        <AlertTriangle class="w-3 h-3 text-amber-600" />
-                                        <span>Shortage: {{ item.shortage }} (Available in stock: {{ item.available_stock || 0 }})</span>
-                                    </div>
-                                </td>
-                                <td class="py-3 px-3 font-mono text-gray-500 text-[11px]">{{ item.sku }}</td>
-                                <td class="py-3 px-3 text-center font-bold text-gray-900">{{ item.quantity }}</td>
-                                <td class="py-3 px-3 text-right font-medium text-gray-800">{{ formatCurrency(item.unit_price) }}</td>
-                                <td class="py-3 px-3 text-right text-gray-500">{{ item.discount > 0 ? formatCurrency(item.discount) : '-' }}</td>
-                                <td class="py-3 px-3 text-right font-mono font-bold text-gray-900">{{ formatCurrency(item.subtotal) }}</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-
-                <!-- Totals Section -->
-                <div class="flex justify-end pt-2">
-                    <div class="w-full sm:w-72 space-y-2 text-xs">
-                        <div class="flex justify-between text-gray-600">
-                            <span>Subtotal:</span>
-                            <span class="font-mono font-bold">{{ formatCurrency(activeQuotation?.subtotal || 0) }}</span>
-                        </div>
-                        <div v-if="activeQuotation?.discount && activeQuotation.discount > 0" class="flex justify-between text-rose-600">
-                            <span>Discount:</span>
-                            <span class="font-mono font-bold">-{{ formatCurrency(activeQuotation.discount) }}</span>
-                        </div>
-                        <div class="flex justify-between text-gray-600">
-                            <span>Value Added Tax (12% VAT):</span>
-                            <span class="font-mono font-bold">{{ formatCurrency(activeQuotation?.tax_amount || 0) }}</span>
-                        </div>
-                        <div class="flex justify-between pt-2 border-t-2 border-gray-900 text-sm">
-                            <span class="font-black text-gray-900 uppercase">Grand Total:</span>
-                            <span class="font-black text-base text-[#4b5320] font-mono">{{ formatCurrency(activeQuotation?.grand_total || 0) }}</span>
-                        </div>
-                        <p v-if="conversionNote" class="pt-1 text-[10px] leading-snug text-gray-500">{{ conversionNote }}</p>
-                    </div>
-                </div>
-
-                <!-- Notes & Terms -->
-                <div class="pt-4 border-t border-gray-200 grid grid-cols-1 md:grid-cols-2 gap-6 text-xs text-gray-600">
-                    <div v-if="activeQuotation?.notes">
-                        <h5 class="font-bold uppercase text-gray-700 text-[10px] mb-1">Notes & Scope:</h5>
-                        <p class="whitespace-pre-line leading-relaxed bg-gray-50 p-3 rounded-lg border border-gray-200">{{ activeQuotation?.notes }}</p>
-                    </div>
-
-                    <div v-if="activeQuotation?.terms_and_conditions">
-                        <h5 class="font-bold uppercase text-gray-700 text-[10px] mb-1">Terms & Conditions:</h5>
-                        <p class="whitespace-pre-line leading-relaxed bg-gray-50 p-3 rounded-lg border border-gray-200 text-[11px]">{{ activeQuotation?.terms_and_conditions }}</p>
-                    </div>
-                </div>
-
-                <!-- Signature & Conforme Block -->
-                <div class="pt-8 border-t border-gray-200 grid grid-cols-2 gap-8 text-xs">
-                    <div>
-                        <p class="text-gray-500 mb-8">Prepared By:</p>
-                        <div class="border-b border-gray-400 w-48 mb-1"></div>
-                        <p class="font-bold text-gray-900">{{ activeQuotation?.prepared_by?.name || 'Authorized Technical Sales' }}</p>
-                        <p class="text-gray-400 text-[10px]">MR-PRIDE Electrical Supplies</p>
-                    </div>
-
-                    <div>
-                        <p class="text-gray-500 mb-8">Conforme / Customer Approval:</p>
-                        <div class="border-b border-gray-400 w-48 mb-1"></div>
-                        <p class="font-bold text-gray-900">Authorized Client Signature</p>
-                        <p class="text-gray-400 text-[10px]">Date Signed:</p>
-                    </div>
-                </div>
-            </div>
+            <p v-if="documentError" class="px-6 py-2 text-xs text-rose-700 bg-rose-50 border-b border-rose-100" role="alert">{{ documentError }}</p>
+            <iframe ref="documentFrame" :src="documentUrl('pdf')" class="flex-1 w-full bg-gray-100" title="Official quotation preview"></iframe>
         </div>
     </div>
 
@@ -2421,18 +2670,22 @@ const executeCsvImport = () => {
                 <Trash2 class="w-6 h-6" />
             </div>
             <h3 class="text-xl font-semibold text-gray-900 mb-2">Delete Quotation</h3>
-            <p class="text-gray-600 text-sm mb-4 leading-relaxed">
-                Are you sure you want to delete quotation <strong class="text-gray-900">"{{ activeQuotation?.quotation_number }}"</strong> for {{ activeQuotation?.client_name }}? This action cannot be undone.
+            <p class="text-gray-600 text-sm mb-2 leading-relaxed">
+                Move quotation <strong class="text-gray-900">"{{ activeQuotation?.quotation_number }}"</strong> for {{ activeQuotation?.client_name }} to the Recycle Bin?
+            </p>
+            <p class="text-gray-500 text-xs mb-4 leading-relaxed">
+                An Admin can restore or permanently delete this record from the Recycle Bin. Unrelated active sessions and trusted devices are not affected.
             </p>
             <div class="mt-4 mb-6">
                 <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm deletion:
                 </label>
                 <input
                     v-model="deleteConfirmInput"
                     type="text"
                     placeholder="Type YES here"
                     class="w-full px-3 py-2 text-sm font-mono rounded-xl border border-gray-300 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                    @keyup.enter="deleteConfirmInput === 'YES' && confirmDelete()"
                 />
             </div>
             <div class="flex justify-end gap-3">
@@ -2451,7 +2704,7 @@ const executeCsvImport = () => {
                     size="md"
                     :radius="10"
                     @click="confirmDelete"
-                    :disabled="deleteConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="deleteConfirmInput !== 'YES'"
                 >
                     Delete
                 </SpecularButton>
@@ -2687,24 +2940,5 @@ const executeCsvImport = () => {
         </div>
     </div>
 
-    <ImportWizard :open="showSupplierQuoteImport" module="supplier_quotation" :suppliers="suppliers ?? []" @close="showSupplierQuoteImport = false" />
+    <ImportWizard :open="showSupplierQuoteImport" module="supplier_quotation" :suppliers="activeSuppliers" @close="showSupplierQuoteImport = false" />
 </template>
-
-<style>
-@media print {
-    body * {
-        visibility: hidden;
-    }
-    #quotation-print-sheet, #quotation-print-sheet * {
-        visibility: visible;
-    }
-    #quotation-print-sheet {
-        position: absolute;
-        left: 0;
-        top: 0;
-        width: 100%;
-        margin: 0;
-        padding: 20px;
-    }
-}
-</style>

@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Services\Import\InventoryRowRules;
 use App\Traits\TracksDeletions;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -153,10 +154,10 @@ class Product extends Model
             return;
         }
         $missing = array_values(array_filter(
-            \App\Services\Import\InventoryRowRules::COMPLETION_FIELDS,
+            InventoryRowRules::COMPLETION_FIELDS,
             fn ($f) => $this->{$f} === null || $this->{$f} === '',
         ));
-        $sellable = ! array_intersect($missing, \App\Services\Import\InventoryRowRules::REQUIRED_TO_ACTIVATE);
+        $sellable = ! array_intersect($missing, InventoryRowRules::REQUIRED_TO_ACTIVATE);
         $this->missing_fields = $missing ?: null;
         if ($sellable && ! $this->is_active) {
             $this->is_active = true;
@@ -171,7 +172,9 @@ class Product extends Model
     {
         $threshold = $this->reorder_level > 0 ? $this->reorder_level : ($this->min_stock > 0 ? $this->min_stock : 10);
 
-        if ($this->stock <= 0) {
+        if (! $this->is_active && $this->missing_fields) {
+            $this->status = 'Incomplete'; // not sellable until its missing values (e.g. selling price) are entered
+        } elseif ($this->stock <= 0) {
             $this->status = 'Out of Stock';
         } elseif ($this->stock <= $threshold) {
             $this->status = 'Low Stock';

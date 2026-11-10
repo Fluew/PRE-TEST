@@ -68,7 +68,7 @@ it('accepts a request with only contact and project details', function () {
     $this->post('/quotation', wfRequest())->assertSessionHasNoErrors();
 
     $quotation = Quotation::with('items')->sole();
-    expect($quotation->status)->toBe(QuotationStatus::Pending)
+    expect($quotation->status)->toBe(QuotationStatus::Draft)
         ->and($quotation->items)->toHaveCount(0);
 });
 
@@ -124,17 +124,23 @@ it('rejects unsupported, disguised, oversized and too many product-list files', 
 })->with([
     'executable' => [[UploadedFile::fake()->createWithContent('setup.exe', 'MZ...')], 'productFiles.0'],
     'script renamed to .pdf' => [[UploadedFile::fake()->createWithContent('list.pdf', '<?php echo 1;')], 'productFiles.0'],
-    'over 10 MB' => [[UploadedFile::fake()->create('big.pdf', 10241, 'application/pdf')], 'productFiles.0'],
+    'over 25 MB' => [[UploadedFile::fake()->create('big.pdf', 25 * 1024 + 1, 'application/pdf')], 'productFiles.0'],
     'more than five files' => [array_map(fn ($i) => wfPng("p{$i}.png", $i), range(1, 6)), 'productFiles'],
 ]);
 
-it('limits the combined size of product-list files to 20 MB', function () {
-    // Three files of 7 MB each are fine one by one, but 21 MB together.
-    $files = array_map(fn ($i) => UploadedFile::fake()->create("part{$i}.pdf", 7 * 1024, 'application/pdf'), [1, 2, 3]);
+it('accepts product-list files up to 25 MB each, more than the old 10 MB / 20 MB limits together', function () {
+    // A real CSV product list padded to the size wanted.
+    $csv = function (string $name, int $megabytes): UploadedFile {
+        $row = 'Circuit breaker 2P 30A bolt-on '.str_repeat('x', 60).",20,pcs\n";
+        $content = "Description,Qty,Unit\n".str_repeat($row, intdiv($megabytes * 1024 * 1024 - 64, strlen($row)));
 
-    $this->post('/quotation', wfRequest(['productFiles' => $files]))->assertSessionHasErrors(['productFiles' => 'Product-list files can be up to 20 MB together. Please remove a file or send smaller ones.']);
+        return UploadedFile::fake()->createWithContent($name, $content);
+    };
 
-    expect(Quotation::count())->toBe(0);
+    $this->post('/quotation', wfRequest(['productFiles' => [$csv('big-list.csv', 24), $csv('second-list.csv', 12)]]))
+        ->assertSessionHasNoErrors();
+
+    expect(Quotation::sole()->files->pluck('original_name')->all())->toBe(['big-list.csv', 'second-list.csv']);
 });
 
 // --- 3. Everything is saved together --------------------------------------------------------
@@ -149,7 +155,7 @@ it('saves brands, project details and files together as a request awaiting revie
     ]))->assertSessionHasNoErrors();
 
     $quotation = Quotation::with('files', 'items')->sole();
-    expect($quotation->status)->toBe(QuotationStatus::Pending)
+    expect($quotation->status)->toBe(QuotationStatus::Draft)
         ->and($quotation->request_details)->toMatchArray([
             'source' => 'public_form',
             'project_type' => 'Industrial Facility',
@@ -159,8 +165,8 @@ it('saves brands, project details and files together as a request awaiting revie
         ])
         ->and($quotation->request_details['submitted_at'])->not->toBeEmpty()
         ->and($quotation->files)->toHaveCount(1)
-        // Brand requests wait for staff: nothing is priced from the client's input.
-        ->and($quotation->items->pluck('sku')->all())->toBe(['BRAND', 'BRAND-UNLISTED'])
+        // Brand requests, and the products read from the attached list, wait for staff: nothing is priced.
+        ->and($quotation->items->pluck('sku')->all())->toBe(['BRAND', 'BRAND-UNLISTED', 'CLIENT-LIST', 'CLIENT-LIST'])
         ->and((float) $quotation->grand_total)->toBe(0.0);
 });
 
@@ -220,7 +226,7 @@ it('keeps client files away from guests, other modules, other teams and other qu
     [$staff, $staffCookies] = wfStaff($this->team);
     $other = Quotation::create([
         'team_id' => $this->team->id, 'quotation_number' => 'Q-OTHER', 'client_name' => 'Other',
-        'quotation_date' => now()->toDateString(), 'valid_until' => now()->addDays(30)->toDateString(), 'status' => QuotationStatus::Pending,
+        'quotation_date' => now()->toDateString(), 'valid_until' => now()->addDays(30)->toDateString(), 'status' => QuotationStatus::Draft,
     ]);
     $this->actingAs($staff)->withCookies($staffCookies)
         ->get("/mr-pride/quotations/{$other->id}/files/{$file->id}")
@@ -256,7 +262,7 @@ it('imports a material list as a draft quotation, with catalog prices only for e
         ])->assertSessionHasNoErrors();
 
     $quotation = Quotation::with('items')->sole();
-    expect($quotation->status)->toBe(QuotationStatus::Preparing)
+    expect($quotation->status)->toBe(QuotationStatus::Draft)
         ->and($quotation->client_name)->toBe('Metro Builders')
         ->and($quotation->material_file_name)->toBe('site-a.csv')
         ->and($quotation->request_details['source'])->toBe('staff_import')

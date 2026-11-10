@@ -13,7 +13,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 
 /**
  * The delivery (or pickup) record of one Sales Order. Created when the order is confirmed, with
- * status order_confirmed. Each trip or pickup is a DeliveryRelease; every status change is kept
+ * status Pending. Each trip or pickup is a DeliveryRelease; every status change is kept
  * in delivery_attempt_logs (the status history).
  */
 class OrderFulfillment extends Model
@@ -144,7 +144,33 @@ class OrderFulfillment extends Model
 
     public function canAttempt(): bool
     {
-        return $this->attempt_count < self::MAX_ATTEMPTS && $this->status === DeliveryStatus::OutForDelivery;
+        return $this->attempt_count < self::MAX_ATTEMPTS && $this->status === DeliveryStatus::InTransit;
+    }
+
+    /** The release being delivered has left the warehouse and is not received yet (goods on the truck). */
+    public function goodsOnTruck(?DeliveryRelease $open = null): bool
+    {
+        return ($open ?? $this->openRelease())?->status === DeliveryRelease::DISPATCHED;
+    }
+
+    /** A delivery attempt failed: the goods are still on the truck, waiting to go out again. */
+    public function awaitingRedelivery(?DeliveryRelease $open = null): bool
+    {
+        return $this->status === DeliveryStatus::ReadyForDelivery && $this->attempt_count > 0 && $this->goodsOnTruck($open);
+    }
+
+    /**
+     * The attempt limit is reached and no administrator has rescheduled since the last failed
+     * attempt: it cannot go out again until it is rescheduled.
+     */
+    public function needsReschedule(?DeliveryRelease $open = null): bool
+    {
+        if (! $this->awaitingRedelivery($open) || $this->attempt_count < self::MAX_ATTEMPTS) {
+            return false;
+        }
+        $lastFailure = $this->attemptLogs()->where('attempt_number', '>', 0)->max('created_at');
+
+        return ! $this->rescheduled_at || ($lastFailure && $this->rescheduled_at->lt($lastFailure));
     }
 
     public static function generateFulfillmentNumber(int $teamId, mixed $date = null): string

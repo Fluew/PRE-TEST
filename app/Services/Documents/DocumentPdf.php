@@ -20,9 +20,13 @@ class DocumentPdf
 {
     public function quotation(Quotation $quotation): string
     {
-        $quotation->loadMissing(['items', 'preparedBy', 'approvedBy']);
-
-        return $this->render('documents.quotation', ['quotation' => $quotation], 'Quotation '.$quotation->quotation_number);
+        // The official MR-PRIDE quotation template; every page's footer names the quotation.
+        return $this->render(
+            'documents.quotation',
+            ['quotation' => $quotation, 'doc' => QuotationDocument::data($quotation)],
+            'Quotation '.$quotation->quotation_number,
+            'Quotation No. '.$quotation->quotation_number,
+        );
     }
 
     public function salesOrder(Sale $sale): string
@@ -63,7 +67,7 @@ class DocumentPdf
     }
 
     /** @param  array<string, mixed>  $data */
-    private function render(string $view, array $data, string $title): string
+    private function render(string $view, array $data, string $title, ?string $footer = null): string
     {
         $tmp = storage_path('app/private/tmp');
         File::ensureDirectoryExists($tmp);
@@ -79,6 +83,9 @@ class DocumentPdf
         $dompdf->setPaper('A4');
         $dompdf->render();
         $dompdf->getCanvas()->page_text(500, 815, 'Page {PAGE_NUM} of {PAGE_COUNT}', 'DejaVu Sans', 7, [0.45, 0.45, 0.45]);
+        if ($footer !== null) {
+            $dompdf->getCanvas()->page_text(40, 815, $footer, 'DejaVu Sans', 7, [0.45, 0.45, 0.45]);
+        }
 
         return (string) $dompdf->output();
     }

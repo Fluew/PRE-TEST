@@ -11,7 +11,7 @@ import {
     X,
     RotateCcw,
 } from '@lucide/vue';
-import { onMounted, onUnmounted, ref, computed } from 'vue';
+import { ref, computed } from 'vue';
 import LogoLoop from '@/components/ui/LogoLoop.vue';
 import {
     hardwarePartners,
@@ -20,6 +20,7 @@ import {
     safetyPartners,
 } from '@/components/products/brandPartnersData';
 import PublicLayout from '@/layouts/PublicLayout.vue';
+import { vWordReveal } from '@/directives/wordReveal';
 
 const categories = [
     {
@@ -262,9 +263,6 @@ const setQuickSearch = (term: string) => {
     searchQuery.value = term;
 };
 
-const categorySections = ref<HTMLElement[]>([]);
-let observer: IntersectionObserver | undefined;
-
 function scrollToCategory(event: MouseEvent, id: string) {
     if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
         return;
@@ -288,34 +286,6 @@ function scrollToCategory(event: MouseEvent, id: string) {
     });
 }
 
-onMounted(() => {
-    if (
-        window.matchMedia('(prefers-reduced-motion: reduce)').matches ||
-        !('IntersectionObserver' in window)
-    ) {
-        return;
-    }
-
-    observer = new IntersectionObserver(
-        (entries) => {
-            entries.forEach((entry) => {
-                if (entry.isIntersecting) {
-                    entry.target.classList.add('is-visible');
-                    observer?.unobserve(entry.target);
-                }
-            });
-        },
-        { threshold: 0.05 },
-    );
-    categorySections.value.forEach((section) => {
-        if (section.getBoundingClientRect().top > window.innerHeight) {
-            section.classList.add('reveal-ready');
-        }
-
-        observer?.observe(section);
-    });
-});
-onUnmounted(() => observer?.disconnect());
 </script>
 
 <template>
@@ -356,7 +326,7 @@ onUnmounted(() => observer?.disconnect());
             <div
                 class="relative z-10 mx-auto max-w-7xl px-4 pt-14 pb-10 sm:px-6 sm:pt-20 lg:px-8"
             >
-                <p
+                <p v-word-reveal
                     class="mb-5 flex items-center gap-3 text-xs font-semibold text-[#F8B803]"
                 >
                     <span
@@ -369,12 +339,12 @@ onUnmounted(() => observer?.disconnect());
                     class="flex flex-col justify-between gap-6 lg:flex-row lg:items-end"
                 >
                     <div class="max-w-3xl">
-                        <h1
+                        <h1 v-word-reveal
                             class="text-4xl font-semibold tracking-tight text-white sm:text-6xl"
                         >
                             PRODUCT LIST<span class="text-[#F8B803]">.</span>
                         </h1>
-                        <p
+                        <p v-word-reveal
                             class="mt-5 max-w-2xl text-base leading-8 text-gray-200 sm:text-lg"
                         >
                             Explore our wide range of hardware, electrical,
@@ -382,7 +352,7 @@ onUnmounted(() => observer?.disconnect());
                             brands.
                         </p>
                     </div>
-                    <p
+                    <p v-word-reveal
                         class="flex items-center gap-3 text-sm font-medium text-gray-300"
                     >
                         <span class="text-3xl font-semibold text-[#F8B803]"
@@ -537,7 +507,6 @@ onUnmounted(() => observer?.disconnect());
                 v-for="category in filteredCategories"
                 :id="category.id"
                 :key="category.id"
-                ref="categorySections"
                 tabindex="-1"
                 :aria-labelledby="`${category.id}-title`"
                 class="category-section scroll-mt-24 overflow-hidden rounded-xl border border-gray-200 bg-white transition-[box-shadow,border-color] duration-300 hover:border-[#4b5320]/30 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[#4b5320]"
@@ -546,7 +515,7 @@ onUnmounted(() => observer?.disconnect());
                     class="grid gap-8 p-6 sm:p-9 lg:grid-cols-[1.15fr_1fr] lg:gap-12 lg:p-10"
                 >
                     <div>
-                        <div
+                        <div v-word-reveal
                             class="mb-5 flex items-center gap-3 text-xs font-semibold text-[#4b5320]"
                         >
                             <span
@@ -554,13 +523,13 @@ onUnmounted(() => observer?.disconnect());
                                 >{{ category.code }}</span
                             >Product category
                         </div>
-                        <h2
+                        <h2 v-word-reveal
                             :id="`${category.id}-title`"
                             class="max-w-xl text-2xl leading-tight font-semibold tracking-tight text-gray-900 sm:text-3xl"
                         >
                             {{ category.title }}
                         </h2>
-                        <p
+                        <p v-word-reveal
                             class="mt-4 text-sm leading-7 text-gray-600 sm:text-base"
                         >
                             {{ category.description }}
@@ -592,7 +561,7 @@ onUnmounted(() => observer?.disconnect());
 
                         <!-- Product List -->
                         <div class="mt-7 flex items-center justify-between">
-                            <h3
+                            <h3 v-word-reveal
                                 class="text-xs font-semibold text-gray-500"
                             >
                                 Our product range
@@ -655,7 +624,7 @@ onUnmounted(() => observer?.disconnect());
                                 class="h-full w-full object-contain transition-transform duration-500 motion-reduce:transform-none motion-reduce:transition-none"
                             />
                         </div>
-                        <figcaption
+                        <figcaption v-word-reveal
                             class="border-t border-gray-100 bg-gray-50 px-5 py-4 text-xs leading-5 font-medium text-gray-500"
                         >
                             {{ category.caption }}
@@ -668,12 +637,12 @@ onUnmounted(() => observer?.disconnect());
                     class="border-t border-gray-100 bg-gray-50/70 px-4 py-8 sm:px-8 sm:py-10"
                 >
                     <div class="mb-5 flex items-center justify-between">
-                        <h3
+                        <h3 v-word-reveal
                             class="text-xs font-semibold text-gray-900 sm:text-sm"
                         >
                             Brand Partners
                         </h3>
-                        <span
+                        <span v-word-reveal
                             class="hidden text-[11px] font-semibold text-gray-400 sm:inline"
                         >
                             Authorized Manufacturers & Suppliers
@@ -699,26 +668,8 @@ onUnmounted(() => observer?.disconnect());
 </template>
 
 <style scoped>
-.reveal-ready {
-    opacity: 0;
-    transform: translateY(18px);
-}
-.reveal-ready.is-visible {
-    opacity: 1;
-    transform: translateY(0);
-    transition:
-        opacity 550ms ease,
-        transform 550ms ease;
-}
 @media (prefers-reduced-motion: reduce) {
     .category-section {
-        transition: none;
-    }
-    .reveal-ready {
-        opacity: 1;
-        transform: none;
-    }
-    .reveal-ready.is-visible {
         transition: none;
     }
 }

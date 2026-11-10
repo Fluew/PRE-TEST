@@ -20,7 +20,7 @@ class MaintenanceService
      */
     public static function getFilePath(): string
     {
-        return storage_path('framework/' . self::$stateFile);
+        return storage_path('framework/'.self::$stateFile);
     }
 
     /**
@@ -34,6 +34,7 @@ class MaintenanceService
         }
 
         $data = json_decode(File::get($path), true);
+
         return ! empty($data['enabled']);
     }
 
@@ -49,7 +50,13 @@ class MaintenanceService
             return [
                 'enabled' => false,
                 'reason' => 'Database updates, system upgrades, deployment, or scheduled server maintenance.',
+                'scheduled_start_at' => null,
+                'duration_hours' => 0,
+                'duration_minutes' => 30,
+                'duration_total_minutes' => 30,
                 'expected_return_time' => null,
+                'expected_end_at' => null,
+                'is_manual_override' => false,
                 'enabled_at' => null,
                 'enabled_by' => null,
             ];
@@ -60,45 +67,115 @@ class MaintenanceService
         return [
             'enabled' => (bool) ($data['enabled'] ?? false),
             'reason' => (string) ($data['reason'] ?? 'Database updates, system upgrades, deployment, or scheduled server maintenance.'),
+            'scheduled_start_at' => $data['scheduled_start_at'] ?? null,
+            'duration_hours' => isset($data['duration_hours']) ? (int) $data['duration_hours'] : 0,
+            'duration_minutes' => isset($data['duration_minutes']) ? (int) $data['duration_minutes'] : 30,
+            'duration_total_minutes' => isset($data['duration_total_minutes']) ? (int) $data['duration_total_minutes'] : 30,
             'expected_return_time' => $data['expected_return_time'] ?? null,
+            'expected_end_at' => $data['expected_end_at'] ?? null,
+            'is_manual_override' => (bool) ($data['is_manual_override'] ?? false),
             'enabled_at' => $data['enabled_at'] ?? null,
             'enabled_by' => $data['enabled_by'] ?? null,
         ];
     }
 
     /**
-     * Enable controlled maintenance mode.
+     * Format hours and minutes into a human-readable duration string.
+     */
+    public static function formatDurationLabel(int $hours, int $minutes): string
+    {
+        $parts = [];
+        if ($hours > 0) {
+            $parts[] = $hours.' '.($hours === 1 ? 'hour' : 'hours');
+        }
+        if ($minutes > 0 || empty($parts)) {
+            $parts[] = $minutes.' '.($minutes === 1 ? 'minute' : 'minutes');
+        }
+
+        return implode(' ', $parts);
+    }
+
+    /**
+     * Enable or update controlled maintenance mode and schedule.
      *
-     * @param array{reason?: string, expected_return_time?: string, duration_minutes?: int} $params
+     * @param array{
+     *     reason?: string|null,
+     *     scheduled_start_at?: string|null,
+     *     duration_hours?: int|null,
+     *     duration_minutes?: int|null,
+     *     expected_return_time?: string|null,
+     *     is_manual_override?: bool|null
+     * } $params
      */
     public static function enable(array $params, User $admin): void
     {
+        $wasAlreadyEnabled = self::isDown();
+        $previousStatus = self::getStatus();
+
         $reason = trim($params['reason'] ?? '') ?: 'Database updates, system upgrades, deployment, or scheduled server maintenance.';
-        $expectedReturn = null;
+
+        $hours = isset($params['duration_hours']) ? max(0, (int) $params['duration_hours']) : 0;
+        $minutes = isset($params['duration_minutes'])
+            ? max(0, min(59, (int) $params['duration_minutes']))
+            : ($hours > 0 ? 0 : 30);
+
+        $totalMinutes = ($hours * 60) + $minutes;
+        if ($totalMinutes < 1) {
+            $minutes = 30;
+            $totalMinutes = 30;
+        }
+
+        $scheduledStart = ! empty($params['scheduled_start_at'])
+            ? Carbon::parse($params['scheduled_start_at'])
+            : now();
+
+        $expectedEnd = $scheduledStart->copy()->addMinutes($totalMinutes);
+        $durationLabel = self::formatDurationLabel($hours, $minutes);
+        $isManualOverride = ! empty($params['is_manual_override']);
 
         if (! empty($params['expected_return_time'])) {
             $expectedReturn = trim($params['expected_return_time']);
-        } elseif (! empty($params['duration_minutes'])) {
-            $minutes = (int) $params['duration_minutes'];
-            $expectedReturn = now()->addMinutes($minutes)->format('h:i A') . " (approx. {$minutes} minutes)";
+        } else {
+            $expectedReturn = $expectedEnd->format('M d, Y h:i A')." (approx. {$durationLabel})";
         }
 
         $payload = [
             'enabled' => true,
             'reason' => $reason,
+            'scheduled_start_at' => $scheduledStart->toIso8601String(),
+            'duration_hours' => $hours,
+            'duration_minutes' => $minutes,
+            'duration_total_minutes' => $totalMinutes,
             'expected_return_time' => $expectedReturn,
-            'enabled_at' => now()->toDateTimeString(),
+            'expected_end_at' => $expectedEnd->toIso8601String(),
+            'is_manual_override' => $isManualOverride,
+            'enabled_at' => $wasAlreadyEnabled && ! empty($previousStatus['enabled_at'])
+                ? $previousStatus['enabled_at']
+                : now()->toDateTimeString(),
+            'updated_at' => now()->toDateTimeString(),
             'enabled_by' => $admin->email,
             'admin_id' => $admin->id,
         ];
 
         File::put(self::getFilePath(), json_encode($payload, JSON_PRETTY_PRINT));
 
+        // Record scheduling / window configuration in the System Audit Trail
+        if (! empty($params['scheduled_start_at']) || isset($params['duration_hours']) || $wasAlreadyEnabled) {
+            AuditLogger::audit(
+                'system.maintenance.scheduled',
+                "Administrator {$admin->email} scheduled maintenance window (Start: {$scheduledStart->format('M d, Y h:i A')}, Duration: {$durationLabel}, Expected return: {$expectedReturn}).",
+                $admin,
+                null,
+                $payload
+            );
+        }
+
+        // Record maintenance activation / update in the System Audit Trail
         AuditLogger::audit(
             'system.maintenance.enabled',
-            "Administrator {$admin->email} enabled system Maintenance Mode. Reason: {$reason}. Expected return: " . ($expectedReturn ?: 'Unspecified'),
+            "Administrator {$admin->email} ".($wasAlreadyEnabled ? 'updated active' : 'enabled')." system Maintenance Mode. Reason: {$reason}. Expected return: ".($expectedReturn ?: 'Unspecified'),
             $admin,
-            $admin,
+            null,
             $payload
         );
     }
@@ -108,6 +185,7 @@ class MaintenanceService
      */
     public static function disable(User $admin): void
     {
+        $previousStatus = self::getStatus();
         $path = self::getFilePath();
         if (File::exists($path)) {
             File::delete($path);
@@ -115,9 +193,16 @@ class MaintenanceService
 
         AuditLogger::audit(
             'system.maintenance.disabled',
-            "Administrator {$admin->email} disabled Maintenance Mode and reopened the system after pre-flight verification.",
+            "Administrator {$admin->email} disabled Maintenance Mode and reopened MRP ElectroDesk for normal operations.",
             $admin,
-            $admin
+            null,
+            [
+                'disabled_at' => now()->toDateTimeString(),
+                'disabled_by' => $admin->email,
+                'previous_reason' => $previousStatus['reason'] ?? null,
+                'previous_enabled_at' => $previousStatus['enabled_at'] ?? null,
+                'previous_expected_return_time' => $previousStatus['expected_return_time'] ?? null,
+            ]
         );
     }
 
@@ -152,7 +237,7 @@ class MaintenanceService
                 'title' => 'Database Connectivity',
                 'status' => 'failed',
                 'latency_ms' => null,
-                'message' => 'Database connection failed: ' . $e->getMessage(),
+                'message' => 'Database connection failed: '.$e->getMessage(),
             ];
         }
 
@@ -180,7 +265,7 @@ class MaintenanceService
                 'id' => 'auth',
                 'title' => 'Authentication & Admin Login',
                 'status' => 'failed',
-                'message' => 'Auth verification failed: ' . $e->getMessage(),
+                'message' => 'Auth verification failed: '.$e->getMessage(),
             ];
         }
 
@@ -198,7 +283,7 @@ class MaintenanceService
                 'id' => 'devices',
                 'title' => 'Device Verification Engine',
                 'status' => 'failed',
-                'message' => 'Device verification error: ' . $e->getMessage(),
+                'message' => 'Device verification error: '.$e->getMessage(),
             ];
         }
 
@@ -216,7 +301,7 @@ class MaintenanceService
                 'id' => 'sales',
                 'title' => 'Sales & POS Transaction Pipeline',
                 'status' => 'failed',
-                'message' => 'Sales pipeline check error: ' . $e->getMessage(),
+                'message' => 'Sales pipeline check error: '.$e->getMessage(),
             ];
         }
 
@@ -234,7 +319,7 @@ class MaintenanceService
                 'id' => 'inventory',
                 'title' => 'Stock Updates & Inventory Ledger',
                 'status' => 'failed',
-                'message' => 'Inventory check error: ' . $e->getMessage(),
+                'message' => 'Inventory check error: '.$e->getMessage(),
             ];
         }
 
@@ -252,7 +337,7 @@ class MaintenanceService
                 'id' => 'security',
                 'title' => 'Security & Threat Logging Engine',
                 'status' => 'failed',
-                'message' => 'Security engine check error: ' . $e->getMessage(),
+                'message' => 'Security engine check error: '.$e->getMessage(),
             ];
         }
 

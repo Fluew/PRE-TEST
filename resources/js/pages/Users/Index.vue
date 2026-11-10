@@ -4,6 +4,7 @@ import { ref, computed, watch } from 'vue';
 import ModuleMultiSelect from '@/components/ModuleMultiSelect.vue';
 import SpecularButton from '@/components/ui/SpecularButton.vue';
 import StatusBadge from '@/components/ui/StatusBadge.vue';
+import SettingsLayout from '@/layouts/settings/Layout.vue';
 import {
     Users,
     Activity,
@@ -132,6 +133,19 @@ const props = defineProps<{
     activeTab: 'accounts' | 'sessions' | 'devices' | 'audit' | 'security';
     isSuperAdmin: boolean;
     users?: UserAccount[];
+    /** Filtered, paginated accounts for the accounts table (only sent on the accounts tab). */
+    accounts?: {
+        data: UserAccount[];
+        current_page: number;
+        last_page: number;
+        total: number;
+        from: number | null;
+        to: number | null;
+        links: Array<{ url: string | null; label: string; active: boolean }>;
+    } | null;
+    /** Accounts per role filter option, following the current search and status. */
+    roleCounts?: Record<string, number>;
+    roleFilterOptions?: Array<{ value: string; label: string }>;
     sessions?: ActiveSession[];
     devices?: TrustedDeviceItem[];
     auditLogs?: PaginatedLogs | null;
@@ -175,20 +189,38 @@ const switchTab = (tab: string) => {
 // Filters
 const searchQuery = ref(props.filters?.search || '');
 const selectedRole = ref(props.filters?.role || 'All Roles');
+// Follow the server's filter (an unknown role in the URL falls back to All Roles).
+watch(
+    () => props.filters?.role,
+    (role) => {
+        selectedRole.value = role || 'All Roles';
+    }
+);
 const selectedStatus = ref(props.filters?.status || 'All Statuses');
 const selectedSeverity = ref(props.filters?.severity || 'All Severities');
 const selectedEvent = ref(props.filters?.event_filter || 'All Events');
 const dateFrom = ref(props.filters?.date_from || '');
 const dateTo = ref(props.filters?.date_to || '');
 
+const isMaintenanceLogView = computed(() => ['audit', 'security'].includes(props.activeTab));
+
+const resolveFilterEndpoint = (): string => {
+    const path = String(page.url || '').split('?')[0] || '';
+    if (path.startsWith('/settings/maintenance')) {
+        return props.activeTab === 'security' ? '/settings/maintenance/security-logs' : '/settings/maintenance/audit-trail';
+    }
+    return `/${teamSlug.value}/users`;
+};
+
 let filterTimeout: ReturnType<typeof setTimeout> | null = null;
 const applyFilter = () => {
     if (filterTimeout) clearTimeout(filterTimeout);
     filterTimeout = setTimeout(() => {
+        const endpoint = resolveFilterEndpoint();
         router.get(
-            `/${teamSlug.value}/users`,
+            endpoint,
             {
-                tab: props.activeTab,
+                tab: endpoint.startsWith('/settings/maintenance') ? undefined : props.activeTab,
                 search: searchQuery.value || undefined,
                 role: selectedRole.value !== 'All Roles' ? selectedRole.value : undefined,
                 status: selectedStatus.value !== 'All Statuses' ? selectedStatus.value : undefined,
@@ -522,8 +554,9 @@ const confirmStatusToggle = () => {
 };
 
 const confirmDelete = () => {
-    if (!selectedUser.value) return;
+    if (!selectedUser.value || deleteConfirmInput.value !== 'YES') return;
     router.delete(`/${teamSlug.value}/users/${selectedUser.value.id}`, {
+        data: { confirmation: deleteConfirmInput.value },
         preserveScroll: true,
         onSuccess: () => {
             showDeleteModal.value = false;
@@ -625,8 +658,10 @@ const confirmRevokeUserSessions = () => {
 };
 
 const confirmRevokeDevice = () => {
-    if (!selectedDevice.value) return;
-    router.post(`/${teamSlug.value}/users/devices/${selectedDevice.value.id}/revoke`, {}, {
+    if (!selectedDevice.value || revokeDeviceConfirmInput.value !== 'YES') return;
+    router.post(`/${teamSlug.value}/users/devices/${selectedDevice.value.id}/revoke`, {
+        confirmation: revokeDeviceConfirmInput.value,
+    }, {
         preserveScroll: true,
         onSuccess: () => {
             showRevokeDeviceModal.value = false;
@@ -663,8 +698,8 @@ const approveDevice = (device: TrustedDeviceItem) => {
 
 const promptDeleteDevice = (device: TrustedDeviceItem) => {
     openConfirmModal({
-        title: 'Remove Trusted Device',
-        description: `Permanently remove the trusted device "${device.device_name}" from the system registry? Active sessions on this hardware will be immediately terminated.`,
+        title: 'Are you sure you want to permanently delete this record?',
+        description: `This action cannot be undone. Related active sessions, registered trusted devices, or dependent records must only be revoked or removed when explicitly required by the operation. Removing "${device.device_name}" will permanently delete its workstation registration and terminate active sessions bound to this hardware.`,
         details: [
             { label: 'Device Name', value: device.device_name },
             { label: 'Account', value: device.user?.name || (device.is_shared ? 'Shared Workstation' : 'Unassigned') },
@@ -678,6 +713,7 @@ const promptDeleteDevice = (device: TrustedDeviceItem) => {
 
 const deleteDevice = (device: TrustedDeviceItem) => {
     router.delete(`/${teamSlug.value}/users/devices/${device.id}`, {
+        data: { confirmation: 'YES' },
         preserveScroll: true,
     });
 };
@@ -703,30 +739,41 @@ const regenerateRecoveryKey = () => {
 </script>
 
 <template>
-    <Head title="User Management & Security Administration" />
+    <Head :title="activeTab === 'security' ? 'Security Logs | System Maintenance' : activeTab === 'audit' ? 'System Audit Trail | System Maintenance' : 'User Management & Security Administration'" />
 
-    <div class="workspace-page">
-        <!-- Header -->
-        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-4">
-            <div>
-                <h1 class="page-title">User Management</h1>
-                <p class="page-subtitle">Accounts, sessions, trusted devices and audit logs.</p>
+    <component :is="isMaintenanceLogView ? SettingsLayout : 'div'">
+        <div :class="isMaintenanceLogView ? 'flex min-w-0 flex-col gap-6' : 'workspace-page'">
+            <!-- Header for System Maintenance Log Views -->
+            <div v-if="activeTab === 'audit'" class="pb-4 border-b border-gray-200">
+                <h1 class="section-title">System Audit Trail</h1>
+                <p class="section-subtitle">Chronological administrative and operational audit events across the system.</p>
+            </div>
+            <div v-else-if="activeTab === 'security'" class="pb-4 border-b border-gray-200">
+                <h1 class="section-title">Security Logs</h1>
+                <p class="section-subtitle">Authentication, device verification, and access-control security events.</p>
             </div>
 
-            <!-- Top Actions -->
-            <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
-                <SpecularButton
-                    v-if="activeTab === 'accounts'"
-                    variant="brand"
-                    size="md"
-                    :radius="12"
-                    @click="openAddModal"
-                >
-                    <Plus class="w-4 h-4" />
-                    Add Account
-                </SpecularButton>
+            <!-- Header for User Management -->
+            <div v-else class="page-header">
+                <div>
+                    <h1 class="page-title">User Management</h1>
+                    <p class="page-subtitle">Accounts, active sessions, and trusted devices.</p>
+                </div>
+
+                <!-- Top Actions -->
+                <div class="page-actions">
+                    <SpecularButton
+                        v-if="activeTab === 'accounts'"
+                        variant="brand"
+                        size="md"
+                        :radius="12"
+                        @click="openAddModal"
+                    >
+                        <Plus class="w-4 h-4" />
+                        Add Account
+                    </SpecularButton>
+                </div>
             </div>
-        </div>
 
         <!-- Banner / Notices -->
         <div
@@ -814,8 +861,8 @@ const regenerateRecoveryKey = () => {
             </div>
         </div>
 
-        <!-- Navigation Tabs (Admin Full Access) -->
-        <div class="border-b border-gray-200 mb-5">
+        <!-- Navigation Tabs (User Management only) -->
+        <div v-if="!isMaintenanceLogView" class="border-b border-gray-200 mb-5">
             <nav class="flex space-x-2 -mb-px overflow-x-auto">
                 <button
                     @click="switchTab('accounts')"
@@ -855,32 +902,6 @@ const regenerateRecoveryKey = () => {
                     <Laptop class="w-4 h-4" />
                     Trusted Devices
                 </button>
-
-                <button
-                    @click="switchTab('audit')"
-                    :class="[
-                        activeTab === 'audit'
-                            ? 'border-gray-900 text-gray-900 font-medium'
-                            : 'border-transparent text-gray-500 hover:text-gray-900 font-medium',
-                        'whitespace-nowrap py-2.5 px-3 border-b-2 text-sm flex items-center gap-2 transition-colors'
-                    ]"
-                >
-                    <FileText class="w-4 h-4" />
-                    Audit Trail
-                </button>
-
-                <button
-                    @click="switchTab('security')"
-                    :class="[
-                        activeTab === 'security'
-                            ? 'border-gray-900 text-gray-900 font-medium'
-                            : 'border-transparent text-gray-500 hover:text-gray-900 font-medium',
-                        'whitespace-nowrap py-2.5 px-3 border-b-2 text-sm flex items-center gap-2 transition-colors'
-                    ]"
-                >
-                    <ShieldAlert class="w-4 h-4" />
-                    Security Logs
-                </button>
             </nav>
         </div>
 
@@ -889,7 +910,7 @@ const regenerateRecoveryKey = () => {
         <!-- ========================================== -->
         <div v-if="activeTab === 'accounts'">
             <!-- Filters -->
-            <div class="flex flex-col sm:flex-row gap-3 mb-4">
+            <div class="mb-6 flex flex-col sm:flex-row gap-3 rounded-xl border border-gray-200 bg-white p-4">
                 <div class="relative flex-1 sm:max-w-md">
                     <Search class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
                     <input
@@ -897,24 +918,23 @@ const regenerateRecoveryKey = () => {
                         @input="applyFilter"
                         type="text"
                         placeholder="Search users by name or email..."
-                        class="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 focus:outline-none focus:border-[#F8B803]"
+                        class="field-control w-full pl-10 pr-4"
                     />
                 </div>
                 <select
                     v-model="selectedRole"
                     @change="applyFilter"
-                    class="bg-white border border-gray-200 rounded-xl px-3.5 py-2 text-sm text-gray-900 focus:outline-none focus:border-[#F8B803] min-w-[150px]"
+                    class="field-control min-w-[150px] sm:w-auto"
                 >
-                    <option value="All Roles">All Roles</option>
-                    <option value="superadmin">Owner / Superadmin</option>
-                    <option value="admin">Administrator</option>
-                    <option value="staff">Staff</option>
-                    <option value="user">User</option>
+                    <option value="All Roles">All Roles ({{ roleCounts?.['All Roles'] ?? 0 }})</option>
+                    <option v-for="r in roleFilterOptions" :key="r.value" :value="r.value">
+                        {{ r.label }} ({{ roleCounts?.[r.value] ?? 0 }})
+                    </option>
                 </select>
                 <select
                     v-model="selectedStatus"
                     @change="applyFilter"
-                    class="bg-white border border-gray-200 rounded-xl px-3.5 py-2 text-sm text-gray-900 focus:outline-none focus:border-[#F8B803] min-w-[140px]"
+                    class="field-control min-w-[140px] sm:w-auto"
                 >
                     <option value="All Statuses">All Statuses</option>
                     <option value="active">Active</option>
@@ -938,12 +958,12 @@ const regenerateRecoveryKey = () => {
                             </tr>
                         </thead>
                         <tbody class="text-sm divide-y divide-gray-100">
-                            <tr v-if="!users?.length">
+                            <tr v-if="!accounts?.data?.length">
                                 <td colspan="7" class="py-10 text-center text-gray-500">
                                     No accounts found matching your query.
                                 </td>
                             </tr>
-                            <tr v-for="user in users" :key="user.id" class="hover:bg-gray-50/70 transition-colors">
+                            <tr v-for="user in accounts?.data ?? []" :key="user.id" class="hover:bg-gray-50/70 transition-colors">
                                 <td class="py-4 text-gray-900 font-semibold">
                                     <div>
                                         <div class="flex items-center gap-1.5">
@@ -1048,6 +1068,35 @@ const regenerateRecoveryKey = () => {
                         </tbody>
                     </table>
                 </div>
+
+                <!-- Count & Pagination (follows the search, role and status filters) -->
+                <div
+                    v-if="accounts && accounts.total > 0"
+                    class="mt-4 pt-4 border-t border-gray-100 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"
+                >
+                    <div class="text-gray-500">
+                        Showing <strong class="text-gray-800">{{ accounts.from || 0 }}</strong> to <strong class="text-gray-800">{{ accounts.to || 0 }}</strong> of <strong class="text-gray-800">{{ accounts.total }}</strong> account{{ accounts.total === 1 ? '' : 's' }}
+                    </div>
+
+                    <div v-if="accounts.last_page > 1" class="flex flex-wrap items-center gap-1">
+                        <button
+                            v-for="(link, i) in accounts.links"
+                            :key="i"
+                            type="button"
+                            :disabled="!link.url || link.active"
+                            @click="link.url && router.visit(link.url, { preserveScroll: true, preserveState: true })"
+                            v-html="link.label"
+                            class="px-2.5 py-1 rounded-lg border text-xs font-semibold transition"
+                            :class="[
+                                link.active
+                                    ? 'bg-[#4b5320] text-white border-[#4b5320]'
+                                    : link.url
+                                    ? 'bg-white text-gray-700 border-gray-200 hover:bg-gray-100'
+                                    : 'bg-transparent text-gray-300 border-transparent cursor-not-allowed'
+                            ]"
+                        ></button>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -1056,7 +1105,7 @@ const regenerateRecoveryKey = () => {
         <!-- ========================================== -->
         <div v-else-if="activeTab === 'sessions' && isSuperAdmin">
             <!-- Filter -->
-            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4">
+            <div class="mb-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 rounded-xl border border-gray-200 bg-white p-4">
                 <div class="relative flex-1 sm:max-w-md">
                     <Search class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
                     <input
@@ -1064,7 +1113,7 @@ const regenerateRecoveryKey = () => {
                         @input="applyFilter"
                         type="text"
                         placeholder="Filter sessions by user or IP address..."
-                        class="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 focus:outline-none focus:border-[#F8B803]"
+                        class="field-control w-full pl-10 pr-4"
                     />
                 </div>
                 <div class="text-xs text-gray-500">
@@ -1147,7 +1196,7 @@ const regenerateRecoveryKey = () => {
         <!-- ========================================== -->
         <div v-else-if="activeTab === 'devices'">
             <!-- Policy Banner: 1 Account, 1 Device -->
-            <div class="mb-5 rounded-xl border border-blue-200 bg-blue-50/80 p-4 flex items-center justify-between gap-4">
+            <div class="mb-6 rounded-xl border border-blue-200 bg-blue-50/80 p-4 flex items-center justify-between gap-4">
                 <div class="flex items-center gap-3">
                     <div class="flex size-9 shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white">
                         <ShieldCheck class="size-5" />
@@ -1165,7 +1214,7 @@ const regenerateRecoveryKey = () => {
             </div>
 
             <!-- Top Card: Emergency Recovery Key -->
-            <div class="mb-5 rounded-xl border border-gray-200 bg-white p-5 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+            <div class="mb-6 rounded-xl border border-gray-200 bg-white p-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                 <div>
                     <h3 class="text-sm font-semibold text-gray-900 flex items-center gap-2">
                         Emergency Admin Device Recovery Key
@@ -1199,7 +1248,7 @@ const regenerateRecoveryKey = () => {
 
 
             <!-- Filters & Actions -->
-            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4">
+            <div class="mb-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 rounded-xl border border-gray-200 bg-white p-4">
                 <div class="relative flex-1 sm:max-w-md">
                     <Search class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
                     <input
@@ -1207,7 +1256,7 @@ const regenerateRecoveryKey = () => {
                         @input="applyFilter"
                         type="text"
                         placeholder="Search devices by name, user, or IP..."
-                        class="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 focus:outline-none focus:border-[#F8B803]"
+                        class="field-control w-full pl-10 pr-4"
                     />
                 </div>
                 <SpecularButton
@@ -1363,7 +1412,7 @@ const regenerateRecoveryKey = () => {
         <!-- ========================================== -->
         <div v-else-if="activeTab === 'audit'">
             <!-- Filter Bar -->
-            <div class="flex flex-col sm:flex-row gap-3 mb-4">
+            <div class="mb-6 flex flex-col sm:flex-row gap-3 rounded-xl border border-gray-200 bg-white p-4">
                 <div class="relative flex-1">
                     <Search class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
                     <input
@@ -1371,7 +1420,7 @@ const regenerateRecoveryKey = () => {
                         @input="applyFilter"
                         type="text"
                         placeholder="Search audit trail by description, admin, or target user..."
-                        class="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 focus:outline-none focus:border-[#F8B803]"
+                        class="field-control w-full pl-10 pr-4"
                     />
                 </div>
                 <input
@@ -1478,7 +1527,7 @@ const regenerateRecoveryKey = () => {
         <!-- ========================================== -->
         <div v-else-if="activeTab === 'security'">
             <!-- Filter Bar -->
-            <div class="flex flex-col sm:flex-row gap-3 mb-4">
+            <div class="mb-6 flex flex-col sm:flex-row gap-3 rounded-xl border border-gray-200 bg-white p-4">
                 <div class="relative flex-1">
                     <Search class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
                     <input
@@ -1486,13 +1535,13 @@ const regenerateRecoveryKey = () => {
                         @input="applyFilter"
                         type="text"
                         placeholder="Search security events, IP address, or account..."
-                        class="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 focus:outline-none focus:border-[#F8B803]"
+                        class="field-control w-full pl-10 pr-4"
                     />
                 </div>
                 <select
                     v-model="selectedSeverity"
                     @change="applyFilter"
-                    class="bg-white border border-gray-200 rounded-xl px-3.5 py-2 text-sm text-gray-900 focus:outline-none focus:border-[#F8B803] min-w-[140px]"
+                    class="field-control min-w-[140px] sm:w-auto"
                 >
                     <option value="All Severities">All Severities</option>
                     <option value="info">Info</option>
@@ -1603,7 +1652,8 @@ const regenerateRecoveryKey = () => {
                 </div>
             </div>
         </div>
-    </div>
+        </div>
+    </component>
 
     <!-- ========================================== -->
     <!-- MODALS                                     -->
@@ -1788,7 +1838,7 @@ const regenerateRecoveryKey = () => {
                 <p class="text-[11px] text-gray-500 mt-1">
                     Changing a member's role or modules invalidates their active sessions to enforce permissions immediately.
                 </p>
-                <span v-if="editForm.errors.role" class="text-xs text-red-500 mt-1 block">{{ editForm.errors.role }}</span>
+                <span v-if="(editForm.errors as Record<string, string | undefined>).role" class="text-xs text-red-500 mt-1 block">{{ (editForm.errors as Record<string, string | undefined>).role }}</span>
 
                 <div class="flex justify-end gap-3 mt-6 pt-2 border-t border-gray-100">
                     <SpecularButton type="button" variant="secondary" size="md" :radius="10" @click="showEditModal = false">
@@ -1834,14 +1884,16 @@ const regenerateRecoveryKey = () => {
     <!-- Delete Account Confirmation Modal -->
     <div v-if="showDeleteModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
         <div class="bg-white border border-gray-200 p-6 rounded-xl w-full max-w-md shadow-xl">
-            <h3 class="text-xl font-semibold text-gray-900 mb-2">Delete Account</h3>
-            <p class="text-gray-600 text-sm mb-4">
-                Are you sure you want to delete <span class="font-semibold text-gray-900">{{ selectedUser?.name }}</span>?
-                All active sessions and registered trusted devices will be revoked immediately.
+            <h3 class="text-xl font-semibold text-gray-900 mb-2">Are you sure you want to permanently delete this record?</h3>
+            <p class="text-gray-600 text-sm mb-3 leading-relaxed">
+                This action cannot be undone. Related active sessions, registered trusted devices, or dependent records must only be revoked or removed when explicitly required by the operation.
             </p>
+            <div class="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 mb-4">
+                Deleting user account <span class="font-semibold text-rose-900">{{ selectedUser?.name }}</span> ({{ selectedUser?.email }}) will immediately revoke their active sessions and registered trusted devices as required for account removal.
+            </div>
             <div class="mt-4 mb-6">
                 <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm permanent deletion:
                 </label>
                 <input
                     v-model="deleteConfirmInput"
@@ -1859,7 +1911,7 @@ const regenerateRecoveryKey = () => {
                     size="md"
                     :radius="10"
                     @click="confirmDelete"
-                    :disabled="deleteConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="deleteConfirmInput !== 'YES'"
                 >
                     Delete Account
                 </SpecularButton>
@@ -2049,7 +2101,7 @@ const regenerateRecoveryKey = () => {
             </p>
             <div class="mt-4 mb-6">
                 <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm permanent deletion:
                 </label>
                 <input
                     v-model="revokeDeviceConfirmInput"
@@ -2067,7 +2119,7 @@ const regenerateRecoveryKey = () => {
                     size="md"
                     :radius="10"
                     @click="confirmRevokeDevice"
-                    :disabled="revokeDeviceConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="revokeDeviceConfirmInput !== 'YES'"
                 >
                     Revoke Device
                 </SpecularButton>
@@ -2119,7 +2171,7 @@ const regenerateRecoveryKey = () => {
 
             <div v-if="confirmOptions.confirmVariant === 'destructive'" class="mt-2 mb-5">
                 <label class="block text-xs font-semibold text-gray-700 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">YES</span> to confirm permanent deletion:
                 </label>
                 <input
                     v-model="confirmActionInput"
@@ -2145,7 +2197,7 @@ const regenerateRecoveryKey = () => {
                     size="md"
                     :radius="10"
                     @click="handleConfirmedAction"
-                    :disabled="addForm.processing || editForm.processing || enrollForm.processing || (confirmOptions.confirmVariant === 'destructive' && confirmActionInput.trim().toUpperCase() !== 'YES')"
+                    :disabled="addForm.processing || editForm.processing || enrollForm.processing || (confirmOptions.confirmVariant === 'destructive' && confirmActionInput !== 'YES')"
                 >
                     <Check v-if="confirmOptions.confirmVariant !== 'destructive'" class="w-4 h-4 mr-1.5 inline" />
                     <Trash2 v-else class="w-4 h-4 mr-1.5 inline" />

@@ -86,7 +86,7 @@ const getEventColor = (event: string) => {
 
         <div class="workspace-page">
             <!-- Header Section -->
-            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <div class="page-header">
                 <div>
                     <h1 class="page-title">
                         Security Audit Logs
@@ -98,7 +98,7 @@ const getEventColor = (event: string) => {
             </div>
 
             <!-- Filters Bar -->
-            <div class="flex flex-col sm:flex-row items-center gap-3">
+            <div class="flex flex-col sm:flex-row items-center gap-3 rounded-xl border border-gray-200 bg-white p-4">
                 <div class="relative flex-1 w-full">
                     <Search class="size-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
                     <input
@@ -106,7 +106,7 @@ const getEventColor = (event: string) => {
                         @input="applyFilters"
                         type="text"
                         placeholder="Search logs by email, IP address, description..."
-                        class="h-11 w-full rounded-xl border border-gray-200 bg-white pl-10 pr-4 text-sm text-gray-900 focus:border-[#4b5320] focus:ring-2 focus:ring-[#4b5320]/20"
+                        class="field-control w-full pl-10 pr-4"
                     />
                 </div>
 
@@ -114,7 +114,7 @@ const getEventColor = (event: string) => {
                     <select
                         v-model="selectedEvent"
                         @change="applyFilters"
-                        class="h-11 w-full rounded-xl border border-gray-200 bg-white px-3 text-sm text-gray-700 focus:border-[#4b5320] focus:ring-2 focus:ring-[#4b5320]/20 cursor-pointer"
+                        class="field-control w-full cursor-pointer"
                     >
                         <option value="all">All Security Events</option>
                         <option v-for="evt in availableEvents" :key="evt" :value="evt">
@@ -130,21 +130,21 @@ const getEventColor = (event: string) => {
                     <table class="w-full text-left text-sm text-gray-600">
                         <thead class="bg-gray-50/80 border-b border-gray-200 text-xs font-semibold text-gray-700">
                             <tr>
-                                <th class="px-6 py-4">Timestamp</th>
-                                <th class="px-6 py-4">Event Type</th>
-                                <th class="px-6 py-4">Account Identifier</th>
-                                <th class="px-6 py-4">Description</th>
-                                <th class="px-6 py-4">IP Address</th>
+                                <th class="px-4 py-3">Timestamp</th>
+                                <th class="px-4 py-3">Event Type</th>
+                                <th class="px-4 py-3">Account Identifier</th>
+                                <th class="px-4 py-3">Description</th>
+                                <th class="px-4 py-3">IP Address</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-gray-100 font-mono text-xs">
                             <tr v-for="log in logs.data" :key="log.id" class="hover:bg-gray-50/60 transition-colors">
-                                <td class="px-6 py-4 whitespace-nowrap text-gray-500 font-sans">
+                                <td class="px-4 py-3 whitespace-nowrap text-gray-500 font-sans">
                                     <div class="font-medium text-gray-900">{{ log.created_at }}</div>
                                     <div class="text-[11px] text-gray-400">{{ log.time_ago }}</div>
                                 </td>
 
-                                <td class="px-6 py-4 whitespace-nowrap">
+                                <td class="px-4 py-3 whitespace-nowrap">
                                     <span
                                         class="inline-flex items-center rounded-md px-2.5 py-1 text-[11px] font-semibold border"
                                         :class="getEventColor(log.event)"
@@ -153,7 +153,7 @@ const getEventColor = (event: string) => {
                                     </span>
                                 </td>
 
-                                <td class="px-6 py-4 whitespace-nowrap font-sans text-xs">
+                                <td class="px-4 py-3 whitespace-nowrap font-sans text-xs">
                                     <div v-if="log.user" class="font-semibold text-gray-900">
                                         {{ log.user.name }}
                                         <span class="text-[10px] text-gray-400">({{ log.user.role }})</span>
@@ -161,17 +161,17 @@ const getEventColor = (event: string) => {
                                     <div class="text-gray-500">{{ log.user_email || '—' }}</div>
                                 </td>
 
-                                <td class="px-6 py-4 font-sans text-xs text-gray-800 max-w-md">
+                                <td class="px-4 py-3 font-sans text-xs text-gray-800 max-w-md">
                                     {{ log.description }}
                                 </td>
 
-                                <td class="px-6 py-4 whitespace-nowrap text-gray-600 font-mono text-[11px]">
+                                <td class="px-4 py-3 whitespace-nowrap text-gray-600 font-mono text-[11px]">
                                     {{ log.ip_address || '—' }}
                                 </td>
                             </tr>
 
                             <tr v-if="logs.data.length === 0">
-                                <td colspan="5" class="px-6 py-12 text-center text-gray-400 font-sans">
+                                <td colspan="5" class="px-4 py-12 text-center text-gray-400 font-sans">
                                     No audit log entries matching criteria.
                                 </td>
                             </tr>
@@ -180,7 +180,7 @@ const getEventColor = (event: string) => {
                 </div>
 
                 <!-- Pagination -->
-                <div v-if="logs.last_page > 1" class="border-t border-gray-200 px-6 py-4 flex items-center justify-between text-xs text-gray-500">
+                <div v-if="logs.last_page > 1" class="border-t border-gray-200 px-4 py-3 flex items-center justify-between text-xs text-gray-500">
                     <div>Showing {{ logs.data.length }} of {{ logs.total }} security events</div>
                     <div class="flex items-center gap-1">
                         <Link

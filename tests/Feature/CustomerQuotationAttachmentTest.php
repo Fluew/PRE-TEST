@@ -75,7 +75,7 @@ it('allows authorized staff to download quotation attachment', function () {
         'tax_rate' => 12.00,
         'tax_amount' => 120.00,
         'grand_total' => 1120.00,
-        'status' => 'pending',
+        'status' => 'draft',
         'attachment_path' => $path,
     ]);
 

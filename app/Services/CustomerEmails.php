@@ -30,8 +30,10 @@ class CustomerEmails
     {
         return match ($type) {
             'quotation_sent' => $this->quotationSent($this->expect($record, Quotation::class)),
+            // Not sent any more (removed 2026-11-09); kept to resend or show earlier emails of this type.
             'quotation_accepted' => $this->quotationAccepted($this->expect($record, Quotation::class)),
             'order_completed' => $this->orderCompleted($this->expect($record, Sale::class)),
+            // Not sent any more (removed 2026-11-09); kept to resend or show earlier emails of this type.
             'sales_order_created' => $this->salesOrderCreated($this->expect($record, Sale::class)),
             'order_confirmed' => $this->orderConfirmed($this->expect($record, Sale::class)),
             'order_cancelled' => $this->orderCancelled($this->expect($record, Sale::class)),
@@ -154,10 +156,10 @@ class CustomerEmails
         return $this->message($this->saleEmail($sale), "Your Sales Order Has Been Created – {$sale->order_number}", $html, $attachments);
     }
 
+    /** The commercial invoice is not attached: staff send it separately ("Send Commercial Invoice"). */
     private function orderConfirmed(Sale $sale): array
     {
-        $sale->loadMissing(['items', 'invoices']);
-        $invoice = $sale->invoices->firstWhere('status', SalesInvoice::ISSUED);
+        $sale->loadMissing('items');
 
         $basis = match ($sale->payment_terms) {
             Sale::TERMS_CREDIT => 'on approved credit terms',
@@ -172,7 +174,6 @@ class CustomerEmails
             [
                 'Sales Order No.' => $sale->order_number,
                 'Confirmed' => $sale->confirmed_at?->format('M d, Y h:i A'),
-                'Sales Invoice No.' => $invoice?->invoice_number,
                 'Amount Paid' => $this->money($sale->amount_paid),
                 'Balance' => $this->money($sale->outstanding_balance),
                 'Payment Terms' => match ($sale->payment_terms) {
@@ -183,11 +184,10 @@ class CustomerEmails
             ],
             [],
             [],
-            $invoice ? 'Your sales invoice is attached.' : null,
+            'Your commercial invoice will be sent to you in a separate email.',
         );
 
-        return $this->message($this->saleEmail($sale), "Order Confirmed – {$sale->order_number}", $html,
-            $invoice ? [$this->invoiceAttachment($invoice)] : []);
+        return $this->message($this->saleEmail($sale), "Order Confirmed – {$sale->order_number}", $html);
     }
 
     private function orderCancelled(Sale $sale): array
@@ -280,22 +280,30 @@ class CustomerEmails
         return $this->message($this->saleEmail($sale), "Payment Not Verified – {$sale->order_number}", $html);
     }
 
+    /** "Send Commercial Invoice" (staff-triggered): the issued invoice PDF, attached. */
     private function invoiceIssued(SalesInvoice $invoice): array
     {
         $sale = $invoice->sale;
         $html = $this->layout(
-            "Sales Invoice {$invoice->invoice_number}",
+            "Commercial Invoice {$invoice->invoice_number}",
             $this->greeting($sale->contact_person ?: $sale->client_name),
-            $invoice->replaces_invoice_id ? 'We have issued a corrected sales invoice, attached. It replaces the earlier invoice.' : 'Your sales invoice is attached.',
+            $invoice->replaces_invoice_id
+                ? 'Please find attached the corrected commercial invoice for your order. It replaces the earlier invoice.'
+                : 'Thank you for your order. Please find attached the commercial invoice for your confirmed order.',
             [
                 'Invoice No.' => $invoice->invoice_number,
                 'Sales Order No.' => $sale->order_number,
                 'Invoice Date' => $invoice->issued_at?->format('M d, Y'),
                 'Total' => $this->money($invoice->grand_total),
+                'Amount Paid' => $this->money($sale->amount_paid),
+                'Balance' => $this->money($sale->outstanding_balance),
             ],
+            [],
+            [],
+            'If you have any questions about this invoice, simply reply to this email.',
         );
 
-        return $this->message($this->saleEmail($sale), "Sales Invoice {$invoice->invoice_number} – {$sale->order_number}", $html, [$this->invoiceAttachment($invoice)]);
+        return $this->message($this->saleEmail($sale), "Commercial Invoice {$invoice->invoice_number} – Order {$sale->order_number}", $html, [$this->invoiceAttachment($invoice)]);
     }
 
     /** @param  array<string, mixed>  $context  status, release_id, remarks */
@@ -310,16 +318,19 @@ class CustomerEmails
         $partial = (bool) ($context['partial'] ?? false);
         $remainingCancelled = (bool) ($context['remaining_cancelled'] ?? false);
 
-        [$title, $intro] = match ($status) {
-            DeliveryStatus::ReadyForDelivery => $pickup
+        // A failed attempt leaves the delivery Ready for Delivery, but the customer hears what happened.
+        $attemptFailed = ! empty($context['attempt_failed']);
+
+        [$title, $intro] = match (true) {
+            $attemptFailed => ['We could not deliver your order', 'Our delivery attempt was not successful. Our team will contact you to arrange the next delivery; you can also reply to this email with a better time or address.'],
+            $status === DeliveryStatus::ReadyForDelivery => $pickup
                 ? ['Your order is ready for pickup', 'Your items are ready. You can pick them up at our warehouse.']
                 : ['Your order is ready for delivery', 'Your items are packed and ready to be dispatched to you.'],
-            DeliveryStatus::OutForDelivery => ['Your order is on the way', 'Your order has left our warehouse and is out for delivery. Please make sure someone is available to receive it.'],
-            DeliveryStatus::Delivered => $partial
+            $status === DeliveryStatus::InTransit => ['Your order is on the way', 'Your order has left our warehouse and is in transit. Please make sure someone is available to receive it.'],
+            $status === DeliveryStatus::Delivered => $partial
                 ? [$pickup ? 'Part of your order was picked up' : 'Part of your order was delivered', 'Part of your order has been received. The remaining items will follow.']
                 : [$pickup ? 'Your order was picked up' : 'Your order was delivered', 'All items in your order have been received. Thank you for your business.'],
-            DeliveryStatus::DeliveryAttemptFailed => ['We could not deliver your order', 'Our delivery attempt was not successful. Our team will contact you to arrange the next delivery; you can also reply to this email with a better time or address.'],
-            DeliveryStatus::Cancelled => $remainingCancelled
+            $status === DeliveryStatus::Cancelled => $remainingCancelled
                 ? ['The rest of your delivery was cancelled', 'The items of your order that were not delivered yet will not be delivered.']
                 : ['Your delivery was cancelled', 'The delivery of your order has been cancelled.'],
             default => throw new InvalidArgumentException("No customer email for delivery status {$status->value}."),

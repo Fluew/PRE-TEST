@@ -10,9 +10,14 @@ use App\Models\Supplier;
 use App\Models\SupplierQuote;
 use App\Models\Team;
 use App\Models\User;
+use App\Services\Import\ColumnSchema;
 use App\Services\Import\DocumentExtractor;
+use App\Services\Import\ImportService;
+use App\Services\Import\ValueParser;
 use App\Services\MaterialList\ExtractionException;
 use App\Services\MaterialList\OcrEngine;
+use App\Services\MaterialList\WordTable;
+use Dompdf\Dompdf;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Storage;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
@@ -27,7 +32,10 @@ beforeEach(function () {
     $this->url = "/{$this->team->slug}/imports";
 });
 
-function impAs($t, ?User $u = null, ?array $cookies = null) { return $t->actingAs($u ?? $t->admin)->withCookies($cookies ?? $t->cookies)->withCredentials(); }
+function impAs($t, ?User $u = null, ?array $cookies = null)
+{
+    return $t->actingAs($u ?? $t->admin)->withCookies($cookies ?? $t->cookies)->withCredentials();
+}
 
 function impCsv(string $csv, string $name = 'list.csv'): UploadedFile
 {
@@ -62,7 +70,10 @@ test('inventory import keeps missing values empty, generates SKUs, and never tou
 
     $rows = $batch->rows()->orderBy('row_number')->get()->keyBy(fn ($r) => $r->values['name'] ?? $r->raw);
     expect($rows['THHN Wire 3.5mm']->status)->toBe(ImportRow::READY)
-        ->and(collect($rows['THHN Wire 3.5mm']->issues)->pluck('message')->implode(' '))->toContain('not imported. Receive stock')
+        // The stock column is noted once for the file, not on every row.
+        ->and($rows['THHN Wire 3.5mm']->issues)->toBe([])
+        ->and($batch->summary['stock_in_file'])->toBe(2)
+        ->and($batch->summary['inactive'])->toBe(1) // LED Bulb 9W: no unit or price
         ->and($rows['LED Bulb 9W']->status)->toBe(ImportRow::READY)
         ->and($rows['LED Bulb 9W']->values['price'])->toBeNull()
         ->and($rows['Circuit Breaker 40A']->status)->toBe(ImportRow::EXISTING)
@@ -74,7 +85,7 @@ test('inventory import keeps missing values empty, generates SKUs, and never tou
     $wire = Product::where('sku', 'WR-35')->sole();
     expect((float) $wire->price)->toBe(1250.0)->and($wire->stock)->toBe(0)->and($wire->is_active)->toBeTrue();
     $bulb = Product::where('name', 'LED Bulb 9W')->sole();
-    expect($bulb->sku)->toStartWith('PRD-')
+    expect($bulb->sku)->toBe('GEN-000001') // no SKU and no category in the file
         ->and($bulb->price)->toBeNull()->and($bulb->unit)->toBeNull()->and($bulb->cost_price)->toBeNull()
         ->and($bulb->is_active)->toBeFalse()
         ->and($bulb->missing_fields)->toEqual(['unit', 'cost_price', 'price', 'category']);
@@ -149,7 +160,7 @@ test('OCR documents need staff to confirm they checked the values, and look-alik
     // Images go to the queue; the test queue runs it at once.
     expect($batch->status)->toBe(ImportBatch::READY)->and($batch->usedOcr())->toBeTrue();
     $row = $batch->rows()->sole();
-    expect($row->values['price'])->toEqual(150.0)->and(collect($row->issues)->pluck('message')->implode(' '))->toContain('read by OCR as "l5O"');
+    expect($row->values['price'])->toEqual(150.0)->and(collect($row->issues)->pluck('message')->implode(' '))->toContain('read as "l5O"');
 
     impAs($this)->post("{$this->url}/batches/{$id}/confirm")->assertStatus(422)->assertJsonPath('errors.ocr_checked.0', fn ($m) => str_contains($m, 'OCR'));
     impAs($this)->post("{$this->url}/batches/{$id}/confirm", ['ocr_checked' => true])->assertOk();
@@ -191,12 +202,12 @@ test('a retried extraction replaces its rows instead of duplicating them, and th
     Storage::disk('local')->put('imports/x.pdf', '%PDF-1.4');
 
     $job = new ProcessImportBatch($batch->id);
-    expect(fn () => $job->handle(app(\App\Services\Import\ImportService::class)))->toThrow(RuntimeException::class);
+    expect(fn () => $job->handle(app(ImportService::class)))->toThrow(RuntimeException::class);
     expect($batch->fresh()->status)->toBe(ImportBatch::PROCESSING)->and($batch->rows()->count())->toBe(0);
 
     // Retry: both pages' rows (header repeated on page 2) in one preview.
-    $job->handle(app(\App\Services\Import\ImportService::class));
-    $job->handle(app(\App\Services\Import\ImportService::class)); // a duplicate delivery of the job does nothing
+    $job->handle(app(ImportService::class));
+    $job->handle(app(ImportService::class)); // a duplicate delivery of the job does nothing
     expect($batch->fresh()->status)->toBe(ImportBatch::READY)->and($batch->rows()->pluck('values')->pluck('name')->all())->toBe(['Alpha', 'Beta'])
         ->and($batch->fresh()->attempts)->toBe(2);
 
@@ -224,7 +235,7 @@ test('a real multi-page digital PDF is combined into one preview', function () {
     $html = '<html><head><style>td,th{padding:4px 28px;text-align:left}</style></head><body style="font-family: DejaVu Sans">'.$page('<tr><td>PG-1</td><td>Page One Item</td><td>pcs</td><td>10.00</td></tr>')
         .'<div style="page-break-after: always"></div>'.$page('<tr><td>PG-2</td><td>Page Two Item</td><td>box</td><td>20.00</td></tr>').'</body></html>';
     $path = tempnam(sys_get_temp_dir(), 'imp').'.pdf';
-    $dompdf = new \Dompdf\Dompdf;
+    $dompdf = new Dompdf;
     $dompdf->loadHtml($html);
     $dompdf->render();
     file_put_contents($path, $dompdf->output());
@@ -266,4 +277,111 @@ test('an OCR supplier quotation with missing fields is held until staff complete
     expect((float) $quote->unit_price)->toBe(1180.0)->and((float) $quote->amount)->toBe(11800.0)->and($quote->amount_source)->toBe('calculated')
         ->and($quote->unit_price_source)->toBe('supplier')->and($quote->verified_at)->toBeNull()
         ->and((float) $wire->fresh()->cost_price)->toBe(950.0);
+});
+
+test('splits combined quantity and unit cells and warns when the exact file was already imported', function () {
+    $supplier = Supplier::create(['team_id' => $this->team->id, 'name' => 'Apex Electric', 'status' => 'Active']);
+    $wire = Product::create(['team_id' => $this->team->id, 'sku' => 'WR-35', 'name' => 'THHN Wire 3.5mm', 'price' => 1300, 'cost_price' => 950, 'stock' => 0, 'is_active' => true, 'unit' => 'roll']);
+
+    $csvContent = "Item Code,Description,Qty,Unit Price,Amount\nWR-35,THHN Wire 3.5mm,10 rolls,₱1200.00/roll,12000.00\n";
+    $id1 = impAs($this)->post("{$this->url}/supplier_quotation", [
+        'file' => impCsv($csvContent, 'apex-quote.csv'),
+        'supplier_id' => $supplier->id,
+        'quoted_on' => now()->toDateString(),
+        'currency' => 'PHP',
+    ])->assertCreated()->json('id');
+
+    $row1 = ImportBatch::findOrFail($id1)->rows()->sole();
+    expect($row1->values['quantity'])->toEqual(10.0)
+        ->and($row1->values['unit'])->toBe('roll')
+        ->and($row1->values['unit_price'])->toEqual(1200.0)
+        ->and($row1->status)->toBe(ImportRow::READY);
+
+    impAs($this)->post("{$this->url}/batches/{$id1}/confirm")->assertOk();
+
+    // Re-uploading the exact same file flags duplicate_batch in summary
+    $id2 = impAs($this)->post("{$this->url}/supplier_quotation", [
+        'file' => impCsv($csvContent, 'apex-quote-copy.csv'),
+        'supplier_id' => $supplier->id,
+        'quoted_on' => now()->toDateString(),
+        'currency' => 'PHP',
+    ])->assertCreated()->json('id');
+
+    $batch2 = ImportBatch::findOrFail($id2);
+    expect($batch2->summary['duplicate_batch']['id'] ?? null)->toBe($id1)
+        ->and($batch2->summary['duplicate_batch']['filename'] ?? null)->toBe('apex-quote.csv');
+});
+
+test('WordTable merges horizontally split Tesseract blocks on the same row and wraps first-column descriptions', function () {
+    $words = [
+        // Header row
+        ['p' => 1, 'b' => 1, 'l' => 1, 'x' => 20, 'y' => 40, 'w' => 110, 'h' => 18, 'c' => 95, 't' => 'Description'],
+        ['p' => 1, 'b' => 1, 'l' => 1, 'x' => 260, 'y' => 40, 'w' => 40, 'h' => 18, 'c' => 95, 't' => 'Unit'],
+        ['p' => 1, 'b' => 1, 'l' => 1, 'x' => 360, 'y' => 40, 'w' => 35, 'h' => 18, 'c' => 95, 't' => 'Qty'],
+        ['p' => 1, 'b' => 1, 'l' => 1, 'x' => 450, 'y' => 40, 'w' => 80, 'h' => 18, 'c' => 95, 't' => 'Price'],
+        // Row 1 split across block 2 (left) and block 3 (right) on the same vertical y=80
+        ['p' => 1, 'b' => 2, 'l' => 1, 'x' => 20, 'y' => 80, 'w' => 140, 'h' => 18, 'c' => 92, 't' => 'Circuit Breaker'],
+        ['p' => 1, 'b' => 3, 'l' => 1, 'x' => 260, 'y' => 81, 'w' => 30, 'h' => 18, 'c' => 92, 't' => 'pcs'],
+        ['p' => 1, 'b' => 3, 'l' => 1, 'x' => 360, 'y' => 80, 'w' => 25, 'h' => 18, 'c' => 90, 't' => '1S'],
+        ['p' => 1, 'b' => 3, 'l' => 1, 'x' => 450, 'y' => 80, 'w' => 60, 'h' => 18, 'c' => 92, 't' => '850.00'],
+        // Wrapped continuation of column 0 (Description) at y=99 (gap 1px < 0.8*18)
+        ['p' => 1, 'b' => 2, 'l' => 2, 'x' => 20, 'y' => 99, 'w' => 95, 'h' => 18, 'c' => 91, 't' => 'Bolt-on 60A'],
+    ];
+
+    $tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n";
+    foreach ($words as $i => $w) {
+        $tsv .= "5\t{$w['p']}\t{$w['b']}\t1\t{$w['l']}\t".($i + 1)."\t{$w['x']}\t{$w['y']}\t{$w['w']}\t{$w['h']}\t{$w['c']}\t{$w['t']}\n";
+    }
+
+    $table = WordTable::build(
+        [$tsv],
+        fn (array $cells) => ColumnSchema::headerMap(ImportBatch::SUPPLIER_QUOTATION, $cells) !== null,
+        true
+    );
+
+    expect($table['aligned'])->toBeTrue()
+        ->and($table['rows'])->toHaveCount(2)
+        ->and($table['rows'][1])->toBe(['Circuit Breaker Bolt-on 60A', 'pcs', '1S', '850.00']);
+
+    $parsedNum = ValueParser::number('1S', true);
+    expect($parsedNum['value'])->toEqual(15.0)->and($parsedNum['corrected_from'])->toBe('1S');
+
+    $parsedDate = ValueParser::date('2026-10-25');
+    expect($parsedDate['value'])->toBe('2026-10-25')->and($parsedDate['problem'])->toBeNull();
+});
+
+test('never treats column headers or field labels as record values, keeps missing fields NULL, and computes confidence', function () {
+    $csv = "Supplier Name:\nSKU,Product Name,Category,Unit,Cost Price,Selling Price\n"
+        ."Product Name,Description,,,,\n"
+        ."EL-100,Industrial Contactor 3P,Controls,pcs,650,950\n"
+        .",Unpriced Panel Box,,,,\n";
+
+    $id = impAs($this)->post("{$this->url}/inventory", ['file' => impCsv($csv)])->assertCreated()->json('id');
+    $batch = ImportBatch::findOrFail($id);
+    $rows = $batch->rows()->orderBy('row_number')->get();
+
+    // Only the 2 actual product rows are extracted; "Supplier Name:" and repeated header "Product Name,Description" are excluded from records
+    expect($rows)->toHaveCount(2);
+
+    $completeRow = $rows[0];
+    expect($completeRow->values['sku'])->toBe('EL-100')
+        ->and($completeRow->values['name'])->toBe('Industrial Contactor 3P')
+        ->and($completeRow->sources['name'])->toBe('document')
+        ->and($completeRow->sources['price'])->toBe('document')
+        ->and($completeRow->sources['_confidence'])->toBe('high');
+
+    $incompleteRow = $rows[1];
+    expect($incompleteRow->values['name'])->toBe('Unpriced Panel Box')
+        ->and($incompleteRow->values['sku'])->toBeNull()
+        ->and($incompleteRow->values['category'])->toBeNull()
+        ->and($incompleteRow->values['unit'])->toBeNull()
+        ->and($incompleteRow->values['cost_price'])->toBeNull()
+        ->and($incompleteRow->values['price'])->toBeNull()
+        ->and($incompleteRow->sources['sku'])->toBeNull()
+        ->and($incompleteRow->sources['price'])->toBeNull()
+        ->and($incompleteRow->sources['_confidence'])->toBe('medium');
+
+    // Also verify a file containing ONLY column headers/field labels produces 0 record rows
+    $headerOnlyId = impAs($this)->post("{$this->url}/inventory", ['file' => impCsv("SKU,Unit,Selling Price\nProduct Name:\n")])->assertCreated()->json('id');
+    expect(ImportBatch::findOrFail($headerOnlyId)->rows()->count())->toBe(0);
 });

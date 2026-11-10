@@ -16,7 +16,9 @@ use Illuminate\Database\Eloquent\Builder;
  *
  * Monthly demand = the larger of (outgoing stock movements) and (units on confirmed, processing or
  * completed Sales Orders) for that month. Forecast for month i = the plain average of the
- * `window` months before it. Months without records count as 0; a product with no demand
+ * `window` months before it; the forecasting period (3 Months, 6 Months, 1 Year) is that window,
+ * and the demand expected over the period is the SMA × its months. Months without records count
+ * as 0; a product with no demand
  * record at all has no forecast (insufficient data), nothing is invented.
  */
 class SmaForecaster
@@ -24,6 +26,9 @@ class SmaForecaster
     public const WINDOWS = [3, 6, 12];
 
     public const DEFAULT_WINDOW = 3;
+
+    /** How staff see the forecasting periods: the months averaged and the months forecast ahead. */
+    public const PERIOD_LABELS = [3 => '3 Months', 6 => '6 Months', 12 => '1 Year'];
 
     public const DEMAND_MOVEMENT_TYPES = ['sale', 'sale_release', 'out'];
 
@@ -137,10 +142,13 @@ class SmaForecaster
                 $reason = "History starts {$historyStart->format('M j, Y')}: fewer than {$window} full months before this month.";
             }
 
+            $average = array_sum(array_column($inputs, 'units')) / $window;
             $result[$id] = [
                 'available' => $reason === null,
                 'has_records' => isset($everHad[$id]),
-                'forecast' => $reason === null ? (int) round(array_sum(array_column($inputs, 'units')) / $window) : null,
+                // Monthly SMA, and the demand expected over the next `window` months (SMA × months).
+                'forecast' => $reason === null ? (int) round($average) : null,
+                'period_forecast' => $reason === null ? (int) round($average * $window) : null,
                 'window' => $window,
                 'inputs' => $inputs,
                 'reason' => $reason,

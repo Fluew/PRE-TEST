@@ -84,7 +84,11 @@ const props = defineProps<{
 }>();
 
 const page = usePage();
-const teamSlug = computed(() => (page.props as any).currentTeam?.slug || '');
+const teamSlug = computed(() => (page.props as any).currentTeam?.slug || (page.props as any).teams?.[0]?.slug || 'mr-pride');
+const recycleBinIndexUrl = computed(() => {
+    const path = String(page.url || '').split('?')[0] || '';
+    return path.startsWith('/settings/maintenance') ? '/settings/maintenance/recycle-bin' : `/${teamSlug.value}/recycle-bin`;
+});
 // Record amounts are stored USD; shown in the user's display currency (header switch).
 const { formatMoney } = useCurrency();
 
@@ -93,11 +97,14 @@ const searchQuery = ref(props.filters.search || '');
 const selectedType = ref(props.filters.type || 'all');
 let searchTimeout: ReturnType<typeof setTimeout> | null = null;
 
-const applyFilters = () => {
+// Filters always start again on page 1. Search waits for typing to pause; the type dropdown applies at once.
+const applyFilters = (delay = 300) => {
     if (searchTimeout) clearTimeout(searchTimeout);
+    // Selected rows may disappear from the filtered list, so clear them to avoid acting on hidden records.
+    selectedIds.value = [];
     searchTimeout = setTimeout(() => {
         router.get(
-            `/${teamSlug.value}/recycle-bin`,
+            recycleBinIndexUrl.value,
             {
                 type: selectedType.value !== 'all' ? selectedType.value : undefined,
                 search: searchQuery.value ? searchQuery.value : undefined,
@@ -108,17 +115,20 @@ const applyFilters = () => {
                 replace: true,
             }
         );
-    }, 300);
-};
-
-const filterByType = (type: string) => {
-    selectedType.value = type;
-    applyFilters();
+    }, delay);
 };
 
 watch(searchQuery, () => {
     applyFilters();
 });
+
+// Keep the dropdown in step with the server (for example when an unknown type falls back to All Records).
+watch(
+    () => props.filters.type,
+    (type) => {
+        selectedType.value = type || 'all';
+    }
+);
 
 // Flash toasts are handled globally by useFlashToast in AppSidebarLayout
 
@@ -181,20 +191,22 @@ const confirmRestore = () => {
     isProcessing.value = true;
 
     router.post(
-        `/${teamSlug.value}/recycle-bin/${recordToRestore.value.type}/${recordToRestore.value.id}/restore`,
+        `${recycleBinIndexUrl.value}/${recordToRestore.value.type}/${recordToRestore.value.id}/restore`,
         {},
         {
             preserveScroll: true,
             onSuccess: () => {
+                const targetType = recordToRestore.value?.type;
+                const targetId = recordToRestore.value?.id;
                 showRestoreModal.value = false;
-                if (showDetailsModal.value && activeRecord.value?.id === recordToRestore.value?.id) {
+                if (showDetailsModal.value && activeRecord.value?.id === targetId) {
                     showDetailsModal.value = false;
                 }
                 recordToRestore.value = null;
                 isProcessing.value = false;
                 // Clean up selected items
                 selectedIds.value = selectedIds.value.filter(
-                    (s) => !(s.type === recordToRestore.value?.type && s.id === recordToRestore.value?.id)
+                    (s) => !(s.type === targetType && s.id === targetId)
                 );
             },
             onError: () => {
@@ -232,23 +244,26 @@ const openEmptyBinModal = () => {
 };
 
 const confirmForceDelete = () => {
-    if (!recordToForceDelete.value) return;
+    if (!recordToForceDelete.value || forceDeleteConfirmInput.value !== 'YES') return;
     isProcessing.value = true;
 
     router.delete(
-        `/${teamSlug.value}/recycle-bin/${recordToForceDelete.value.type}/${recordToForceDelete.value.id}/force`,
+        `${recycleBinIndexUrl.value}/${recordToForceDelete.value.type}/${recordToForceDelete.value.id}/force`,
         {
+            data: { confirmation: forceDeleteConfirmInput.value },
             preserveScroll: true,
             onSuccess: () => {
+                const targetType = recordToForceDelete.value?.type;
+                const targetId = recordToForceDelete.value?.id;
                 showForceDeleteModal.value = false;
-                if (showDetailsModal.value && activeRecord.value?.id === recordToForceDelete.value?.id) {
+                if (showDetailsModal.value && activeRecord.value?.id === targetId) {
                     showDetailsModal.value = false;
                 }
                 recordToForceDelete.value = null;
                 isProcessing.value = false;
                 // Clean up selected items
                 selectedIds.value = selectedIds.value.filter(
-                    (s) => !(s.type === recordToForceDelete.value?.type && s.id === recordToForceDelete.value?.id)
+                    (s) => !(s.type === targetType && s.id === targetId)
                 );
             },
             onError: () => {
@@ -270,7 +285,7 @@ const confirmBulkRestore = () => {
     isProcessing.value = true;
 
     router.post(
-        `/${teamSlug.value}/recycle-bin/bulk-restore`,
+        `${recycleBinIndexUrl.value}/bulk-restore`,
         { items: selectedIds.value },
         {
             preserveScroll: true,
@@ -294,12 +309,12 @@ const confirmBulkRestore = () => {
 const showBulkForceDeleteModal = ref(false);
 
 const confirmBulkForceDelete = () => {
-    if (!selectedIds.value.length) return;
+    if (!selectedIds.value.length || bulkForceDeleteConfirmInput.value !== 'YES') return;
     isProcessing.value = true;
 
     router.post(
-        `/${teamSlug.value}/recycle-bin/bulk-force-delete`,
-        { items: selectedIds.value },
+        `${recycleBinIndexUrl.value}/bulk-force-delete`,
+        { items: selectedIds.value, confirmation: bulkForceDeleteConfirmInput.value },
         {
             preserveScroll: true,
             onSuccess: () => {
@@ -322,11 +337,12 @@ const confirmBulkForceDelete = () => {
 const showEmptyBinModal = ref(false);
 
 const confirmEmptyBin = () => {
+    if (emptyBinConfirmInput.value !== 'YES') return;
     isProcessing.value = true;
 
     router.post(
-        `/${teamSlug.value}/recycle-bin/empty`,
-        {},
+        `${recycleBinIndexUrl.value}/empty`,
+        { confirmation: emptyBinConfirmInput.value },
         {
             preserveScroll: true,
             onSuccess: () => {
@@ -363,6 +379,7 @@ const getTypeIcon = (type: string) => {
         case 'commercial_invoice':
             return FileSpreadsheet;
         case 'delivery':
+        case 'customer_delivery':
             return Truck;
         case 'inquiry':
             return MessageSquare;
@@ -392,6 +409,8 @@ const getTypeBadgeClasses = (type: string) => {
             return 'bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-800/60';
         case 'delivery':
             return 'bg-purple-50 text-purple-700 border-purple-200 dark:bg-purple-950/40 dark:text-purple-300 dark:border-purple-800/60';
+        case 'customer_delivery':
+            return 'bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-800/60';
         case 'inquiry':
             return 'bg-teal-50 text-teal-700 border-teal-200 dark:bg-teal-950/40 dark:text-teal-300 dark:border-teal-800/60';
         case 'sale':
@@ -405,22 +424,22 @@ const getTypeBadgeClasses = (type: string) => {
 <template>
     <Head title="Archive / Recycle Bin | Admin" />
 
-    <div class="workspace-page">
+    <div class="flex min-w-0 flex-col gap-6">
         <!-- Page Header -->
-        <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
+        <div class="page-header">
             <div>
-                <h1 class="page-title">Archive / Recycle Bin</h1>
-                <p class="page-subtitle">Restore deleted records or delete them permanently. Every action is logged.</p>
+                <h1 class="section-title">Archive / Recycle Bin</h1>
+                <p class="section-subtitle">Restore deleted records or delete them permanently. Every action is logged.</p>
             </div>
 
             <!-- Header Action Buttons -->
-            <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
+            <div class="page-actions">
                 <SpecularButton
                     type="button"
                     variant="secondary"
                     size="md"
                     :radius="12"
-                    @click="router.reload({ preserveScroll: true })"
+                    @click="router.reload()"
                 >
                     <RefreshCw class="w-4 h-4 text-gray-500" />
                     <span>Refresh</span>
@@ -442,9 +461,10 @@ const getTypeBadgeClasses = (type: string) => {
             </div>
         </div>
 
-        <!-- Filter Tabs & Search Bar -->
-        <div class="space-y-3">
+        <!-- Search Bar & Record Type Filter -->
+        <div class="space-y-3 rounded-xl border border-gray-200 bg-white p-4">
             <div class="flex flex-col md:flex-row gap-3 justify-between items-stretch md:items-center">
+                <div class="flex flex-col sm:flex-row gap-3 flex-1 min-w-0">
                 <!-- Search Box -->
                 <div class="relative flex-1 max-w-md">
                     <Search class="w-4 h-4 text-gray-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
@@ -452,7 +472,7 @@ const getTypeBadgeClasses = (type: string) => {
                         v-model="searchQuery"
                         type="text"
                         placeholder="Search archived records by title, SKU, or user..."
-                        class="w-full pl-9 pr-4 py-2 text-xs rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-900/50 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:border-[#4b5320] focus:ring-1 focus:ring-[#4b5320]"
+                        class="field-control w-full pl-9 pr-4"
                     />
                     <button
                         v-if="searchQuery"
@@ -463,44 +483,25 @@ const getTypeBadgeClasses = (type: string) => {
                     </button>
                 </div>
 
+                <!-- Record Type Filter (counts follow the current search) -->
+                <select
+                    v-model="selectedType"
+                    @change="applyFilters(0)"
+                    aria-label="Filter by record type"
+                    class="field-control w-full sm:w-60 shrink-0 cursor-pointer"
+                >
+                    <option value="all">All Records ({{ counts.all || 0 }})</option>
+                    <option v-for="t in availableTypes" :key="t.key" :value="t.key">
+                        {{ t.label }} ({{ counts[t.key] || 0 }})
+                    </option>
+                </select>
+                </div>
+
                 <!-- Record Count Indicator -->
                 <div class="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-1.5 self-center">
                     <Filter class="w-3.5 h-3.5 text-gray-400" />
                     <span>Showing {{ records.from || 0 }}–{{ records.to || 0 }} of {{ records.total }}<template v-if="stats.deleted_today"> · {{ stats.deleted_today }} deleted today</template></span>
                 </div>
-            </div>
-
-            <!-- Type Filter Tabs (Scrollable on mobile) -->
-            <div class="flex items-center gap-1.5 overflow-x-auto pb-1 pt-1 no-scrollbar border-t border-gray-100 dark:border-gray-700/50">
-                <button
-                    type="button"
-                    @click="filterByType('all')"
-                    class="px-3 py-1.5 rounded-lg text-sm font-medium shrink-0 transition-colors flex items-center gap-1.5"
-                    :class="selectedType === 'all'
-                        ? 'bg-gray-100 text-gray-900'
-                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 hover:bg-gray-50 dark:hover:bg-gray-800'"
-                >
-                    <span>All Records</span>
-                    <span class="text-xs text-gray-400">
-                        {{ counts.all || 0 }}
-                    </span>
-                </button>
-
-                <button
-                    v-for="t in availableTypes"
-                    :key="t.key"
-                    type="button"
-                    @click="filterByType(t.key)"
-                    class="px-3 py-1.5 rounded-lg text-sm font-medium shrink-0 transition-colors flex items-center gap-1.5"
-                    :class="selectedType === t.key
-                        ? 'bg-gray-100 text-gray-900'
-                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 hover:bg-gray-50 dark:hover:bg-gray-800'"
-                >
-                    <span>{{ t.label }}</span>
-                    <span class="text-xs text-gray-400">
-                        {{ counts[t.key] || 0 }}
-                    </span>
-                </button>
             </div>
         </div>
 
@@ -551,7 +552,7 @@ const getTypeBadgeClasses = (type: string) => {
                 <table class="w-full text-left border-collapse">
                     <thead class="bg-gray-50/80 dark:bg-gray-900/60 border-b border-gray-200/80 dark:border-gray-700/80 text-[11px] font-semibold text-gray-500 dark:text-gray-400">
                         <tr>
-                            <th class="p-3.5 w-10 text-center">
+                            <th class="px-4 py-3 w-10 text-center">
                                 <input
                                     type="checkbox"
                                     :checked="isAllSelected"
@@ -559,12 +560,12 @@ const getTypeBadgeClasses = (type: string) => {
                                     class="rounded text-[#4b5320] focus:ring-[#4b5320] cursor-pointer"
                                 />
                             </th>
-                            <th class="p-3.5">Record Type</th>
-                            <th class="p-3.5">Title & Identifier</th>
-                            <th class="p-3.5">Summary / Details</th>
-                            <th class="p-3.5">Deleted Date</th>
-                            <th class="p-3.5">Deleted By</th>
-                            <th class="p-3.5 text-right">Actions</th>
+                            <th class="px-4 py-3">Record Type</th>
+                            <th class="px-4 py-3">Title & Identifier</th>
+                            <th class="px-4 py-3">Summary / Details</th>
+                            <th class="px-4 py-3">Deleted Date</th>
+                            <th class="px-4 py-3">Deleted By</th>
+                            <th class="px-4 py-3 text-right">Actions</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-gray-100 dark:divide-gray-700/60 text-xs">
@@ -575,7 +576,7 @@ const getTypeBadgeClasses = (type: string) => {
                             :class="isItemSelected(record) ? 'bg-[#4b5320]/5 dark:bg-[#4b5320]/10' : ''"
                         >
                             <!-- Checkbox -->
-                            <td class="p-3.5 text-center">
+                            <td class="px-4 py-3 text-center">
                                 <input
                                     type="checkbox"
                                     :checked="isItemSelected(record)"
@@ -585,7 +586,7 @@ const getTypeBadgeClasses = (type: string) => {
                             </td>
 
                             <!-- Record Type Badge -->
-                            <td class="p-3.5 whitespace-nowrap">
+                            <td class="px-4 py-3 whitespace-nowrap">
                                 <span
                                     class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold border"
                                     :class="getTypeBadgeClasses(record.type)"
@@ -596,7 +597,7 @@ const getTypeBadgeClasses = (type: string) => {
                             </td>
 
                             <!-- Title & Identifier -->
-                            <td class="p-3.5 max-w-xs">
+                            <td class="px-4 py-3 max-w-xs">
                                 <div class="font-semibold text-gray-900 dark:text-white truncate text-xs sm:text-sm">
                                     {{ record.title }}
                                 </div>
@@ -606,14 +607,14 @@ const getTypeBadgeClasses = (type: string) => {
                             </td>
 
                             <!-- Summary / Details -->
-                            <td class="p-3.5 max-w-sm">
+                            <td class="px-4 py-3 max-w-sm">
                                 <span class="text-xs text-gray-700 dark:text-gray-300 font-medium leading-relaxed">
                                     <template v-if="record.amount !== null && record.amount !== undefined">{{ formatMoney(record.amount) }}<template v-if="record.summary"> • </template></template>{{ record.summary || (record.amount === null || record.amount === undefined ? '—' : '') }}
                                 </span>
                             </td>
 
                             <!-- Deleted Date -->
-                            <td class="p-3.5 whitespace-nowrap">
+                            <td class="px-4 py-3 whitespace-nowrap">
                                 <div class="font-semibold text-gray-900 dark:text-gray-200">
                                     {{ record.deleted_at_human }}
                                 </div>
@@ -623,7 +624,7 @@ const getTypeBadgeClasses = (type: string) => {
                             </td>
 
                             <!-- Deleted By User -->
-                            <td class="p-3.5 whitespace-nowrap">
+                            <td class="px-4 py-3 whitespace-nowrap">
                                 <div v-if="record.deleted_by" class="flex items-center gap-2">
                                     <div class="w-6 h-6 rounded-full bg-[#4b5320]/15 dark:bg-[#F8B803]/20 text-[#4b5320] dark:text-[#F8B803] flex items-center justify-center font-semibold text-[10px]">
                                         {{ record.deleted_by.name ? record.deleted_by.name.charAt(0).toUpperCase() : 'U' }}
@@ -643,7 +644,7 @@ const getTypeBadgeClasses = (type: string) => {
                             </td>
 
                             <!-- Actions -->
-                            <td class="p-3.5 text-right whitespace-nowrap">
+                            <td class="px-4 py-3 text-right whitespace-nowrap">
                                 <div class="inline-flex items-center gap-1.5">
                                     <!-- View Details Button -->
                                     <button
@@ -802,7 +803,7 @@ const getTypeBadgeClasses = (type: string) => {
                 <!-- Attributes Table -->
                 <div>
                     <h4 class="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-2">Original Record Properties</h4>
-                    <div class="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden">
+                    <div class="border border-gray-200 dark:border-gray-700 rounded-xl overflow-x-auto">
                         <table class="w-full text-left text-xs divide-y divide-gray-100 dark:divide-gray-700">
                             <tbody class="divide-y divide-gray-100 dark:divide-gray-700 bg-white dark:bg-gray-800">
                                 <tr v-for="(attr, idx) in activeRecord.details" :key="idx" class="hover:bg-gray-50/50 dark:hover:bg-gray-700/30">
@@ -911,20 +912,20 @@ const getTypeBadgeClasses = (type: string) => {
             <div class="w-12 h-12 rounded-full bg-rose-50 dark:bg-rose-950/60 text-rose-600 flex items-center justify-center mb-4 border border-rose-100 dark:border-rose-800">
                 <AlertTriangle class="w-6 h-6" />
             </div>
-            <h3 class="text-xl font-semibold text-gray-900 dark:text-white mb-2">Permanently Delete Record</h3>
-            <p class="text-gray-600 dark:text-gray-300 text-sm mb-4 leading-relaxed">
-                Warning: You are about to permanently purge <strong class="text-gray-900 dark:text-white">"{{ recordToForceDelete.title }}"</strong> ({{ recordToForceDelete.type_label }}) from the database.
+            <h3 class="text-xl font-semibold text-gray-900 dark:text-white mb-2">Are you sure you want to permanently delete this record?</h3>
+            <p class="text-gray-600 dark:text-gray-300 text-sm mb-3 leading-relaxed">
+                This action cannot be undone. Related active sessions, registered trusted devices, or dependent records must only be revoked or removed when explicitly required by the operation.
             </p>
             <div class="p-3.5 bg-rose-50 dark:bg-rose-950/40 rounded-xl border border-rose-200 dark:border-rose-800/60 text-xs text-rose-800 dark:text-rose-300 mb-4 space-y-1">
                 <div class="font-semibold flex items-center gap-1.5">
                     <ShieldAlert class="w-4 h-4 text-rose-600 shrink-0" />
-                    <span>Restricted Admin Action</span>
+                    <span>Target Record: {{ recordToForceDelete.title }} ({{ recordToForceDelete.type_label }})</span>
                 </div>
-                <p>This action is irreversible. The record will be permanently purged and an audit entry will be logged under your administrative credentials.</p>
+                <p>Permanently purging this archived {{ recordToForceDelete.type_label.toLowerCase() }} record removes it from the database and logs an audit entry. Unrelated active sessions and trusted devices are not affected.</p>
             </div>
             <div class="mt-2 mb-6">
                 <label class="block text-xs font-semibold text-gray-700 dark:text-gray-300 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 dark:bg-rose-950 px-1.5 py-0.5 rounded border border-rose-200 dark:border-rose-800">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 dark:bg-rose-950 px-1.5 py-0.5 rounded border border-rose-200 dark:border-rose-800">YES</span> to confirm permanent deletion:
                 </label>
                 <input
                     v-model="forceDeleteConfirmInput"
@@ -948,7 +949,7 @@ const getTypeBadgeClasses = (type: string) => {
                     variant="destructive"
                     size="md"
                     :radius="10"
-                    :disabled="isProcessing || forceDeleteConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="isProcessing || forceDeleteConfirmInput !== 'YES'"
                     @click="confirmForceDelete"
                 >
                     <Trash2 class="w-4 h-4 mr-1.5" />
@@ -1009,16 +1010,16 @@ const getTypeBadgeClasses = (type: string) => {
             <div class="w-12 h-12 rounded-full bg-rose-50 dark:bg-rose-950/60 text-rose-600 flex items-center justify-center mb-4 border border-rose-100 dark:border-rose-800">
                 <AlertTriangle class="w-6 h-6" />
             </div>
-            <h3 class="text-xl font-semibold text-gray-900 dark:text-white mb-2">Bulk Permanent Delete</h3>
-            <p class="text-gray-600 dark:text-gray-300 text-sm mb-4 leading-relaxed">
-                Warning: You are about to permanently purge <strong class="text-gray-900 dark:text-white">{{ selectedIds.length }} records</strong> from the system database. This cannot be undone.
+            <h3 class="text-xl font-semibold text-gray-900 dark:text-white mb-2">Are you sure you want to permanently delete this record?</h3>
+            <p class="text-gray-600 dark:text-gray-300 text-sm mb-3 leading-relaxed">
+                This action cannot be undone. Related active sessions, registered trusted devices, or dependent records must only be revoked or removed when explicitly required by the operation.
             </p>
             <div class="p-3 bg-rose-50 dark:bg-rose-950/40 rounded-xl border border-rose-200 dark:border-rose-800 text-xs text-rose-800 dark:text-rose-300 mb-4">
-                All selected records will be permanently erased and this batch action will be logged in the audit trail.
+                You are about to permanently purge <strong>{{ selectedIds.length }} selected records</strong> from the database. All eligible records will be permanently erased and logged in the audit trail without revoking unrelated sessions or trusted devices.
             </div>
             <div class="mt-2 mb-6">
                 <label class="block text-xs font-semibold text-gray-700 dark:text-gray-300 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 dark:bg-rose-950 px-1.5 py-0.5 rounded border border-rose-200 dark:border-rose-800">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 dark:bg-rose-950 px-1.5 py-0.5 rounded border border-rose-200 dark:border-rose-800">YES</span> to confirm permanent deletion:
                 </label>
                 <input
                     v-model="bulkForceDeleteConfirmInput"
@@ -1042,7 +1043,7 @@ const getTypeBadgeClasses = (type: string) => {
                     variant="destructive"
                     size="md"
                     :radius="10"
-                    :disabled="isProcessing || bulkForceDeleteConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="isProcessing || bulkForceDeleteConfirmInput !== 'YES'"
                     @click="confirmBulkForceDelete"
                 >
                     <Trash2 class="w-4 h-4 mr-1.5" />
@@ -1063,17 +1064,17 @@ const getTypeBadgeClasses = (type: string) => {
             <div class="w-12 h-12 rounded-full bg-rose-50 dark:bg-rose-950/60 text-rose-600 flex items-center justify-center mb-4 border border-rose-100 dark:border-rose-800">
                 <Trash2 class="w-6 h-6" />
             </div>
-            <h3 class="text-xl font-semibold text-gray-900 dark:text-white mb-2">Empty Entire Recycle Bin?</h3>
-            <p class="text-gray-600 dark:text-gray-300 text-sm mb-4 leading-relaxed">
-                Are you sure you want to permanently delete <strong class="text-gray-900 dark:text-white">all {{ stats.total }} records</strong> currently in the Recycle Bin?
+            <h3 class="text-xl font-semibold text-gray-900 dark:text-white mb-2">Are you sure you want to permanently delete this record?</h3>
+            <p class="text-gray-600 dark:text-gray-300 text-sm mb-3 leading-relaxed">
+                This action cannot be undone. Related active sessions, registered trusted devices, or dependent records must only be revoked or removed when explicitly required by the operation.
             </p>
             <div class="p-3.5 bg-rose-50 dark:bg-rose-950/40 rounded-xl border border-rose-200 dark:border-rose-800 text-xs text-rose-800 dark:text-rose-300 mb-4 space-y-1">
-                <span class="font-semibold block">Irreversible Database Purge</span>
-                <span>Every recoverable item across all modules will be completely erased. This operation will be logged to the security audit trail.</span>
+                <span class="font-semibold block">Empty Entire Recycle Bin ({{ stats.total }} records)</span>
+                <span>Every eligible archived item in the Recycle Bin will be permanently erased and logged to the audit trail. Unrelated active sessions and trusted devices are not affected.</span>
             </div>
             <div class="mt-2 mb-6">
                 <label class="block text-xs font-semibold text-gray-700 dark:text-gray-300 mb-1.5">
-                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 dark:bg-rose-950 px-1.5 py-0.5 rounded border border-rose-200 dark:border-rose-800">YES</span> if you wish to delete:
+                    Type <span class="font-mono font-semibold text-rose-600 bg-rose-50 dark:bg-rose-950 px-1.5 py-0.5 rounded border border-rose-200 dark:border-rose-800">YES</span> to confirm permanent deletion:
                 </label>
                 <input
                     v-model="emptyBinConfirmInput"
@@ -1097,7 +1098,7 @@ const getTypeBadgeClasses = (type: string) => {
                     variant="destructive"
                     size="md"
                     :radius="10"
-                    :disabled="isProcessing || emptyBinConfirmInput.trim().toUpperCase() !== 'YES'"
+                    :disabled="isProcessing || emptyBinConfirmInput !== 'YES'"
                     @click="confirmEmptyBin"
                 >
                     <Trash2 class="w-4 h-4 mr-1.5" />

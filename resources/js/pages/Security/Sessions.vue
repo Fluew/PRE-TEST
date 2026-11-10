@@ -116,7 +116,7 @@ const promptRevokeOtherSessions = () => {
 
         <div class="workspace-page">
             <!-- Header Section -->
-            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <div class="page-header">
                 <div>
                     <h1 class="page-title">
                         Active Sessions
@@ -126,7 +126,7 @@ const promptRevokeOtherSessions = () => {
                     </p>
                 </div>
 
-                <div class="flex flex-wrap items-center justify-start lg:justify-end gap-2.5 w-full lg:w-auto">
+                <div class="page-actions">
                     <SpecularButton
                         type="button"
                         variant="danger"
@@ -146,16 +146,16 @@ const promptRevokeOtherSessions = () => {
                     <table class="w-full text-left text-sm text-gray-600">
                         <thead class="bg-gray-50/80 border-b border-gray-200 text-xs font-semibold text-gray-700">
                             <tr>
-                                <th class="px-6 py-4">Workstation / Device</th>
-                                <th v-if="isAdmin" class="px-6 py-4">Account</th>
-                                <th class="px-6 py-4">IP Address</th>
-                                <th class="px-6 py-4">Last Activity</th>
-                                <th class="px-6 py-4 text-right">Actions</th>
+                                <th class="px-4 py-3">Workstation / Device</th>
+                                <th v-if="isAdmin" class="px-4 py-3">Account</th>
+                                <th class="px-4 py-3">IP Address</th>
+                                <th class="px-4 py-3">Last Activity</th>
+                                <th class="px-4 py-3 text-right">Actions</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-gray-100">
                             <tr v-for="s in sessions" :key="s.id" class="hover:bg-gray-50/60 transition-colors">
-                                <td class="px-6 py-4">
+                                <td class="px-4 py-3">
                                     <div class="flex items-center gap-3">
                                         <div class="flex size-9 shrink-0 items-center justify-center rounded-lg bg-gray-100 text-gray-600">
                                             <Laptop class="size-4" />
@@ -175,20 +175,20 @@ const promptRevokeOtherSessions = () => {
                                     </div>
                                 </td>
 
-                                <td v-if="isAdmin" class="px-6 py-4">
+                                <td v-if="isAdmin" class="px-4 py-3">
                                     <div class="font-medium text-gray-900">{{ s.user.name }}</div>
                                     <div class="text-xs text-gray-400">{{ s.user.email }} ({{ s.user.role }})</div>
                                 </td>
 
-                                <td class="px-6 py-4 font-mono text-xs text-gray-700">
+                                <td class="px-4 py-3 font-mono text-xs text-gray-700">
                                     {{ s.ip_address || '—' }}
                                 </td>
 
-                                <td class="px-6 py-4 text-xs text-gray-500">
+                                <td class="px-4 py-3 text-xs text-gray-500">
                                     {{ s.last_activity }}
                                 </td>
 
-                                <td class="px-6 py-4 text-right">
+                                <td class="px-4 py-3 text-right">
                                     <button
                                         v-if="!s.is_current"
                                         type="button"
@@ -204,7 +204,7 @@ const promptRevokeOtherSessions = () => {
                             </tr>
 
                             <tr v-if="sessions.length === 0">
-                                <td :colspan="isAdmin ? 5 : 4" class="px-6 py-12 text-center text-gray-400">
+                                <td :colspan="isAdmin ? 5 : 4" class="px-4 py-12 text-center text-gray-400">
                                     No active sessions recorded.
                                 </td>
                             </tr>

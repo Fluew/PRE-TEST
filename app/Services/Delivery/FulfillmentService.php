@@ -22,26 +22,26 @@ use Illuminate\Support\Facades\DB;
 /**
  * Delivery and pickup of confirmed Sales Orders.
  *
- * One delivery record per order, starting at Order Confirmed. Goods leave in releases: a
- * release takes chosen quantities, is prepared (Preparing), made ready (Ready for Delivery),
- * dispatched (Out for Delivery, stock is taken out here) and received. When only part of the
- * order was received the status goes back to Preparing for the next release; it becomes
- * Delivered only when nothing is owed, and the order is then completed automatically when its
- * payment terms allow. Every change is kept in the history; the customer is emailed once for
- * Ready for Delivery, Out for Delivery, Delivered (each receipt), Delivery Attempt Failed and
- * Cancelled.
+ * One delivery record per order (enforced by the database), created at Pending when the order is
+ * confirmed. Goods leave in releases: a release takes chosen quantities, is prepared (still
+ * Pending), made ready (Ready for Delivery), dispatched (In Transit, its units stay reserved) and
+ * received (stock is taken out here, for the quantities received only). A failed attempt puts
+ * it back to Ready for Delivery with the goods still on the truck (the attempt is in the history). When only part of the order was received the status goes back
+ * to Pending for the next release; it becomes Delivered only when nothing is owed, and the order
+ * is then completed automatically when its payment terms allow. Every change is kept in the
+ * history; the customer is emailed for Ready for Delivery, In Transit, Delivered (each receipt),
+ * a failed delivery attempt, and Cancelled.
  */
 class FulfillmentService
 {
     /** Statuses the customer is emailed about. */
     private const EMAILED = [
-        DeliveryStatus::ReadyForDelivery, DeliveryStatus::OutForDelivery, DeliveryStatus::Delivered,
-        DeliveryStatus::DeliveryAttemptFailed, DeliveryStatus::Cancelled,
+        DeliveryStatus::ReadyForDelivery, DeliveryStatus::InTransit, DeliveryStatus::Delivered, DeliveryStatus::Cancelled,
     ];
 
     public function __construct(private StockLedger $stock, private CustomerNotifier $notifier) {}
 
-    /** Create (or reuse) the order's delivery record at Order Confirmed, with its first history entry. */
+    /** Create (or reuse) the order's delivery record at Pending, with its first history entry. Never a second one. */
     public function initialize(Sale $sale, ?User $user = null): OrderFulfillment
     {
         $fulfillment = OrderFulfillment::where('sale_id', $sale->id)->first();
@@ -59,11 +59,11 @@ class FulfillmentService
             'contact_number' => $fulfillment->contact_number ?: $sale->phone,
             'delivery_address' => $fulfillment->delivery_address ?: $sale->address,
             'instructions' => $fulfillment->instructions ?: $sale->delivery_instructions,
-            'status' => DeliveryStatus::OrderConfirmed,
+            'status' => DeliveryStatus::Pending,
             'attempt_count' => 0,
         ])->save();
 
-        $this->history($fulfillment, null, DeliveryStatus::OrderConfirmed, $user, 'Order confirmed; delivery record created.');
+        $this->history($fulfillment, null, DeliveryStatus::Pending, $user, 'Order confirmed; delivery record created.');
         AuditLogger::record('delivery.created', "Delivery record {$fulfillment->fulfillment_number} created for {$sale->order_number} (".($fulfillment->isPickup() ? 'pickup' : 'delivery').').', $sale, ['fulfillment_id' => $fulfillment->id], $user);
 
         return $fulfillment;
@@ -86,7 +86,7 @@ class FulfillmentService
             if ($fulfillment->openRelease()) {
                 throw new WorkflowException('A release for this order is already being prepared or is on its way. Finish or cancel it first.');
             }
-            $this->guard($fulfillment, DeliveryStatus::Preparing);
+            $this->guard($fulfillment, DeliveryStatus::Pending);
 
             $lines = SaleItem::where('sale_id', $sale->id)->lockForUpdate()->get()->keyBy('id');
             $chosen = [];
@@ -128,7 +128,7 @@ class FulfillmentService
             }
 
             $summary = collect($chosen)->map(fn ($q, $id) => "{$lines[$id]->product_name} × {$q}")->implode(', ');
-            $this->transition($fulfillment, DeliveryStatus::Preparing, $user, "{$release->release_number}: {$summary}".($remarks ? ". {$remarks}" : ''), $release);
+            $this->transition($fulfillment, DeliveryStatus::Pending, $user, "{$release->release_number} being prepared: {$summary}".($remarks ? ". {$remarks}" : ''), $release);
             AuditLogger::record('delivery.release_created', "Release {$release->release_number} prepared for {$sale->order_number}: {$summary}.", $sale, ['release_id' => $release->id], $user);
 
             return $release;
@@ -166,7 +166,7 @@ class FulfillmentService
         });
     }
 
-    /** The release leaves the warehouse: stock is taken out now. */
+    /** The release leaves the warehouse. Its units stay reserved; stock is taken out when the customer receives them. */
     public function dispatch(DeliveryRelease $release, User $user): void
     {
         DB::transaction(function () use ($release, $user) {
@@ -179,7 +179,7 @@ class FulfillmentService
             }
             $this->assertNotHeld($sale);
 
-            $this->stock->deductForRelease($release, $user);
+            $this->stock->holdForRelease($release, $user);
             $release->update(['status' => DeliveryRelease::DISPATCHED, 'dispatched_at' => now(), 'released_by_id' => $user->id]);
             $fulfillment->forceFill([
                 'handled_by_id' => $fulfillment->handled_by_id ?: $user->id,
@@ -187,16 +187,20 @@ class FulfillmentService
                 'attempt_count' => 0,
             ])->save();
 
-            $this->transition($fulfillment, DeliveryStatus::OutForDelivery, $user, "{$release->release_number} dispatched.", $release);
+            $this->transition($fulfillment, DeliveryStatus::InTransit, $user, "{$release->release_number} dispatched.", $release);
         });
     }
 
+    /**
+     * The customer could not receive the goods. They stay on the truck and the delivery is Ready
+     * for Delivery again; the attempt (reason, photo) is in the history and the customer is told.
+     */
     public function recordFailedAttempt(OrderFulfillment $fulfillment, string $reason, string $remarks, ?string $photoPath, User $user): int
     {
         return DB::transaction(function () use ($fulfillment, $reason, $remarks, $photoPath, $user) {
             [, $fulfillment] = $this->lock($fulfillment);
-            if ($fulfillment->status !== DeliveryStatus::OutForDelivery) {
-                throw new WorkflowException('A failed attempt can only be recorded while the order is out for delivery.');
+            if ($fulfillment->status !== DeliveryStatus::InTransit) {
+                throw new WorkflowException('A failed attempt can only be recorded while the order is in transit.');
             }
             if ($fulfillment->attempt_count >= OrderFulfillment::MAX_ATTEMPTS) {
                 throw new WorkflowException('The 3-attempt limit has been reached. An administrator has to reschedule this delivery.');
@@ -204,8 +208,8 @@ class FulfillmentService
 
             $attempt = $fulfillment->attempt_count + 1;
             $fulfillment->forceFill(['attempt_count' => $attempt])->save();
-            $this->transition($fulfillment, DeliveryStatus::DeliveryAttemptFailed, $user, $remarks, $fulfillment->openRelease(),
-                attempt: $attempt, failureReason: $reason, proofImage: $photoPath, context: ['remarks' => "{$reason}. {$remarks}"]);
+            $this->transition($fulfillment, DeliveryStatus::ReadyForDelivery, $user, "Delivery attempt {$attempt} failed: {$remarks}", $fulfillment->openRelease(),
+                attempt: $attempt, failureReason: $reason, proofImage: $photoPath, context: ['remarks' => "{$reason}. {$remarks}", 'attempt_failed' => true]);
 
             return $attempt;
         });
@@ -218,15 +222,14 @@ class FulfillmentService
             [$sale, $fulfillment] = $this->lock($fulfillment);
             $this->assertNotHeld($sale);
             $release = $fulfillment->openRelease();
-            $rescheduled = $fulfillment->status === DeliveryStatus::ReadyForDelivery && $release?->status === DeliveryRelease::DISPATCHED;
-            if ($fulfillment->status === DeliveryStatus::DeliveryAttemptFailed && $fulfillment->attempt_count >= OrderFulfillment::MAX_ATTEMPTS) {
-                throw new WorkflowException('The 3-attempt limit has been reached. An administrator has to reschedule this delivery.');
-            }
-            if ($fulfillment->status !== DeliveryStatus::DeliveryAttemptFailed && ! $rescheduled) {
+            if ($fulfillment->status !== DeliveryStatus::ReadyForDelivery || ! $fulfillment->goodsOnTruck($release)) {
                 throw new WorkflowException('Only a failed or rescheduled delivery can be dispatched again.');
             }
+            if ($fulfillment->needsReschedule($release)) {
+                throw new WorkflowException('The 3-attempt limit has been reached. An administrator has to reschedule this delivery.');
+            }
             $fulfillment->forceFill(['dispatched_at' => now()])->save();
-            $this->transition($fulfillment, DeliveryStatus::OutForDelivery, $user, 'Dispatched again (attempt '.($fulfillment->attempt_count + 1).' of '.OrderFulfillment::MAX_ATTEMPTS.').', $release);
+            $this->transition($fulfillment, DeliveryStatus::InTransit, $user, 'Dispatched again (attempt '.($fulfillment->attempt_count + 1).' of '.OrderFulfillment::MAX_ATTEMPTS.').', $release);
         });
     }
 
@@ -239,7 +242,7 @@ class FulfillmentService
 
         DB::transaction(function () use ($fulfillment, $schedule, $resetAttempts, $notes, $driverId, $user) {
             [, $fulfillment] = $this->lock($fulfillment);
-            if ($fulfillment->status !== DeliveryStatus::DeliveryAttemptFailed) {
+            if (! $fulfillment->awaitingRedelivery()) {
                 throw new WorkflowException('Only a delivery whose attempt failed can be rescheduled.');
             }
             $fulfillment->forceFill(array_filter([
@@ -253,13 +256,14 @@ class FulfillmentService
             $when = Carbon::parse($schedule)->format('M d, Y h:i A');
             $this->transition($fulfillment, DeliveryStatus::ReadyForDelivery, $user,
                 "Rescheduled to {$when}".($resetAttempts ? '; attempt counter reset.' : '.').($notes ? " {$notes}" : ''),
-                $fulfillment->openRelease(), context: ['remarks' => "New delivery date: {$when}.".($notes ? " {$notes}" : '')]);
+                $fulfillment->openRelease(), context: ['remarks' => "New delivery date: {$when}.".($notes ? " {$notes}" : '')],
+                emailAs: DeliveryStatus::ReadyForDelivery); // still Ready for Delivery: the customer is told the new date
         });
     }
 
     /**
      * Record what the customer received for a release (sale_item_id => quantity received).
-     * Anything not received goes back into stock and stays held for the order.
+     * Only the received quantities are taken out of stock; anything not received stays held for the order.
      *
      * @param  array<int|string, int|string>  $received
      */
@@ -274,7 +278,7 @@ class FulfillmentService
             }
             if ($pickup) {
                 $this->assertNotHeld($sale);
-                $this->stock->deductForRelease($release, $user); // handed over at the warehouse: stock leaves now
+                $this->stock->holdForRelease($release, $user); // refuses a handover the stock cannot cover
                 $release->update(['dispatched_at' => now(), 'released_by_id' => $user->id]);
             }
 
@@ -301,11 +305,13 @@ class FulfillmentService
                     'delivered_quantity' => $line->delivered_quantity + $qty,
                     'released_quantity' => max(0, $line->released_quantity - $back),
                 ])->save();
-                if ($back > 0) {
-                    $this->stock->restock($item->fresh('release.sale'), $back, "Not received on {$release->release_number}", $user);
+                if ($item->deducted_quantity > $qty) {
+                    // Dispatched before stock-out moved to delivery: put back what was not received.
+                    $this->stock->restock($item->fresh('release.sale'), $item->deducted_quantity - $qty, "Not received on {$release->release_number}", $user);
                 }
                 $lines[] = "{$line->product_name}: {$qty} of {$item->quantity}";
             }
+            $this->stock->deductDelivered($release, $user); // only what the customer received leaves stock
 
             $release->update([
                 'status' => DeliveryRelease::DELIVERED,
@@ -322,9 +328,9 @@ class FulfillmentService
                 'delivered_at' => $done ? now() : $fulfillment->delivered_at,
             ])->save();
 
-            // All received: Delivered. Part received: back to Preparing for the next release; the
+            // All received: Delivered. Part received: back to Pending for the next release; the
             // customer still gets a "delivered" email for what arrived and what is still to follow.
-            $to = $done ? DeliveryStatus::Delivered : DeliveryStatus::Preparing;
+            $to = $done ? DeliveryStatus::Delivered : DeliveryStatus::Pending;
             $this->transition($fulfillment, $to, $user, "{$release->release_number} received by {$receivedBy}: ".implode('; ', $lines).($remarks ? ". {$remarks}" : '').($done ? '' : '. More to follow.'), $release,
                 emailAs: DeliveryStatus::Delivered, context: ['partial' => ! $done]);
             AuditLogger::record('delivery.acknowledged', "{$release->release_number} received by {$receivedBy}".($done ? '; everything delivered.' : '; part of the order is still to follow.'), $sale, ['release_id' => $release->id], $user);
@@ -339,7 +345,10 @@ class FulfillmentService
         return $status;
     }
 
-    /** The goods on a dispatched release came back to the warehouse (back into stock, held for the order). */
+    /**
+     * The goods on a dispatched release came back to the warehouse. They never left stock, so
+     * nothing moves; they stay held for the order (older releases taken out at dispatch are put back).
+     */
     public function returnRelease(DeliveryRelease $release, string $reason, User $user): void
     {
         DB::transaction(function () use ($release, $reason, $user) {
@@ -355,7 +364,7 @@ class FulfillmentService
             }
             $release->update(['status' => DeliveryRelease::RETURNED, 'returned_at' => now(), 'return_reason' => $reason]);
 
-            $this->transition($fulfillment, DeliveryStatus::Preparing, $user, "{$release->release_number} returned to the warehouse: {$reason}", $release, notify: false);
+            $this->transition($fulfillment, DeliveryStatus::Pending, $user, "{$release->release_number} returned to the warehouse: {$reason}", $release, notify: false);
         });
     }
 
@@ -464,6 +473,7 @@ class FulfillmentService
                 'remarks' => $context['remarks'] ?? null,
                 'partial' => $context['partial'] ?? null,
                 'remaining_cancelled' => $context['remaining_cancelled'] ?? null,
+                'attempt_failed' => $context['attempt_failed'] ?? null, // emailed as "we could not deliver your order"
             ], fn ($v) => $v !== null && $v !== false));
         }
     }
@@ -492,10 +502,10 @@ class FulfillmentService
         }
     }
 
-    /** Where a delivery rests between releases: nothing delivered yet, or part of it. */
+    /** Where a delivery rests between releases (nothing or only part of it delivered): Pending. */
     private function restingStatus(Sale $sale): DeliveryStatus
     {
-        return SaleItem::where('sale_id', $sale->id)->sum('delivered_quantity') > 0 ? DeliveryStatus::Preparing : DeliveryStatus::OrderConfirmed;
+        return DeliveryStatus::Pending;
     }
 
     private function assertNotHeld(Sale $sale): void

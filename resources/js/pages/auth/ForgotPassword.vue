@@ -528,9 +528,10 @@ onUnmounted(() => {
                         @click="showPassword = !showPassword"
                         class="absolute inset-y-0 right-0 flex cursor-pointer items-center pr-3.5 text-gray-500 transition-colors hover:text-black focus:outline-none"
                         :aria-label="showPassword ? 'Hide password' : 'Show password'"
+                        :aria-pressed="showPassword"
                     >
-                        <EyeOff v-if="showPassword" class="size-4" />
-                        <Eye v-else class="size-4" />
+                        <EyeOff v-if="showPassword" class="size-4 shrink-0" />
+                        <Eye v-else class="size-4 shrink-0" />
                     </button>
                 </div>
                 <InputError :message="resetForm.errors.password" class="mt-1 text-xs text-red-300" />
@@ -562,9 +563,10 @@ onUnmounted(() => {
                         @click="showConfirmPassword = !showConfirmPassword"
                         class="absolute inset-y-0 right-0 flex cursor-pointer items-center pr-3.5 text-gray-500 transition-colors hover:text-black focus:outline-none"
                         :aria-label="showConfirmPassword ? 'Hide password' : 'Show password'"
+                        :aria-pressed="showConfirmPassword"
                     >
-                        <EyeOff v-if="showConfirmPassword" class="size-4" />
-                        <Eye v-else class="size-4" />
+                        <EyeOff v-if="showConfirmPassword" class="size-4 shrink-0" />
+                        <Eye v-else class="size-4 shrink-0" />
                     </button>
                 </div>
                 <InputError :message="resetForm.errors.password_confirmation" class="mt-1 text-xs text-red-300" />

@@ -47,4 +47,24 @@ class Supplier extends Model
     {
         return $this->hasMany(StockMovement::class);
     }
+
+    public function purchaseOrders(): HasMany
+    {
+        return $this->hasMany(PurchaseOrder::class);
+    }
+
+    public function deliveries(): HasMany
+    {
+        return $this->hasMany(Delivery::class);
+    }
+
+    public function quotes(): HasMany
+    {
+        return $this->hasMany(SupplierQuote::class);
+    }
+
+    public function purchaseRequests(): HasMany
+    {
+        return $this->hasMany(PurchaseRequest::class);
+    }
 }

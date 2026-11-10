@@ -64,8 +64,10 @@ class StockMovement extends Model
             'stock_in' => 'Stock In',
             'stock_out' => 'Stock Out',
             'adjustment' => 'Adjustment',
-            'sale' => 'Sale Deduction',
-            default => ucfirst($this->type),
+            'sale' => 'Counter Sale',
+            'sale_release' => 'Delivered',
+            'return' => 'Returned',
+            default => ucfirst(str_replace('_', ' ', $this->type)),
         };
     }
 }

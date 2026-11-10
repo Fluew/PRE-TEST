@@ -48,6 +48,7 @@ class SupplierQuoteRowRules extends RowRules
             $issues = [];
             $values = [];
             $sources = [];
+            $hadOcrCorrection = false;
             foreach (['description', 'item_code', 'unit', 'quantity', 'unit_price', 'amount'] as $f) {
                 $r = $this->field($row, $f, $ocr);
                 $values[$f] = $r['value'];
@@ -56,6 +57,7 @@ class SupplierQuoteRowRules extends RowRules
                     $issues[] = self::issue('error', $f, "{$this->label($f)}: {$r['problem']}.");
                 }
                 if ($r['corrected_from'] !== null) {
+                    $hadOcrCorrection = true;
                     $issues[] = self::issue('warning', $f, "{$this->label($f)} read by OCR as \"{$r['corrected_from']}\" and taken as {$r['value']}. Check it against the original.");
                 }
             }
@@ -127,6 +129,7 @@ class SupplierQuoteRowRules extends RowRules
                 }
             }
 
+            $sources['_confidence'] = $this->confidence($ocr, $row, $issues, $sources, $hadOcrCorrection);
             $row->values = $values;
             $row->sources = $sources;
             $row->issues = $issues;
